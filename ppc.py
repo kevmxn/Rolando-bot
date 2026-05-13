@@ -311,7 +311,7 @@ class StrategySlot:
         )
 
         if self.msg_id:
-            tg_reply(self.msg_id, result_text)          # responde como comentario al mensaje de señal
+            tg_reply(self.msg_id, result_text)
         else:
             tg_send(result_text)
 
@@ -530,18 +530,47 @@ def run_flask():
     logger.info(f"[Flask] Iniciando en 0.0.0.0:{port}")
     flask_app.run(host="0.0.0.0", port=port, debug=False, use_reloader=False)
 
+# ─── ROBUST BOT POLLING ──────────────────────────────────────────────────────
+def run_bot_polling():
+    """
+    Loop de polling robusto que captura ReadTimeout y otras excepciones
+    de red, reconectando automáticamente. Esto evita que el hilo muera
+    en Render donde la red puede ser lenta.
+    """
+    while True:
+        try:
+            # timeout=25 → Telegram API espera hasta 25s por updates
+            # long_polling_timeout=60 → HTTP read_timeout = 25+60 = 85s
+            # Esto da amplio margen para que la respuesta llegue
+            bot.polling(
+                none_stop=True,
+                interval=1,
+                timeout=25,
+                long_polling_timeout=60
+            )
+        except requests.exceptions.ReadTimeout:
+            logger.warning("[Bot] ReadTimeout en long polling, reconectando...")
+            time.sleep(3)
+        except requests.exceptions.ConnectionError:
+            logger.warning("[Bot] ConnectionError en polling, reconectando en 5s...")
+            time.sleep(5)
+        except requests.exceptions.RequestException as e:
+            logger.warning(f"[Bot] RequestException en polling: {e}, reconectando en 5s...")
+            time.sleep(5)
+        except Exception as e:
+            logger.error(f"[Bot] Error inesperado en polling: {e}, reconectando en 10s...")
+            time.sleep(10)
+
 # ─── MAIN ─────────────────────────────────────────────────────────────────────
 async def main():
     threading.Thread(target=run_flask, daemon=True).start()
     logger.info("[Main] ✅ Flask thread iniciado")
 
-    threading.Thread(
-        target=lambda: bot.polling(none_stop=True, interval=1, timeout=30),
-        daemon=True
-    ).start()
-    logger.info("[Main] ✅ Telegram bot thread iniciado")
+    # ── Cambio clave: usar run_bot_polling() en lugar de lambda ──
+    threading.Thread(target=run_bot_polling, daemon=True).start()
+    logger.info("[Main] ✅ Telegram bot thread iniciado (con retry robusto)")
 
-    await asyncio.sleep(1)
+    await asyncio.sleep(3)
     logger.info(f"[Main] 🎰 Bot iniciado — {ROULETTE_NAME} key={ROULETTE_KEY}")
 
     await asyncio.gather(
