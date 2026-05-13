@@ -1,62 +1,36 @@
 #!/usr/bin/env python3
 """
-Multi-Roulette Session Bot — 5 Ruletas / Sesiones de 30 min / 48 señales/día
-
-Ruletas:
-  - Roulette Italia Tricolore  — key 223
-  - Roulette Deutsche          — key 222
-  - Speed Roulette 1           — key 203
-  - Speed Roulette 2           — key 205
-  - Roulette 1 (Azure)         — key 227
-
-Lógica:
-  - Cada sesión dura 30 min (slot de tiempo fijo).
-  - Las 5 ruletas se rotan en orden. Al terminar la 5ª, vuelve a la 1ª.
-  - Cada sesión emite como máximo UNA señal.
-  - Si en los 30 min no se detecta señal, envía mensaje de cambio a la siguiente ruleta.
-  - Apuesta: 0.50 por categoría (total 1.00). En gale x3 → 1.50 c/u (total 3.00). Solo 1 gale.
-  - No hay niveles de gestión, solo el nivel 1 (base).
-
-CAMBIOS:
-  - Al enviar mensaje de inicio de sesión (:00/:30) se borra el anterior de inicio Y el de fin.
-  - Al enviar mensaje de fin de sesión (:25/:55) NO se borra el anterior (se borrará al iniciar la próxima).
-  - Al iniciar, se cargan los últimos 20 resultados de la API (primer mensaje WS)
-    antes de pasar a modo real-time. Luego cada spin llega por evento en tiempo real.
+Mega Roulette Bot — Key 204
+Lógica: Docenas, Columnas, Call+PLE, Color (patrones), Rango
+Sin gestión, sin estadísticas ML. 1 intento por señal.
 """
 
 import asyncio
-import json
 import logging
-import math
 import os
-import sqlite3
-import threading
 import time
 import urllib.request
-from collections import deque, defaultdict
-from typing import Optional, Dict
-
-import numpy as np
-from sklearn.naive_bayes import MultinomialNB
-from sklearn.linear_model import SGDClassifier
+import threading
+from typing import Optional
 
 import telebot
 import websockets
+import json
 from flask import Flask, jsonify
 import requests
 from requests.adapters import HTTPAdapter
 from urllib3.util.retry import Retry
 
 # ─── LOGGING ──────────────────────────────────────────────────────────────────
-logging.basicConfig(level=logging.INFO, format='%(asctime)s [MultiRoulette] %(levelname)s %(message)s')
-logger = logging.getLogger("MultiRoulette")
+logging.basicConfig(level=logging.INFO,
+                    format='%(asctime)s [MegaRoulette] %(levelname)s %(message)s')
+logger = logging.getLogger("MegaRoulette")
 for _ln in ['werkzeug', 'flask.app', 'flask', 'urllib3']:
     logging.getLogger(_ln).setLevel(logging.ERROR)
 
 # ─── TELEGRAM ─────────────────────────────────────────────────────────────────
-TOKEN          = "8347707121:AAH1cPEDMLbm-scTJ8mUuufeEhzw3Axv2Lw"
-CHAT_ID        = -1003835197023
-STATS_THREAD_ID = 40034   # Tema del grupo donde se envían las estadísticas diarias
+TOKEN   = "8932208184:AAHj_7XYSQQmZZQWrk6LJtJj4CkwuCxrNLI"
+CHAT_ID = -1003610988961
 
 _session = requests.Session()
 _retry = Retry(total=5, backoff_factor=1.5, status_forcelist=[429, 500, 502, 503, 504],
@@ -66,87 +40,114 @@ _session.mount("http://",  HTTPAdapter(max_retries=_retry, pool_connections=10, 
 bot = telebot.TeleBot(TOKEN, threaded=False)
 bot.session = _session
 
-# ─── RULETAS CONFIGURACIÓN ────────────────────────────────────────────────────
-ROULETTES = [
-    {"key": 223, "name": "ROULETTE ITALIA"},
-    {"key": 222, "name": "ROULETTE DEUTSCHE"},
-    {"key": 203, "name": "SPEED ROULETTE 1"},
-    {"key": 205, "name": "SPEED ROULETTE 2"},
-    {"key": 227, "name": "ROULETTE 1"},
-    {"key": 204, "name": "MEGA ROULETTE"},
-    {"key": 206, "name": "ROULETTE MACAO"},
+# ─── RULETA ───────────────────────────────────────────────────────────────────
+ROULETTE_KEY  = 204
+ROULETTE_NAME = "MEGA ROULETTE"
+ROULETTE_URL  = "https://1win.lat/casino/play/v_pragmatic:megaroulette"
+
+WS_URL    = "wss://dga.pragmaticplaylive.net/ws"
+CASINO_ID = "ppcjd00000007254"
+
+# ─── LÓGICA (portada desde logica.txt) ────────────────────────────────────────
+RED    = {1,3,5,7,9,12,14,16,18,19,21,23,25,27,30,32,34,36}
+BLACK  = {2,4,6,8,10,11,13,15,17,20,22,24,26,28,29,31,33,35}
+COL1   = {1,4,7,10,13,16,19,22,25,28,31,34}
+COL2   = {2,5,8,11,14,17,20,23,26,29,32,35}
+COL3   = {3,6,9,12,15,18,21,24,27,30,33,36}
+CALLPLE_NUMS = [1, 3, 4, 6, 7, 9]
+
+COLOR_PATTERNS = [
+    {'p': ['N','N','N','R','N'],         'bet': 'Negro'},
+    {'p': ['R','R','R','N','R'],         'bet': 'Rojo'},
+    {'p': ['N','N','N','R','R','N','N'], 'bet': 'Rojo'},
+    {'p': ['R','R','R','N','N','R','R'], 'bet': 'Negro'},
 ]
 
-# ─── LINKS POR RULETA ─────────────────────────────────────────────────────────
-ROULETTE_LINKS = {
-    "MEGA ROULETTE":          "https://1win.lat/casino/play/v_pragmatic:megaroulette",
-    "AUTO ROULETTE":          "https://1win.lat/casino/play/v_pragmatic:1winautoroulette",
-    "ROULETTE ITALIA":        "https://1win.lat/casino/play/v_pragmatic:rouletteitaliatricolore",
-    "ROULETTE 1":             "https://1win.lat/casino/play/v_pragmatic:roulette1",
-    "ROULETTE 2 EXTRA TIME":  "https://1win.lat/casino/play/v_pragmatic:roulette2",
-    "SPEED ROULETTE 1":       "https://1win.lat/casino/play/v_pragmatic:speedroulette1",
-    "SPEED ROULETTE 2":       "https://1win.lat/casino/play/v_pragmatic:speedroulette2",
-    "ROULETTE MACAO":         "https://1win.lat/casino/play/v_pragmatic:roulettemacao",
-    "ROULETTE LATINA":        "https://1win.lat/casino/play/v_pragmatic:1winspanishroulette",
-    "ROULETTE DEUTSCHE":      "https://1win.lat/casino/play/v_pragmatic:germanroulette",
-    "ROULETTE TURKISH":       "https://1win.lat/casino/play/v_pragmatic:1winturkishroulette",
-    "ROULETTE RUSSIAN":       "https://1win.lat/casino/play/v_pragmatic:1winroulette",
-}
+def _color(n):   return 'green' if n == 0 else ('red' if n in RED else 'black')
+def _letter(n):  return 'X' if n == 0 else ('R' if n in RED else 'N')
+def _dozen(n):   return 'X' if n == 0 else ('D1' if n <= 12 else ('D2' if n <= 24 else 'D3'))
+def _column(n):  return 'X' if n == 0 else ('C1' if n in COL1 else ('C2' if n in COL2 else 'C3'))
 
-def get_roulette_url(name: str) -> Optional[str]:
-    """Devuelve el link de la ruleta ignorando emojis y variaciones de nombre."""
-    # Buscar coincidencia exacta primero
-    if name in ROULETTE_LINKS:
-        return ROULETTE_LINKS[name]
-    # Buscar por nombre base (sin emoji)
-    name_upper = name.upper()
-    for key, url in ROULETTE_LINKS.items():
-        if key.upper() in name_upper or name_upper in key.upper():
-            return url
+def check_docenas(h):
+    if len(h) < 2: return None
+    a, b = _dozen(h[-1]), _dozen(h[-2])
+    if a == 'X' or b == 'X' or a != b: return None
+    bets = {'D1': 'D2 y D3', 'D2': 'D1 y D3', 'D3': 'D1 y D2'}
+    return {'name': 'Docenas', 'bet': f"Apostar {bets[a]}", 'detail': f"{a} repetida"}
+
+def check_columnas(h):
+    if len(h) < 2: return None
+    a, b = _column(h[-1]), _column(h[-2])
+    if a == 'X' or b == 'X' or a != b: return None
+    bets = {'C1': 'C2 y C3', 'C2': 'C1 y C3', 'C3': 'C1 y C2'}
+    return {'name': 'Columnas', 'bet': f"Apostar {bets[a]}", 'detail': f"{a} repetida"}
+
+def check_callple(h):
+    if len(h) < 2: return None
+    if _dozen(h[-1]) == 'D3' and _dozen(h[-2]) == 'D3':
+        nums = ', '.join(str(n) for n in CALLPLE_NUMS)
+        return {'name': 'Call + PLE', 'bet': f"Apostar: {nums}", 'detail': 'D3 repetida'}
     return None
 
-def tg_send_with_button(text: str, roulette_name: str) -> Optional[int]:
-    """Envía mensaje con botón inline de acceso a la ruleta (sin pie de página del link)."""
-    url = get_roulette_url(roulette_name)
-    if not url:
-        return tg_send(text)
-    markup = telebot.types.InlineKeyboardMarkup()
-    markup.add(telebot.types.InlineKeyboardButton("🎰 ACCEDER A LA RULETA", url=url))
-    msg = _tg_call(bot.send_message, chat_id=CHAT_ID, text=text,
-                   parse_mode="HTML", reply_markup=markup,
-                   disable_web_page_preview=True)
-    return msg.message_id if msg else None
+def check_color(h):
+    if len(h) < 5: return None
+    letters = [_letter(n) for n in h]
+    for pat in COLOR_PATTERNS:
+        l = len(pat['p'])
+        if len(h) < l: continue
+        if letters[-l:] == pat['p']:
+            return {
+                'name': 'Color',
+                'bet': f"Apostar {pat['bet']}",
+                'detail': 'Patrón: ' + '-'.join(pat['p'])
+            }
+    return None
 
-# ─── CONSTANTES ───────────────────────────────────────────────────────────────
-WS_URL         = "wss://dga.pragmaticplaylive.net/ws"
-CASINO_ID      = "ppcjd00000007254"
-SESSION_ACTIVE = 25 * 60    # 25 min de señales activas
-SESSION_PAUSE  = 5  * 60    # 5 min de pausa entre sesiones
-SESSION_TOTAL  = SESSION_ACTIVE + SESSION_PAUSE   # 30 min = ciclo exacto por hora
-BASE_BET       = 0.50
-WARMUP_SPINS   = 25
-MIN_PROB       = 0.78
-TRAIN_INTERVAL = 100
+def check_rango(h):
+    if len(h) < 2: return None
+    a, b = _dozen(h[-1]), _dozen(h[-2])
+    if a == 'X' or b == 'X' or a != b: return None
+    if a == 'D3': return {'name': 'Rango', 'bet': 'Apostar 1-18', 'detail': 'D3 repetida'}
+    if a == 'D1': return {'name': 'Rango', 'bet': 'Apostar 19-36', 'detail': 'D1 repetida'}
+    return None
 
-REAL_COLOR_MAP: dict = {
-    0:"VERDE",1:"ROJO",2:"NEGRO",3:"ROJO",4:"NEGRO",5:"ROJO",6:"NEGRO",
-    7:"ROJO",8:"NEGRO",9:"ROJO",10:"NEGRO",11:"NEGRO",12:"ROJO",13:"NEGRO",
-    14:"ROJO",15:"NEGRO",16:"ROJO",17:"NEGRO",18:"ROJO",19:"ROJO",20:"NEGRO",
-    21:"ROJO",22:"NEGRO",23:"ROJO",24:"NEGRO",25:"ROJO",26:"NEGRO",27:"ROJO",
-    28:"NEGRO",29:"NEGRO",30:"ROJO",31:"NEGRO",32:"ROJO",33:"NEGRO",34:"ROJO",
-    35:"NEGRO",36:"ROJO",
-}
+def run_all_checks(history):
+    return [
+        check_docenas(history),
+        check_columnas(history),
+        check_callple(history),
+        check_color(history),
+        check_rango(history),
+    ]
 
-def get_dozen(n: int) -> int:
-    if n == 0: return 0
-    return (n - 1) // 12 + 1
+# ─── MARCADOR DIARIO ──────────────────────────────────────────────────────────
+class DailyScore:
+    def __init__(self):
+        self.wins   = 0
+        self.losses = 0
 
-def get_column(n: int) -> int:
-    if n == 0: return 0
-    return ((n - 1) % 3) + 1
+    def add_win(self):  self.wins   += 1
+    def add_loss(self): self.losses += 1
+
+    def get_text(self):
+        total = self.wins + self.losses
+        pct   = (self.wins / total * 100) if total > 0 else 0.0
+        return (
+            f"📊 MARCADOR DIARIO:\n"
+            f"✅ GANADAS: {self.wins}\n"
+            f"❌ PERDIDAS: {self.losses}\n\n"
+            f"📈 ACIERTOS = {pct:.1f}%"
+        )
+
+    def reset(self):
+        self.wins   = 0
+        self.losses = 0
+
+SCORE = DailyScore()
 
 # ─── TELEGRAM HELPERS ─────────────────────────────────────────────────────────
 _TG_RETRIES = 12
+
 def _tg_call(fn, *a, **kw):
     delay = 2.0
     for attempt in range(1, _TG_RETRIES + 1):
@@ -165,889 +166,309 @@ def tg_send(text: str) -> Optional[int]:
     msg = _tg_call(bot.send_message, chat_id=CHAT_ID, text=text, parse_mode="HTML")
     return msg.message_id if msg else None
 
-def tg_send_stats(text: str) -> Optional[int]:
-    """Envía al tema (topic) 40034 del grupo — exclusivo para el reporte diario de stats."""
+def tg_send_with_button(text: str) -> Optional[int]:
+    markup = telebot.types.InlineKeyboardMarkup()
+    markup.add(telebot.types.InlineKeyboardButton("🎰 ACCEDER A LA RULETA", url=ROULETTE_URL))
     msg = _tg_call(bot.send_message, chat_id=CHAT_ID, text=text,
-                   parse_mode="HTML", message_thread_id=STATS_THREAD_ID)
+                   parse_mode="HTML", reply_markup=markup,
+                   disable_web_page_preview=True)
     return msg.message_id if msg else None
 
-def tg_delete(chat_id: int, message_id: int):
+def tg_edit(message_id: int, text: str):
     try:
-        _tg_call(bot.delete_message, chat_id=chat_id, message_id=message_id)
-    except:
-        pass
-
-def tg_edit(chat_id: int, message_id: int, text: str):
-    """Edita un mensaje existente en Telegram."""
-    try:
-        _tg_call(bot.edit_message_text, text=text, chat_id=chat_id,
+        _tg_call(bot.edit_message_text, text=text, chat_id=CHAT_ID,
                  message_id=message_id, parse_mode="HTML")
-    except:
-        pass
+    except: pass
 
-# ─── EMA ──────────────────────────────────────────────────────────────────────
-def calc_ema(data: list, period: int) -> list:
-    if len(data) < period: return [None] * len(data)
-    mult = 2 / (period + 1)
-    out = [None] * (period - 1)
-    prev = sum(data[:period]) / period
-    out.append(prev)
-    for v in data[period:]:
-        prev = v * mult + prev * (1 - mult)
-        out.append(prev)
-    return out
+def tg_reply(reply_to_id: int, text: str) -> Optional[int]:
+    """Envía un mensaje como respuesta (comentario) a otro mensaje."""
+    msg = _tg_call(bot.send_message, chat_id=CHAT_ID, text=text,
+                   parse_mode="HTML", reply_to_message_id=reply_to_id)
+    return msg.message_id if msg else None
 
-def ema_signal(levels: list, mode: str = "moderado") -> bool:
-    if len(levels) < 20: return False
-    e4, e8, e20 = calc_ema(levels, 4), calc_ema(levels, 8), calc_ema(levels, 20)
-    li = len(levels) - 1
-    if any(v is None for v in [e4[li], e8[li], e20[li]]): return False
-    cur = levels[li]; ce4, ce8, ce20 = e4[li], e8[li], e20[li]
-    pe4  = e4[li-1]  if li > 0 and e4[li-1]  is not None else ce4
-    pe8  = e8[li-1]  if li > 0 and e8[li-1]  is not None else ce8
-    pe20 = e20[li-1] if li > 0 and e20[li-1] is not None else ce20
-    if mode == "tendencia":
-        return (pe4 <= pe20 and ce4 > ce20) or (cur > ce4 and cur > ce8 and cur > ce20)
-    else:
-        v_pattern = False
-        if len(levels) >= 3:
-            a, b, c = levels[-3], levels[-2], levels[-1]
-            v_pattern = (b < a) and (b < c) and (c > a)
-        return (pe4 <= pe8 and ce4 > ce8) or (pe8 <= pe20 and ce8 > ce20) or (cur > ce4 and cur > ce8) or v_pattern
+def tg_delete(message_id: int):
+    try: _tg_call(bot.delete_message, chat_id=CHAT_ID, message_id=message_id)
+    except: pass
 
-# ─── MARKOV ───────────────────────────────────────────────────────────────────
-class SmoothedMarkovPredictor:
-    def __init__(self, window: int = 60, order: int = 2):
-        self.window = window; self.order = order
-        self.transition_counts: dict = {}
+# ─── MOTOR DE SEÑALES ─────────────────────────────────────────────────────────
+WARMUP_SPINS = 20
 
-    def update(self, sequence: list):
-        self.transition_counts = defaultdict(lambda: defaultdict(int))
-        recent = sequence[-self.window:]
-        if len(recent) < self.order + 1: return
-        for i in range(len(recent) - self.order):
-            state = tuple(recent[i:i + self.order])
-            nxt = recent[i + self.order]
-            self.transition_counts[state][nxt] += 1
+# Nombres de todas las estrategias (en orden fijo)
+STRATEGY_NAMES = ['Docenas', 'Columnas', 'Call + PLE', 'Color', 'Rango']
 
-    def predict(self, sequence: list) -> Optional[dict]:
-        if len(sequence) < self.order: return None
-        state = tuple(sequence[-self.order:])
-        counts = dict(self.transition_counts.get(state, {}))
-        total = sum(counts.values())
-        if total < 10: return None
-        alpha = 2.0; vocab_size = 3
-        probs = {k: (v + alpha) / (total + alpha * vocab_size) for k, v in counts.items()}
-        for c in [1, 2, 3]:
-            if c not in probs: probs[c] = alpha / (total + alpha * vocab_size)
-        return probs
+CHECKERS = [
+    check_docenas,
+    check_columnas,
+    check_callple,
+    check_color,
+    check_rango,
+]
 
-# ─── ENSEMBLE ML ──────────────────────────────────────────────────────────────
-class OnlineEnsemblePredictor:
-    WINDOW = 5; CLASSES = [1, 2, 3]
+def _ball(n: int) -> str:
+    c = _color(n)
+    icons = {'red': '🔴', 'black': '⚫', 'green': '🟢'}
+    return f"{icons.get(c, '⚪')}{n}"
 
-    def __init__(self):
-        self.mnb = MultinomialNB(alpha=2.0, class_prior=[0.333, 0.333, 0.333])
-        self.sgd = SGDClassifier(loss='log_loss', learning_rate='adaptive', eta0=0.005,
-                                 penalty='l2', alpha=0.01, epsilon=0.2)
-        self.trained = False; self.sample_count = 0
+def _evaluate(n: int, bet: str) -> bool:
+    """Evalúa si el número n gana la apuesta dada."""
+    if n == 0:
+        return False
+    bet = bet.lower()
 
-    def _extract_features(self, hist_d, hist_c, pf_pair_d, ph_pair_d, pf_pair_c, ph_pair_c) -> Optional[list]:
-        if len(hist_d) < self.WINDOW or len(hist_c) < self.WINDOW: return None
-        features = []
-        for i in range(1, self.WINDOW + 1):
-            d = hist_d[-i]; c = hist_c[-i]
-            vec = [0] * 9; vec[(d - 1) * 3 + (c - 1)] = 1
-            features.extend(vec)
-        for pair in (pf_pair_d, ph_pair_d, pf_pair_c, ph_pair_c):
-            vec = [0, 0, 0]
-            for x in pair: vec[x - 1] = 1
-            features.extend(vec)
-        return features
+    # Docenas
+    if 'd2' in bet and 'd3' in bet and 'd1' not in bet:
+        return _dozen(n) in ('D2', 'D3')
+    if 'd1' in bet and 'd3' in bet and 'd2' not in bet:
+        return _dozen(n) in ('D1', 'D3')
+    if 'd1' in bet and 'd2' in bet and 'd3' not in bet:
+        return _dozen(n) in ('D1', 'D2')
 
-    def partial_train(self, hist_d, hist_c, target, pf_d, ph_d, pf_c, ph_c):
-        feats = self._extract_features(hist_d[:-1], hist_c[:-1], pf_d, ph_d, pf_c, ph_c)
-        if feats is None: return
-        X = np.array(feats).reshape(1, -1); y = np.array([target])
-        if not self.trained:
-            self.mnb.partial_fit(X, y, classes=self.CLASSES)
-            self.sgd.partial_fit(X, y, classes=self.CLASSES)
-            self.trained = True
+    # Columnas
+    if 'c2' in bet and 'c3' in bet and 'c1' not in bet:
+        return _column(n) in ('C2', 'C3')
+    if 'c1' in bet and 'c3' in bet and 'c2' not in bet:
+        return _column(n) in ('C1', 'C3')
+    if 'c1' in bet and 'c2' in bet and 'c3' not in bet:
+        return _column(n) in ('C1', 'C2')
+
+    # Call + PLE
+    if 'apostar:' in bet or '1, 3, 4' in bet:
+        return n in CALLPLE_NUMS
+
+    # Color
+    if 'rojo' in bet:
+        return n in RED
+    if 'negro' in bet:
+        return n in BLACK
+
+    # Rango
+    if '1-18' in bet:
+        return 1 <= n <= 18
+    if '19-36' in bet:
+        return 19 <= n <= 36
+
+    return False
+
+
+class StrategySlot:
+    """
+    Representa UNA estrategia independiente.
+    Ciclo: IDLE → WAITING (señal enviada, espera resultado) → IDLE
+    """
+    def __init__(self, name: str, checker):
+        self.name    = name
+        self.checker = checker
+        self.waiting  = False   # True = señal activa esperando resultado
+        self.sig      = None    # dict con bet/detail
+        self.msg_id   = None    # message_id del mensaje en Telegram
+
+    def try_detect(self, history: list) -> bool:
+        """Intenta detectar señal. Retorna True si se activó."""
+        if self.waiting:
+            return False
+        result = self.checker(history)
+        if result is None:
+            return False
+
+        self.waiting = True
+        self.sig     = result
+
+        last5 = history[-5:][::-1]
+        balls = '  '.join(_ball(x) for x in last5)
+        text = (
+            f"🎰 <b>{ROULETTE_NAME}</b>\n\n"
+            f"🔔 <b>SEÑAL DETECTADA</b>\n\n"
+            f"📌 <b>Estrategia:</b> {self.name}\n"
+            f"🎯 <b>Apuesta:</b> {result['bet']}\n"
+            f"📋 <b>Patrón:</b> {result['detail']}\n\n"
+            f"🕐 Últimos números:\n{balls}\n\n"
+            f"⚠️ <b>1 intento — sin gestión</b>"
+        )
+        self.msg_id = tg_send_with_button(text)
+        logger.info(f"📡 [{self.name}] Señal enviada | {result['bet']}")
+        return True
+
+    def resolve(self, n: int) -> Optional[bool]:
+        """Resuelve la señal activa con el número n. Retorna True/False o None si no había señal."""
+        if not self.waiting:
+            return None
+
+        won = _evaluate(n, self.sig['bet'])
+        if won:
+            SCORE.add_win()
+            emoji, label = "✅", "GANADA"
         else:
-            self.mnb.partial_fit(X, y); self.sgd.partial_fit(X, y)
-        self.sample_count += 1
+            SCORE.add_loss()
+            emoji, label = "❌", "PERDIDA"
 
-    def predict(self, hist_d, hist_c, pf_d, ph_d, pf_c, ph_c) -> Optional[dict]:
-        if not self.trained: return None
-        feats = self._extract_features(hist_d, hist_c, pf_d, ph_d, pf_c, ph_c)
-        if feats is None: return None
-        X = np.array(feats).reshape(1, -1)
-        try:
-            nb_p = self.mnb.predict_proba(X)[0]
-            sg_p = self.sgd.predict_proba(X)[0]
-            final = 0.5 * nb_p + 0.5 * sg_p
-            return {c + 1: float(p) for c, p in enumerate(final)}
-        except: return None
-
-# ─── STATS GLOBAL UNIFICADA ───────────────────────────────────────────────────
-class GlobalStats:
-    """Estadísticas unificadas de todas las ruletas. Se envía una vez al día a las 12:00 ARG."""
-
-    def __init__(self):
-        self.wins = 0; self.zeros = 0; self.losses = 0
-        self.consecutive = 0
-        self.last_20 = deque(maxlen=20)
-        self.signals_processed = 0
-
-    # Balance global acumulado (no por ruleta)
-    global_bankroll: float = 0.0
-
-    def record(self, result_type: str, attempt: int, number: int,
-               val, type_str: str, roulette_name: str, profit_or_loss: float):
-        """profit_or_loss: positivo en WIN, negativo en LOSS, 0 en EMPATE."""
-        self.signals_processed += 1
-        self.global_bankroll = round(self.global_bankroll + profit_or_loss, 2)
-        if result_type == 'WIN':
-            self.wins += 1; self.consecutive += 1
-        elif result_type == 'LOSS':
-            self.losses += 1; self.consecutive = 0
-        elif result_type == 'EMPATE':
-            self.zeros += 1
-        self.last_20.append({
-            "result": result_type, "attempt": attempt,
-            "number": number, "val": val, "type": type_str,
-            "roulette": roulette_name, "balance": self.global_bankroll
-        })
-
-    def get_stats_text(self) -> str:
-        total = self.wins + self.zeros + self.losses
-        eff = ((self.wins + self.zeros) / total * 100) if total > 0 else 0.0
-        text  = "📊 RESUMEN DIARIO — TODAS LAS RULETAS 📊\n"
-        text += f"🕛 Reporte 12:00 hs (Argentina)\n\n"
-        text += f"► PLACAR = ✅{self.wins} | 🟠{self.zeros} | 🚫{self.losses}\n"
-        text += f"► Consecutivas = {self.consecutive}\n"
-        text += f"► Assertividade = {eff:.2f}%\n"
-        text += f"► Balance total: 💰 {self.global_bankroll:.2f}\n"
-        text += f"► Total señales del día: {total}\n\n"
-        text += "📌 Últimas 20 SEÑALES 📌\n"
-        for s in reversed(list(self.last_20)):
-            a_str = f"🔄 GALE #{s['attempt']}"
-            b_str = f"💰 {s['balance']:.2f}"
-            rl    = s['roulette'][:14]
-            if s['result'] == 'WIN':
-                text += f"✅ WIN #{s['number']} {s['type']} {s['val']} | {rl} | {a_str} | {b_str}\n"
-            elif s['result'] == 'EMPATE':
-                text += f"🟠 EMPATE #0 ZERO | {rl} | {a_str} | {b_str}\n"
-            else:
-                text += f"🚫 LOSS #{s['number']} {s['type']} {s['val']} | {rl} | {a_str} | {b_str}\n"
-        return text
-
-# Instancia global única de stats
-GLOBAL_STATS = GlobalStats()
-
-# ─── ENGINE POR RULETA ────────────────────────────────────────────────────────
-class RouletteEngine:
-    """Estado ML/PF/PH independiente por ruleta. Sin gestión de niveles (solo nivel 1)."""
-
-    def __init__(self, ws_key: int, name: str):
-        self.ws_key = ws_key
-        self.name = name
-        self.db_path = f"roulette_{ws_key}.db"
-
-        # Estado analítico
-        self.spin_history: list = []
-        self.dozen_seq: list = []; self.column_seq: list = []
-        self.d_levels: dict = {1: [], 2: [], 3: []}
-        self.c_levels: dict = {1: [], 2: [], 3: []}
-        self.markov_d = SmoothedMarkovPredictor()
-        self.markov_c = SmoothedMarkovPredictor()
-        self.ensemble_d = OnlineEnsemblePredictor()
-        self.ensemble_c = OnlineEnsemblePredictor()
-        self.after_number_dozen: dict = defaultdict(lambda: defaultdict(int))
-        self.after_number_column: dict = defaultdict(lambda: defaultdict(int))
-
-        # Estado de señal
-        self.signal_active = False
-        self.active_type = None
-        self.active_pair: tuple = ()
-        self.active_missing = ""
-        self.total_signal_loss = 0.0
-        self.oportunidad = 1         # 1 = entrada base, 2 = gale x3
-        self.bankroll: float = 0.0
-        self.active_signal_msg_id = None
-        self.spins_since_train = 0
-        self.last_game_id = None
-        self.ws_count = 0
-        self.warmup_done = False
-
-        self._db = self._get_db()
-        live = self._load_live_history()
-        self.ws_count = live
-        self.warmup_done = live >= WARMUP_SPINS
-        logger.info(f"[{name}] Pre-cargados: {live} giros | Warmup: {'✅' if self.warmup_done else '⏳'}")
-
-    # ── DB ────────────────────────────────────────────────────────────────────
-    def _get_db(self) -> sqlite3.Connection:
-        conn = sqlite3.connect(self.db_path, check_same_thread=False)
-        conn.execute("""CREATE TABLE IF NOT EXISTS live_spins (
-            id INTEGER PRIMARY KEY AUTOINCREMENT,
-            number INTEGER NOT NULL,
-            ts INTEGER NOT NULL
-        )""")
-        conn.commit()
-        return conn
-
-    def _persist(self, number: int):
-        try:
-            self._db.execute("INSERT INTO live_spins(number,ts) VALUES(?,?)", (number, int(time.time())))
-            self._db.commit()
-        except: pass
-
-    def _load_live_history(self) -> int:
-        try: rows = self._db.execute("SELECT number FROM live_spins ORDER BY id ASC").fetchall()
-        except: return 0
-        for (n,) in rows: self._update_state(n, persist=False, train_model=False)
-        if rows: self._train_models()
-        return len(rows)
-
-    def _train_models(self):
-        self.markov_d.update(self.dozen_seq)
-        self.markov_c.update(self.column_seq)
-
-    # ── Estado ────────────────────────────────────────────────────────────────
-    def _update_state(self, number: int, persist=True, train_model=True):
-        color = REAL_COLOR_MAP.get(number, "VERDE")
-        d = get_dozen(number); c = get_column(number)
-        if number != 0 and self.spin_history:
-            prev = self.spin_history[-1]["number"]
-            if prev != 0:
-                self.after_number_dozen[prev][d] += 1
-                self.after_number_column[prev][c] += 1
-        self.spin_history.append({"number": number, "color": color})
-        if d != 0:
-            self.dozen_seq.append(d)
-            for dd in (1, 2, 3):
-                prev = self.d_levels[dd][-1] if self.d_levels[dd] else 0
-                self.d_levels[dd].append(prev + (1 if d == dd else -1))
-        if c != 0:
-            self.column_seq.append(c)
-            for cc in (1, 2, 3):
-                prev = self.c_levels[cc][-1] if self.c_levels[cc] else 0
-                self.c_levels[cc].append(prev + (1 if c == cc else -1))
-        if train_model and d != 0 and c != 0 and len(self.dozen_seq) > 5:
-            pf_d, ph_d = self._get_pf("DOCENA"), self._get_ph("DOCENA")
-            pf_c, ph_c = self._get_pf("COLUMNA"), self._get_ph("COLUMNA")
-            if pf_d and ph_d and pf_c and ph_c:
-                self.ensemble_d.partial_train(self.dozen_seq, self.column_seq, d,
-                                              pf_d["pair"], ph_d["pair"], pf_c["pair"], ph_c["pair"])
-                self.ensemble_c.partial_train(self.dozen_seq, self.column_seq, c,
-                                              pf_d["pair"], ph_d["pair"], pf_c["pair"], ph_c["pair"])
-            self.spins_since_train += 1
-            if self.spins_since_train >= TRAIN_INTERVAL:
-                self._train_models(); self.spins_since_train = 0
-        if persist: self._persist(number)
-
-    def _get_pf(self, cat_type: str) -> Optional[Dict]:
-        if len(self.spin_history) < 5: return None
-        counts = {1: 0, 2: 0, 3: 0}
-        for s in self.spin_history[-5:]:
-            n = s["number"]
-            if n != 0:
-                val = get_dozen(n) if cat_type == "DOCENA" else get_column(n)
-                counts[val] += 1
-        active = [k for k, v in counts.items() if v > 0]
-        if len(active) != 2: return None
-        missing = list({1, 2, 3} - set(active))[0]
-        return {"pair": tuple(sorted(active)), "missing": missing, "prob": sum(counts[a] for a in active) / 5.0}
-
-    def _get_ph(self, cat_type: str) -> Optional[Dict]:
-        if not self.spin_history: return None
-        last_num = self.spin_history[-1]["number"]
-        if last_num == 0: return None
-        counts = self.after_number_dozen.get(last_num, {}) if cat_type == "DOCENA" else \
-                 self.after_number_column.get(last_num, {})
-        total = sum(counts.values())
-        if total < 10: return None
-        sc = sorted(counts.items(), key=lambda x: x[1], reverse=True)
-        if len(sc) < 2: return None
-        missing = list({1, 2, 3} - {sc[0][0], sc[1][0]})[0]
-        return {"pair": tuple(sorted([sc[0][0], sc[1][0]])), "missing": missing,
-                "prob": (sc[0][1] + sc[1][1]) / total}
-
-    def _predict_pair_ml(self, cat_type: str, missing_num: int) -> float:
-        mk   = self.markov_d if cat_type == "DOCENA" else self.markov_c
-        hist = self.dozen_seq if cat_type == "DOCENA" else self.column_seq
-        levels = (self.d_levels if cat_type == "DOCENA" else self.c_levels).get(missing_num, [])
-        mk_pred = mk.predict(hist)
-        m_p_miss = mk_pred.get(missing_num, 1/3) if mk_pred else 1/3
-        pf_d, ph_d = self._get_pf("DOCENA"), self._get_ph("DOCENA")
-        pf_c, ph_c = self._get_pf("COLUMNA"), self._get_ph("COLUMNA")
-        ens_p_miss = 1/3
-        if pf_d and ph_d and pf_c and ph_c:
-            ens = self.ensemble_d.predict(hist, self.column_seq, pf_d["pair"], ph_d["pair"],
-                                          pf_c["pair"], ph_c["pair"]) \
-                  if cat_type == "DOCENA" else \
-                  self.ensemble_c.predict(self.dozen_seq, hist, pf_d["pair"], ph_d["pair"],
-                                          pf_c["pair"], ph_c["pair"])
-            if ens: ens_p_miss = ens.get(missing_num, 1/3)
-        ml_miss = 0.4 * m_p_miss + 0.6 * ens_p_miss
-        if len(levels) >= 20:
-            if ema_signal(levels, "tendencia"): ml_miss *= 0.85
-            elif ema_signal(levels, "moderado"): ml_miss *= 0.92
-        return 1.0 - ml_miss
-
-    def detect_signal(self) -> Optional[dict]:
-        pf_d = self._get_pf("DOCENA"); pf_c = self._get_pf("COLUMNA")
-        if not pf_d and not pf_c: return None
-        ph_d = self._get_ph("DOCENA"); ph_c = self._get_ph("COLUMNA")
-        candidates = []
-        if pf_d and ph_d and set(pf_d["pair"]) == set(ph_d["pair"]):
-            base = 0.65 * pf_d["prob"] + 0.35 * ph_d["prob"]
-            ml   = self._predict_pair_ml("DOCENA", pf_d["missing"])
-            prob = 0.5 * base + 0.5 * ml
-            if prob >= MIN_PROB:
-                candidates.append({"type":"DOCENA",
-                                    "pair":tuple(f"D{x}" for x in sorted(pf_d["pair"])),
-                                    "missing":f"D{pf_d['missing']}", "prob":prob})
-        if pf_c and ph_c and set(pf_c["pair"]) == set(ph_c["pair"]):
-            base = 0.65 * pf_c["prob"] + 0.35 * ph_c["prob"]
-            ml   = self._predict_pair_ml("COLUMNA", pf_c["missing"])
-            prob = 0.5 * base + 0.5 * ml
-            if prob >= MIN_PROB:
-                candidates.append({"type":"COLUMNA",
-                                    "pair":tuple(f"C{x}" for x in sorted(pf_c["pair"])),
-                                    "missing":f"C{pf_c['missing']}", "prob":prob})
-        return max(candidates, key=lambda x: x["prob"]) if candidates else None
-
-    # ── Mensaje de señal ──────────────────────────────────────────────────────
-    def _build_signal_text(self) -> str:
-        nums = sorted([p[1:] for p in self.active_pair])
-        pair_disp = f"{nums[0]} y {nums[1]}"
-        type_str, singular = ("docenas", "docena") if self.active_type == "DOCENA" else ("columnas", "columna")
-        gale_num  = self.oportunidad - 1   # 0 = entrada base, 1 = gale
-        bet       = BASE_BET if gale_num == 0 else BASE_BET * 3
-        total_bet = bet * 2
-        return (
-            f"✅✅ ENTRADA CONFIRMADA ✅✅\n\n"
-            f"🕹️ {self.name}\n"
-            f"🎯 Entrar en las {type_str}: {pair_disp}\n"
-            f"💰 Balance: {GLOBAL_STATS.global_bankroll:.2f}\n"
-            f"💵 Apuesta total: {total_bet:.2f}\n"
-            f"🚨 (por {singular}: {bet:.2f})\n"
-            f"⚔️ Cubrir el CERO 🟢\n"
-            f"🛟 GALE #{gale_num}"
+        # Texto del resultado (sin marcador)
+        result_text = (
+            f"🎰 <b>{ROULETTE_NAME}</b>\n\n"
+            f"{emoji} <b>SEÑAL {label}</b>\n\n"
+            f"📌 <b>Estrategia:</b> {self.name}\n"
+            f"🎯 <b>Apuesta:</b> {self.sig['bet']}\n"
+            f"🔢 <b>Número:</b> {_ball(n)}"
         )
 
-    def send_signal(self):
-        msg_id = tg_send(self._build_signal_text())
-        if msg_id:
-            self.active_signal_msg_id = msg_id
-
-    def iniciar_senal(self, sig: dict):
-        self.signal_active    = True
-        self.active_type      = sig["type"]
-        self.active_pair      = sig["pair"]
-        self.active_missing   = sig["missing"]
-        self.oportunidad      = 1
-        self.total_signal_loss = 0.0
-        self.send_signal()
-
-    def resolve(self, number: int) -> bool:
-        """Resolver resultado. Retorna True si la señal terminó."""
-        color    = REAL_COLOR_MAP.get(number, "VERDE")
-        d, c     = get_dozen(number), get_column(number)
-        type_str = self.active_type
-        val_num  = d if type_str == "DOCENA" else c
-        intento  = self.oportunidad   # 1 o 2
-        bet      = BASE_BET if intento == 1 else BASE_BET * 3
-
-        gale_num = intento - 1  # 0 = entrada base, 1 = gale
-
-        # ── CERO ──────────────────────────────────────────────────────────────
-        if number == 0:
-            tg_send(
-                f"🟠 EMPATE 0 — ZERO — 🔄 GALE #{gale_num}\n"
-                f"🉑 Para la próxima ganaremos 0.00 🉑\n"
-                f"💰 Balance actual: {GLOBAL_STATS.global_bankroll:.2f}"
-            )
-            GLOBAL_STATS.record('EMPATE', intento, 0, 0, type_str, self.name, 0.0)
-            self._reset_signal()
-            return True
-
-        won = (type_str == "DOCENA"  and d != 0 and f"D{d}" in self.active_pair) or \
-              (type_str == "COLUMNA" and c != 0 and f"C{c}" in self.active_pair)
-
-        if won:
-            profit = bet
-            self.bankroll = round(self.bankroll + profit, 2)
-            cat_label = f"{'DOCENA' if type_str == 'DOCENA' else 'COLUMNA'} {val_num}"
-            GLOBAL_STATS.record('WIN', intento, number, val_num, type_str, self.name, profit)
-            tg_send(
-                f"✅ WIN {number} — {cat_label} — 🔄 GALE #{gale_num}\n"
-                f"🎉 Felicidades has ganado {profit:.2f} 🎉\n"
-                f"💰 Balance actual: {GLOBAL_STATS.global_bankroll:.2f}"
-            )
-            self._reset_signal()
-            return True
-
+        if self.msg_id:
+            tg_reply(self.msg_id, result_text)          # responde como comentario al mensaje de señal
         else:
-            loss = bet * 2
-            self.bankroll          = round(self.bankroll - loss, 2)
-            self.total_signal_loss = round(self.total_signal_loss + loss, 2)
+            tg_send(result_text)
 
-            if intento == 1:
-                # ── Perdió Gale #0 → borrar mensaje de señal, enviar GALE #1 ──
-                # El próximo giro valida Gale #1 directamente (NO se salta)
-                if self.active_signal_msg_id:
-                    tg_delete(CHAT_ID, self.active_signal_msg_id)
-                    self.active_signal_msg_id = None
-                self.oportunidad    = 2
-                self.send_signal()   # nuevo mensaje con GALE #1
-                return False         # señal sigue activa
+        logger.info(f"{emoji} [{self.name}] Señal {label} | Número: {n}")
 
-            else:
-                # ── Perdió Gale #1 → mensaje con LOSS ──────────────────────
-                cat_label = f"{'DOCENA' if type_str == 'DOCENA' else 'COLUMNA'} {val_num}"
-                GLOBAL_STATS.record('LOSS', 2, number, val_num, type_str, self.name, -self.total_signal_loss)
-                tg_send(
-                    f"❌ LOSS {number} — {cat_label} — 🔄 GALE #{gale_num}\n"
-                    f"🚨 Señal perdida. Monto total perdido en las 2 entradas: -{self.total_signal_loss:.2f} 🚨\n"
-                    f"💰 Balance actual: {GLOBAL_STATS.global_bankroll:.2f}"
-                )
-                self._reset_signal()
-                return True
+        # reset
+        self.waiting = False
+        self.sig     = None
+        self.msg_id  = None
+        return won
 
-    def _reset_signal(self):
-        self.signal_active = False
-        self.active_pair = ()
-        self.active_type = None
-        self.total_signal_loss = 0.0
-        self.oportunidad = 1
-        self.active_signal_msg_id = None
 
-    def feed_number(self, number: int, active: bool = False):
-        """Alimentar número al estado del engine. Persiste en DB y loguea en consola."""
-        color  = REAL_COLOR_MAP.get(number, "VERDE")
-        d      = get_dozen(number)
-        c      = get_column(number)
-        tag    = "🟢 ACTIVA" if active else "⚫ pasiva"
-        spin_n = len(self.spin_history) + 1  # antes del update
+class SignalEngine:
+    def __init__(self):
+        self.history     = []
+        self.warmup_done = False
+        # Un slot independiente por cada estrategia
+        self.slots = [StrategySlot(name, checker)
+                      for name, checker in zip(STRATEGY_NAMES, CHECKERS)]
 
-        self._update_state(number)           # persiste en DB aquí
+    def on_number(self, n: int):
+        self.history.append(n)
 
         if not self.warmup_done:
-            self.ws_count += 1
-            warmup_tag = f"⏳ warmup {self.ws_count}/{WARMUP_SPINS}"
-            if self.ws_count >= WARMUP_SPINS:
+            if len(self.history) >= WARMUP_SPINS:
                 self.warmup_done = True
-                warmup_tag = "✅ WARMUP listo"
-        else:
-            warmup_tag = "✔"
-
-        logger.info(
-            f"[{self.name}] 🎰 #{spin_n:>4} | {number:>2} {color:<5} D{d} C{c} "
-            f"| {tag} | {warmup_tag} | 💾 guardado"
-        )
-
-
-# ─── GESTOR DE SESIONES ───────────────────────────────────────────────────────
-class SessionManager:
-    """
-    Sesiones sincronizadas al reloj:
-      - Arrancan en HH:00 y HH:30 exactos (hora Argentina UTC-3)
-      - 25 min activos (señales) + 5 min de pausa → 48 sesiones/día
-      - 5 ruletas rotando en orden. Al terminar la 5ª vuelve a la 1ª.
-      - Solo la ruleta activa puede emitir señal; las demás acumulan datos.
-
-    MENSAJES:
-      - Al enviar mensaje de inicio (:00/:30) se elimina el anterior de inicio Y el de fin.
-      - Al enviar mensaje de fin (:25/:55) solo se guarda el ID (se borrará al iniciar la próxima).
-    """
-    ARG_UTC_OFFSET = -3
-
-    def __init__(self):
-        self.engines: list[RouletteEngine] = [
-            RouletteEngine(r["key"], r["name"]) for r in ROULETTES
-        ]
-        self.current_idx       = 0
-        self.session_start     = 0.0      # epoch del inicio del slot actual
-        self.session_active    = False    # True durante los 25 min activos
-        self.signal_sent_this_session = False
-
-        # ── IDs para borrar mensajes anteriores ───────────────────────────────
-        self.prev_start_msg_id: Optional[int] = None   # msg de :00/:30 anterior
-        self.prev_end_msg_id:   Optional[int] = None   # msg de :25/:55 anterior
-
-        logger.info("[SessionManager] Iniciado — esperando próximo slot en punto o media hora.")
-
-    # ── Hora Argentina ────────────────────────────────────────────────────────
-    def _now_arg(self):
-        import datetime
-        return datetime.datetime.utcnow() + datetime.timedelta(hours=self.ARG_UTC_OFFSET)
-
-    # ── Calcular cuántos segundos faltan para el próximo slot (HH:00 o HH:30) ─
-    def seconds_to_next_slot(self) -> float:
-        import datetime
-        now = self._now_arg()
-        if now.second <= 5 and now.minute in (0, 30):
-            return 0.0
-        if now.minute < 30:
-            target = now.replace(minute=30, second=0, microsecond=0)
-        else:
-            target = (now + datetime.timedelta(hours=1)).replace(minute=0, second=0, microsecond=0)
-        diff = (target - now).total_seconds()
-        return max(0.0, diff)
-
-    # ── Calcular el índice de ruleta según el slot del día ───────────────────
-    def _slot_index_for_now(self) -> int:
-        now = self._now_arg()
-        slot_of_day = now.hour * 2 + (1 if now.minute >= 30 else 0)
-        return slot_of_day % len(self.engines)
-
-    # ── Iniciar sesión activa ─────────────────────────────────────────────────
-    def _start_session(self, initial: bool = False):
-        import datetime
-        # En el arranque inicial se calcula el índice desde el reloj.
-        # En todos los cambios siguientes se avanza secuencialmente para que
-        # la ruleta que sigue sea siempre la inmediata posterior en el array,
-        # sin importar la hora — así se evita el desfase de _slot_index_for_now().
-        if initial:
-            self.current_idx = self._slot_index_for_now()
-        else:
-            self.current_idx = (self.current_idx + 1) % len(self.engines)
-
-        self.session_start = time.time()
-        self.session_active = True
-        self.signal_sent_this_session = False
-        engine = self.engines[self.current_idx]
-        now_str = self._now_arg().strftime("%H:%M")
-        end_str = (self._now_arg() + datetime.timedelta(minutes=25)).strftime("%H:%M")
-        logger.info(f"[SessionManager] 🟢 Sesión iniciada: {engine.name} | {now_str}–{end_str} (ARG)")
-
-        if self.prev_start_msg_id:
-            tg_delete(CHAT_ID, self.prev_start_msg_id)
-            self.prev_start_msg_id = None
-
-        msg_id = tg_send(f"🔔 SESION INICIADA — {engine.name} 🔔")
-        self.prev_start_msg_id = msg_id
-
-    # ── Cerrar sesión activa ──────────────────────────────────────────────────
-    def _end_session(self):
-        engine = self.engines[self.current_idx]
-        # El next_idx es siempre el siguiente en el array — igual que hará _start_session
-        next_idx  = (self.current_idx + 1) % len(self.engines)
-        next_name = self.engines[next_idx].name
-        logger.info(f"[SessionManager] ⏸ Sesión terminada: {engine.name} → siguiente: {next_name}")
-        self.session_active = False
-
-        # ── Al enviar nuevo fin: borrar el mensaje de fin ANTERIOR ────────────
-        if self.prev_end_msg_id:
-            tg_delete(CHAT_ID, self.prev_end_msg_id)
-            self.prev_end_msg_id = None
-
-        text = (
-            f"⏸ SESIÓN CERRADA — {engine.name}\n"
-            f"🎰 PRÓXIMA RULETA — {next_name} 🎰\n\n"
-            f"💵 ¿COMO OPERAR LAS SEÑALES?\n\n"
-            f"1° Op. = $0.50 USD x Docena/Columna\n"
-            f"2° Op. = $1.50 USD x Docena/Columna\n\n"
-            f"🎯 FUNCIONAMIENTO DE LAS SEÑALES 🎯\n\n"
-            f"  • Se envía señal → Se resuelve\n"
-            f"  • Sesión se cierra → Ej: 12:25 o 12:55\n"
-            f"  • Nueva Sesión → Ej: 15:00 o 15:30\n"
-            f"  • Nueva Señal → Ciclo de señales\n\n"
-            f"♦️ POR SESION SE ENVÍA 1 SEÑAL ♦️"
-        )
-        msg_id = tg_send_with_button(text, next_name)
-        self.prev_end_msg_id = msg_id
-
-    # ── Watchdog: controla inicio/fin de sesión según el reloj ───────────────
-    async def session_watchdog(self):
-        # Esperar al primer slot
-        wait = self.seconds_to_next_slot()
-        logger.info(f"[SessionManager] ⏳ Esperando {wait/60:.1f} min para el primer slot...")
-        await asyncio.sleep(wait)
-        self._start_session(initial=True)   # ← arranque inicial: usar el reloj
-
-        _waiting_signal_since: Optional[float] = None
-        SIGNAL_WAIT_TIMEOUT = 120
-
-        while True:
-            await asyncio.sleep(1)
-            now     = time.time()
-            elapsed = now - self.session_start
-            engine  = self.engines[self.current_idx]
-
-            if self.session_active:
-                if elapsed >= SESSION_ACTIVE:
-                    if engine.signal_active:
-                        if _waiting_signal_since is None:
-                            _waiting_signal_since = now
-                            logger.info(
-                                f"[SessionManager] ⏳ Sesión terminada pero señal activa en "
-                                f"{engine.name} — esperando resolución (máx {SIGNAL_WAIT_TIMEOUT}s)..."
-                            )
-                        elif now - _waiting_signal_since >= SIGNAL_WAIT_TIMEOUT:
-                            logger.warning(
-                                f"[SessionManager] ⚠️ Timeout esperando señal en {engine.name} "
-                                f"({SIGNAL_WAIT_TIMEOUT}s). Cancelando señal y cerrando sesión."
-                            )
-                            if engine.active_signal_msg_id:
-                                tg_edit(CHAT_ID, engine.active_signal_msg_id,
-                                        engine._build_signal_text() +
-                                        "\n\n⚠️ Señal cancelada — tiempo de sesión agotado.")
-                            engine._reset_signal()
-                            _waiting_signal_since = None
-                        else:
-                            continue
-                    else:
-                        _waiting_signal_since = None
-
-                    end_time = time.time()
-                    self._end_session()
-                    pause_remaining = SESSION_TOTAL - (end_time - self.session_start)
-                    if pause_remaining > 0:
-                        logger.info(f"[SessionManager] ⏸ Pausa {pause_remaining:.0f}s")
-                        await asyncio.sleep(pause_remaining)
-                    self._start_session()   # ← rotación normal: avanza +1
-            else:
-                if elapsed >= SESSION_TOTAL:
-                    self._start_session()   # ← rotación normal: avanza +1
-
-    # ── Tick de sesión activa ─────────────────────────────────────────────────
-    def tick_active(self, engine: RouletteEngine, number: int):
-        engine.feed_number(number, active=True)
-
-        if not self.session_active:
+                logger.info(f"✅ Warmup completo ({WARMUP_SPINS} giros)")
             return
 
-        elapsed = time.time() - self.session_start
-        if elapsed >= SESSION_ACTIVE:
-            return
+        # 1) Resolver primero todas las señales que estaban esperando
+        resolved_any = False
+        for slot in self.slots:
+            if slot.waiting:
+                result = slot.resolve(n)
+                if result is not None:
+                    resolved_any = True
 
-        if engine.signal_active:
-            done = engine.resolve(number)
-            if done:
-                elapsed2 = time.time() - self.session_start
-                if elapsed2 >= SESSION_ACTIVE:
-                    self._end_session()
-            return
+        # Enviar marcador una sola vez después de resolver todas las señales del giro
+        if resolved_any:
+            tg_send(SCORE.get_text())
 
-        if not self.signal_sent_this_session and engine.warmup_done:
-            sig = engine.detect_signal()
-            if sig:
-                logger.info(f"[SessionManager] 🎯 Señal detectada en {engine.name}: {sig}")
-                engine.iniciar_senal(sig)
-                self.signal_sent_this_session = True
+        # 2) Luego detectar nuevas señales con el historial actualizado
+        for slot in self.slots:
+            slot.try_detect(self.history)
 
-    # ── Tick pasivo ───────────────────────────────────────────────────────────
-    def tick_passive(self, engine: RouletteEngine, number: int):
-        engine.feed_number(number, active=False)
-
-    # ── Entrada de número desde WS ────────────────────────────────────────────
-    def on_number(self, ws_key: int, number: int):
-        for i, engine in enumerate(self.engines):
-            if engine.ws_key != ws_key:
-                continue
-            if i == self.current_idx:
-                self.tick_active(engine, number)
-            else:
-                self.tick_passive(engine, number)
-            break
-
-    # ── Avanzar ruleta manualmente (comando /siguiente) ───────────────────────
-    def _advance_session(self):
-        self._end_session()
-        self.current_idx = (self.current_idx + 1) % len(self.engines)
-        self.session_start = time.time()
-        self.session_active = True
-        self.signal_sent_this_session = False
+    @property
+    def active_signals(self):
+        return [s for s in self.slots if s.waiting]
 
 
-# ─── WS READER POR RULETA ─────────────────────────────────────────────────────
-async def ws_reader(ws_key: int, session_mgr: SessionManager):
-    """
-    Lee datos WebSocket para una ruleta con polling activo de 1 segundo.
+ENGINE = SignalEngine()
 
-    Deduplicación:
-      - Cada jugada tiene un game_id único proporcionado por el servidor.
-      - Se mantiene un set `seen_ids` acotado (máx 200 IDs) + deque para
-        limpiar los más antiguos automáticamente y evitar crecimiento infinito.
-      - TODAS las rutas de entrada (last20Results y fallback directo) pasan
-        por `is_new_id()` antes de procesar. Si el ID ya fue visto → descartado.
-      - En la carga inicial los 20 IDs se registran en seen_ids sin procesar
-        en tiempo real, evitando que el polling los reprocese.
+# ─── WEBSOCKET READER ─────────────────────────────────────────────────────────
+async def ws_reader():
+    reconnect_delay = 3
+    seen_ids: set = set()
 
-    Flujo:
-      1. Primera conexión → carga 20 giros iniciales de la API (sin DB, sin señales).
-      2. Polling paralelo de 1s → garantiza datos frescos para ruletas rápidas.
-      3. Cualquier giro nuevo detectado pasa por is_new_id() antes de on_number().
-    """
-    reconnect_delay = 5
-    initial_loaded = False   # True tras carga inicial de los primeros 20
-
-    # ── Deduplicación por ID único de jugada ──────────────────────────────────
-    seen_ids: set  = set()
-    seen_ids_queue: deque = deque(maxlen=200)   # límite de memoria: máx 200 IDs
-
-    def is_new_id(gid: str) -> bool:
-        if not gid or gid in seen_ids:
-            return False
-        if len(seen_ids_queue) == seen_ids_queue.maxlen:
-            seen_ids.discard(seen_ids_queue[0])
+    def is_new(gid: str) -> bool:
+        if gid in seen_ids: return False
         seen_ids.add(gid)
-        seen_ids_queue.append(gid)
+        if len(seen_ids) > 5000:
+            oldest = list(seen_ids)[:1000]
+            for x in oldest: seen_ids.discard(x)
         return True
 
     while True:
         try:
-            async with websockets.connect(
-                WS_URL, ping_interval=20, ping_timeout=40, close_timeout=10
-            ) as ws:
-                await ws.send(json.dumps({
-                    "type": "subscribe", "key": ws_key, "casinoId": CASINO_ID
-                }))
-                logger.info(f"[WS-{ws_key}] ✅ Conectado | polling 1s | dedup activo")
-                reconnect_delay = 5
+            sub_msg = json.dumps({
+                "type": "subscribe",
+                "casinoId": CASINO_ID,
+                "key": str(ROULETTE_KEY),
+            })
+            async with websockets.connect(WS_URL, ping_interval=20, ping_timeout=30) as ws:
+                await ws.send(sub_msg)
+                reconnect_delay = 3
+                logger.info(f"[WS] Conectado — Mega Roulette key={ROULETTE_KEY}")
 
-                # ── Tarea paralela: re-suscribe cada 1 segundo ────────────────
-                async def poll_1s():
-                    while True:
-                        await asyncio.sleep(1)
+                async for raw in ws:
+                    try:
+                        data = json.loads(raw)
+                    except Exception:
+                        continue
+
+                    # carga inicial de historial
+                    if isinstance(data, dict) and "results" in data:
+                        results = data["results"]
+                        if isinstance(results, list):
+                            loaded = 0
+                            for item in reversed(results):
+                                gid = str(item.get("gameId", ""))
+                                if not gid or not is_new(gid): continue
+                                try:
+                                    n = int(item.get("result", ""))
+                                    if 0 <= n <= 36:
+                                        ENGINE.history.append(n)
+                                        loaded += 1
+                                except (ValueError, TypeError): pass
+                            if not ENGINE.warmup_done and len(ENGINE.history) >= WARMUP_SPINS:
+                                ENGINE.warmup_done = True
+                                logger.info(f"✅ Warmup por carga inicial ({loaded} giros)")
+                            logger.info(f"[WS] Carga inicial: {loaded} giros | Total: {len(ENGINE.history)}")
+                        continue
+
+                    # nuevo giro en tiempo real
+                    results = data.get("results") if isinstance(data, dict) else None
+                    if results and isinstance(results, list) and len(results) > 0:
+                        latest = results[0]
+                        gid = str(latest.get("gameId", ""))
+                        if not is_new(gid): continue
                         try:
-                            await ws.send(json.dumps({
-                                "type": "subscribe",
-                                "key": ws_key,
-                                "casinoId": CASINO_ID
-                            }))
-                        except Exception:
+                            n = int(latest.get("result", ""))
+                            if 0 <= n <= 36:
+                                logger.info(f"[WS] Nuevo número: {n}")
+                                ENGINE.on_number(n)
+                        except (ValueError, TypeError): pass
+                        continue
+
+                    # fallback
+                    for key in ("result", "number", "outcome", "winningNumber"):
+                        if key in data:
+                            gid = str(data.get("gameId", f"{ROULETTE_KEY}_{data[key]}_{int(time.time())}"))
+                            if not is_new(gid): break
+                            try:
+                                n = int(data[key])
+                                if 0 <= n <= 36:
+                                    logger.info(f"[WS-fallback] Nuevo número: {n}")
+                                    ENGINE.on_number(n)
+                            except (ValueError, TypeError): pass
                             break
 
-                poll_task = asyncio.create_task(poll_1s())
-
-                try:
-                    async for raw in ws:
-                        try:
-                            data = json.loads(raw)
-                        except Exception:
-                            continue
-                        if not isinstance(data, dict):
-                            continue
-
-                        results = data.get("last20Results")
-                        if results and isinstance(results, list):
-
-                            # ── CARGA INICIAL ─────────────────────────────────
-                            if not initial_loaded:
-                                initial_loaded = True
-                                engine = next(
-                                    (e for e in session_mgr.engines if e.ws_key == ws_key), None
-                                )
-                                loaded_count = 0
-                                if engine:
-                                    for item in reversed(results):
-                                        gid_init = str(item.get("gameId", ""))
-                                        if gid_init:
-                                            if len(seen_ids_queue) == seen_ids_queue.maxlen:
-                                                seen_ids.discard(seen_ids_queue[0])
-                                            seen_ids.add(gid_init)
-                                            seen_ids_queue.append(gid_init)
-                                        try:
-                                            n = int(item.get("result", ""))
-                                        except (ValueError, TypeError):
-                                            continue
-                                        if 0 <= n <= 36:
-                                            engine._update_state(n, persist=False, train_model=True)
-                                            loaded_count += 1
-                                    engine._train_models()
-                                    if not engine.warmup_done and len(engine.spin_history) >= WARMUP_SPINS:
-                                        engine.warmup_done = True
-                                        engine.ws_count = len(engine.spin_history)
-                                        logger.info(f"[WS-{ws_key}] ✅ WARMUP alcanzado tras carga inicial")
-                                    logger.info(
-                                        f"[WS-{ws_key}] 📦 {loaded_count} giros iniciales | "
-                                        f"Historia: {len(engine.spin_history)} | "
-                                        f"IDs registrados: {len(seen_ids)} | "
-                                        f"Warmup: {'✅' if engine.warmup_done else '⏳'}"
-                                    )
-                                continue
-
-                            # ── TIEMPO REAL: last20Results ────────────────────
-                            latest = results[0]
-                            gid = str(latest.get("gameId", ""))
-                            if not is_new_id(gid):
-                                continue
-                            try:
-                                n = int(latest.get("result", ""))
-                            except (ValueError, TypeError):
-                                continue
-                            if 0 <= n <= 36:
-                                session_mgr.on_number(ws_key, n)
-                            continue
-
-                        # ── Fallback: mensajes con número directo ─────────────
-                        fallback_gid = str(data.get("gameId", "")).strip()
-                        if not fallback_gid:
-                            for key in ("result", "number", "outcome", "winningNumber"):
-                                if key in data:
-                                    fallback_gid = f"{ws_key}_{data[key]}_{int(time.time())}"
-                                    break
-                        if not fallback_gid or not is_new_id(fallback_gid):
-                            continue
-
-                        for key in ("result", "number", "outcome", "winningNumber"):
-                            if key in data:
-                                try:
-                                    n = int(data[key])
-                                    if 0 <= n <= 36:
-                                        session_mgr.on_number(ws_key, n)
-                                except (ValueError, TypeError):
-                                    pass
-                                break
-
-                finally:
-                    poll_task.cancel()
-                    try:
-                        await poll_task
-                    except asyncio.CancelledError:
-                        pass
-
         except Exception as e:
-            logger.warning(f"[WS-{ws_key}] Desconectado: {e}. Reconectando en {reconnect_delay}s")
+            logger.warning(f"[WS] Desconectado: {e}. Reconectando en {reconnect_delay}s")
             await asyncio.sleep(reconnect_delay)
             reconnect_delay = min(reconnect_delay * 2, 60)
 
 
 # ─── FLASK ────────────────────────────────────────────────────────────────────
-app = Flask(__name__)
-session_mgr_global: Optional[SessionManager] = None
+flask_app = Flask(__name__)
 
-@app.route("/")
+@flask_app.route("/")
 def home():
-    return jsonify({"status": "ok", "bot": "Multi-Roulette Session Bot"})
+    return jsonify({"status": "ok", "bot": "Mega Roulette Bot — key 204"})
 
-@app.route("/ping")
+@flask_app.route("/ping")
 def ping():
     return jsonify({"status": "pong", "ts": time.time()})
 
-@app.route("/health")
+@flask_app.route("/health")
 def health():
-    if not session_mgr_global:
-        return jsonify({"status": "initializing"})
-    active = session_mgr_global.engines[session_mgr_global.current_idx]
-    elapsed = int(time.time() - session_mgr_global.session_start)
-    remaining = max(0, SESSION_ACTIVE - elapsed)
+    active = ENGINE.active_signals
     return jsonify({
-        "active_roulette": active.name,
-        "session_elapsed_s": elapsed,
-        "session_remaining_s": remaining,
-        "signal_sent": session_mgr_global.signal_sent_this_session,
-        "signal_active": active.signal_active,
-        "engines": [
-            {"name": e.name, "spins": len(e.spin_history), "warmup": e.warmup_done,
-             "balance": e.bankroll}
-            for e in session_mgr_global.engines
-        ]
+        "roulette":       ROULETTE_NAME,
+        "warmup":         ENGINE.warmup_done,
+        "history_len":    len(ENGINE.history),
+        "signals_active": len(active),
+        "active_signals": [{"name": s.name, "bet": s.sig["bet"]} for s in active],
+        "score":          {"wins": SCORE.wins, "losses": SCORE.losses},
     })
 
 async def self_ping_loop():
@@ -1059,90 +480,81 @@ async def self_ping_loop():
         except: pass
         await asyncio.sleep(240)
 
-async def daily_stats_loop():
-    """Envía estadísticas unificadas a las 12:00 hs de Argentina (UTC-3) cada día."""
+# ─── RESET DIARIO DEL MARCADOR ────────────────────────────────────────────────
+async def daily_reset_loop():
     import datetime
-    ARG_UTC_OFFSET = -3
     while True:
         now_utc = datetime.datetime.utcnow()
-        now_arg = now_utc + datetime.timedelta(hours=ARG_UTC_OFFSET)
-        target  = now_arg.replace(hour=12, minute=0, second=0, microsecond=0)
-        if now_arg >= target:
-            target += datetime.timedelta(days=1)
-        wait_secs = (target - now_arg).total_seconds()
-        logger.info(f"[Stats] Próximo reporte diario en {wait_secs/3600:.1f}h")
-        await asyncio.sleep(wait_secs)
-        if session_mgr_global:
-            tg_send_stats(GLOBAL_STATS.get_stats_text())
-            logger.info("[Stats] Reporte diario enviado al tema 40034.")
+        now_arg = now_utc + datetime.timedelta(hours=-3)
+        target  = now_arg.replace(hour=0, minute=0, second=0, microsecond=0) \
+                  + datetime.timedelta(days=1)
+        wait    = (target - now_arg).total_seconds()
+        logger.info(f"[Score] Reset diario en {wait/3600:.1f}h")
+        await asyncio.sleep(wait)
+        SCORE.reset()
+        logger.info("[Score] Marcador reiniciado para el nuevo día")
 
 # ─── BOT COMMANDS ─────────────────────────────────────────────────────────────
 @bot.message_handler(commands=['start', 'help'])
 def cmd_start(m):
     bot.reply_to(m,
-        "<b>🎰 Multi-Roulette Session Bot</b>\n\n"
-        "5 ruletas rotando cada 30 min\n"
-        "1 señal por sesión | 48 señales/día\n"
-        "📊 Stats unificadas enviadas a las 12:00 hs (ARG)\n\n"
+        "<b>🎰 Mega Roulette Bot</b>\n\n"
+        "Ruleta: MEGA ROULETTE (key 204)\n"
+        "Señales: Docenas · Columnas · Call+PLE · Color · Rango\n"
+        "Sin gestión · 1 intento por señal\n\n"
         "/status — Estado actual\n"
-        "/stats — Ver estadísticas ahora\n"
-        "/siguiente — Forzar cambio de ruleta",
+        "/score — Marcador diario",
         parse_mode="HTML")
 
 @bot.message_handler(commands=['status'])
 def cmd_status(m):
-    if not session_mgr_global: return
-    active = session_mgr_global.engines[session_mgr_global.current_idx]
-    elapsed = int(time.time() - session_mgr_global.session_start)
-    remaining = max(0, SESSION_ACTIVE - elapsed) // 60
-    st = f"🟢 Señal activa: {active.active_pair}" if active.signal_active else "⚪ Esperando señal"
+    active = ENGINE.active_signals
+    if active:
+        lines = "\n".join(f"📡 <b>{s.name}</b> — {s.sig['bet']}" for s in active)
+        estado = f"Señales activas ({len(active)}):\n{lines}"
+    else:
+        estado = "⚪ Sin señales activas"
     bot.reply_to(m,
-        f"<b>Ruleta activa:</b> {active.name}\n"
-        f"<b>Estado:</b> {st}\n"
-        f"<b>Tiempo restante:</b> {remaining} min\n"
-        f"<b>Señal enviada:</b> {'✅' if session_mgr_global.signal_sent_this_session else '⏳'}\n"
-        f"<b>Balance global:</b> {GLOBAL_STATS.global_bankroll:.2f}",
+        f"🎰 <b>{ROULETTE_NAME}</b>\n"
+        f"Warmup: {'✅' if ENGINE.warmup_done else '⏳'}\n"
+        f"Giros vistos: {len(ENGINE.history)}\n"
+        f"{estado}",
         parse_mode="HTML")
 
-@bot.message_handler(commands=['stats'])
-def cmd_stats(m):
-    if not session_mgr_global: return
-    tg_send_stats(GLOBAL_STATS.get_stats_text())
-
-@bot.message_handler(commands=['siguiente'])
-def cmd_siguiente(m):
-    if not session_mgr_global: return
-    session_mgr_global._advance_session()
-    active = session_mgr_global.engines[session_mgr_global.current_idx]
-    bot.reply_to(m, f"🔄 Cambiado a: <b>{active.name}</b>", parse_mode="HTML")
+@bot.message_handler(commands=['score'])
+def cmd_score(m):
+    bot.reply_to(m, SCORE.get_text(), parse_mode="HTML")
 
 def run_flask():
-    app.run(host="0.0.0.0", port=int(os.environ.get("PORT", 10000)), debug=False, use_reloader=False)
+    port = int(os.environ.get("PORT", 10000))
+    logger.info(f"[Flask] Iniciando en 0.0.0.0:{port}")
+    flask_app.run(host="0.0.0.0", port=port, debug=False, use_reloader=False)
 
 # ─── MAIN ─────────────────────────────────────────────────────────────────────
 async def main():
-    global session_mgr_global
-    session_mgr_global = SessionManager()
+    threading.Thread(target=run_flask, daemon=True).start()
+    logger.info("[Main] ✅ Flask thread iniciado")
 
     threading.Thread(
         target=lambda: bot.polling(none_stop=True, interval=1, timeout=30),
         daemon=True
     ).start()
+    logger.info("[Main] ✅ Telegram bot thread iniciado")
 
-    tasks = [
-        asyncio.create_task(session_mgr_global.session_watchdog()),
-        asyncio.create_task(daily_stats_loop()),
-    ]
-    for r in ROULETTES:
-        tasks.append(asyncio.create_task(ws_reader(r["key"], session_mgr_global)))
-    tasks.append(asyncio.create_task(self_ping_loop()))
+    await asyncio.sleep(1)
+    logger.info(f"[Main] 🎰 Bot iniciado — {ROULETTE_NAME} key={ROULETTE_KEY}")
 
-    logger.info("[Main] 🎰 Multi-Roulette Session Bot iniciado — 5 ruletas / 30 min por sesión")
-    await asyncio.gather(*tasks)
+    await asyncio.gather(
+        ws_reader(),
+        daily_reset_loop(),
+        self_ping_loop(),
+    )
 
 if __name__ == "__main__":
-    threading.Thread(target=run_flask, daemon=True).start()
     try:
         asyncio.run(main())
     except KeyboardInterrupt:
         logger.info("[Main] 🛑 Bot detenido")
+    except Exception as e:
+        logger.error(f"[Main] 💥 Error fatal: {e}")
+        raise
