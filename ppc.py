@@ -32,15 +32,44 @@ for _ln in ['werkzeug', 'flask.app', 'flask', 'urllib3']:
 TOKEN   = "8932208184:AAHj_7XYSQQmZZQWrk6LJtJj4CkwuCxrNLI"
 CHAT_ID = -1003610988961
 
-_session = requests.Session()
-_retry = Retry(total=5, backoff_factor=1.5, status_forcelist=[429, 500, 502, 503, 504],
-               allowed_methods=["GET", "POST"], raise_on_status=False)
-_session.mount("https://", HTTPAdapter(max_retries=_retry, pool_connections=10, pool_maxsize=20))
-_session.mount("http://",  HTTPAdapter(max_retries=_retry, pool_connections=10, pool_maxsize=20))
-bot = telebot.TeleBot(TOKEN, threaded=False)
-bot.session = _session
+# ── Sesión para ENVIAR mensajes (con reintentos y timeout generoso) ──
+_send_session = requests.Session()
+_send_retry = Retry(total=5, backoff_factor=1.5, status_forcelist=[429, 500, 502, 503, 504],
+                    allowed_methods=["GET", "POST"], raise_on_status=False)
+_send_session.mount("https://", HTTPAdapter(max_retries=_send_retry, pool_connections=10, pool_maxsize=20))
+_send_session.mount("http://",  HTTPAdapter(max_retries=_send_retry, pool_connections=10, pool_maxsize=20))
 
-# ─── RULETA ───────────────────────────────────────────────────────────────────
+API_BASE = f"https://api.telegram.org/bot{TOKEN}/"
+
+# ── Sesión para POLLING (sin reintentos agresivos) ──
+_poll_session = requests.Session()
+_poll_session.mount("https://", HTTPAdapter(max_retries=Retry(total=2, backoff_factor=1),
+                                            pool_connections=5, pool_maxsize=10))
+_poll_session.mount("http://",  HTTPAdapter(max_retries=Retry(total=2, backoff_factor=1),
+                                            pool_connections=5, pool_maxsize=10))
+
+# ── Bot (solo para polling y command handlers) ──
+bot = telebot.TeleBot(TOKEN, threaded=False)
+
+# Forzar la sesión del bot a nuestra sesión de polling
+# pyTelegramBotAPI usa apihelper internamente; esto asegura que use nuestra sesión
+try:
+    telebot.apihelper.sessions[TOKEN] = _poll_session
+    logger.info("[TG] Sesión de polling configurada via apihelper.sessions")
+except Exception:
+    try:
+        telebot.apihelper._sessions[TOKEN] = _poll_session
+        logger.info("[TG] Sesión de polling configurada via apihelper._sessions")
+    except Exception:
+        # Fallback: monkey-patch
+        _orig = getattr(telebot.apihelper, '_get_req_session', None)
+        if _orig:
+            telebot.apihelper._get_req_session = lambda token=None: _poll_session
+            logger.info("[TG] Sesión de polling configurada via monkey-patch")
+        else:
+            logger.warning("[TG] No se pudo configurar la sesión de polling — usando default")
+
+# ─── REGLA ────────────────────────────────────────────────────────────────────
 ROULETTE_KEY  = 204
 ROULETTE_NAME = "MEGA ROULETTE"
 ROULETTE_URL  = "https://1win.lat/casino/play/v_pragmatic:megaroulette"
@@ -48,7 +77,7 @@ ROULETTE_URL  = "https://1win.lat/casino/play/v_pragmatic:megaroulette"
 WS_URL    = "wss://dga.pragmaticplaylive.net/ws"
 CASINO_ID = "ppcjd00000007254"
 
-# ─── LÓGICA (portada desde logica.txt) ────────────────────────────────────────
+# ─── LÓGICA ───────────────────────────────────────────────────────────────────
 RED    = {1,3,5,7,9,12,14,16,18,19,21,23,25,27,30,32,34,36}
 BLACK  = {2,4,6,8,10,11,13,15,17,20,22,24,26,28,29,31,33,35}
 COL1   = {1,4,7,10,13,16,19,22,25,28,31,34}
@@ -145,55 +174,152 @@ class DailyScore:
 
 SCORE = DailyScore()
 
-# ─── TELEGRAM HELPERS ─────────────────────────────────────────────────────────
-_TG_RETRIES = 12
+# ─── TELEGRAM DIRECT API SENDER ──────────────────────────────────────────────
+# Llamadas directas a la API de Telegram con nuestra sesión personalizada.
+# Esto evita depender de la sesión interna de pyTelegramBotAPI (que ignoraba
+# bot.session) y nos da control total sobre timeouts y reintentos.
 
-def _tg_call(fn, *a, **kw):
+_TG_MAX_RETRIES = 5
+_TG_TIMEOUT = (10, 30)  # 10s connect, 30s read
+
+def _api_call(method: str, payload: dict, timeout=_TG_TIMEOUT) -> Optional[dict]:
+    """
+    Llamada directa a la API de Telegram con reintentos y logging.
+    Usa _send_session (con retry y timeout generoso), NO la sesión del bot.
+    """
+    url = API_BASE + method
     delay = 2.0
-    for attempt in range(1, _TG_RETRIES + 1):
-        try: return fn(*a, **kw)
+    for attempt in range(1, _TG_MAX_RETRIES + 1):
+        try:
+            r = _send_session.post(url, json=payload, timeout=timeout)
+            data = r.json()
+
+            if data.get("ok"):
+                return data.get("result")
+
+            # Error de la API de Telegram
+            desc = data.get("description", "unknown")
+            err_code = data.get("error_code", 0)
+            logger.warning(f"[TG API] {method} error {err_code}: {desc} (intento {attempt}/{_TG_MAX_RETRIES})")
+
+            # Rate limit — esperar y reintentar
+            if err_code == 429 or "retry after" in desc.lower():
+                try:
+                    wait = int(''.join(filter(str.isdigit, desc))) + 1
+                except ValueError:
+                    wait = 30
+                logger.info(f"[TG API] Rate limited, esperando {wait}s...")
+                time.sleep(wait)
+                continue
+
+            # Errores que no valen la pena reintentar
+            if err_code in (400, 401, 403, 404):
+                logger.error(f"[TG API] {method} error permanente ({err_code}): {desc}")
+                return None
+
+            # Otros errores — reintentar
+            if attempt >= _TG_MAX_RETRIES:
+                logger.error(f"[TG API] {method} falló tras {_TG_MAX_RETRIES} intentos: {desc}")
+                return None
+            time.sleep(delay)
+            delay = min(delay * 2, 30)
+
+        except requests.exceptions.ReadTimeout:
+            logger.warning(f"[TG API] {method} ReadTimeout (intento {attempt}/{_TG_MAX_RETRIES})")
+            if attempt >= _TG_MAX_RETRIES:
+                logger.error(f"[TG API] {method} falló tras {_TG_MAX_RETRIES} timeouts")
+                return None
+            time.sleep(delay)
+            delay = min(delay * 2, 30)
+
+        except requests.exceptions.ConnectionError as e:
+            logger.warning(f"[TG API] {method} ConnectionError (intento {attempt}/{_TG_MAX_RETRIES}): {e}")
+            if attempt >= _TG_MAX_RETRIES:
+                return None
+            time.sleep(delay)
+            delay = min(delay * 2, 30)
+
         except Exception as e:
-            err = str(e)
-            if "retry after" in err.lower():
-                try: wait = int(''.join(filter(str.isdigit, err))) + 1
-                except: wait = 30
-                time.sleep(wait); continue
-            if attempt == _TG_RETRIES: return None
-            time.sleep(delay); delay = min(delay * 2, 60)
+            logger.warning(f"[TG API] {method} excepción (intento {attempt}/{_TG_MAX_RETRIES}): {type(e).__name__}: {e}")
+            if attempt >= _TG_MAX_RETRIES:
+                return None
+            time.sleep(delay)
+            delay = min(delay * 2, 30)
+
     return None
 
+
 def tg_send(text: str) -> Optional[int]:
-    msg = _tg_call(bot.send_message, chat_id=CHAT_ID, text=text, parse_mode="HTML")
-    return msg.message_id if msg else None
+    """Envía un mensaje de texto al chat."""
+    result = _api_call("sendMessage", {
+        "chat_id": CHAT_ID,
+        "text": text,
+        "parse_mode": "HTML",
+    })
+    if result:
+        logger.info(f"[TG] Mensaje enviado (id={result.get('message_id')})")
+        return result.get("message_id")
+    logger.error("[TG] Falló envío de mensaje")
+    return None
+
 
 def tg_send_with_button(text: str) -> Optional[int]:
-    markup = telebot.types.InlineKeyboardMarkup()
-    markup.add(telebot.types.InlineKeyboardButton("🎰 ACCEDER A LA RULETA", url=ROULETTE_URL))
-    msg = _tg_call(bot.send_message, chat_id=CHAT_ID, text=text,
-                   parse_mode="HTML", reply_markup=markup,
-                   disable_web_page_preview=True)
-    return msg.message_id if msg else None
+    """Envía un mensaje con botón inline de acceso a la ruleta."""
+    markup = json.dumps({
+        "inline_keyboard": [[
+            {"text": "🎰 ACCEDER A LA RULETA", "url": ROULETTE_URL}
+        ]]
+    })
+    result = _api_call("sendMessage", {
+        "chat_id": CHAT_ID,
+        "text": text,
+        "parse_mode": "HTML",
+        "reply_markup": markup,
+        "disable_web_page_preview": True,
+    })
+    if result:
+        logger.info(f"[TG] Mensaje con botón enviado (id={result.get('message_id')})")
+        return result.get("message_id")
+    logger.error("[TG] Falló envío de mensaje con botón")
+    return None
+
 
 def tg_edit(message_id: int, text: str):
-    try:
-        _tg_call(bot.edit_message_text, text=text, chat_id=CHAT_ID,
-                 message_id=message_id, parse_mode="HTML")
-    except: pass
+    """Edita un mensaje existente."""
+    _api_call("editMessageText", {
+        "chat_id": CHAT_ID,
+        "message_id": message_id,
+        "text": text,
+        "parse_mode": "HTML",
+    })
+
 
 def tg_reply(reply_to_id: int, text: str) -> Optional[int]:
     """Envía un mensaje como respuesta (comentario) a otro mensaje."""
-    msg = _tg_call(bot.send_message, chat_id=CHAT_ID, text=text,
-                   parse_mode="HTML", reply_to_message_id=reply_to_id)
-    return msg.message_id if msg else None
+    result = _api_call("sendMessage", {
+        "chat_id": CHAT_ID,
+        "text": text,
+        "parse_mode": "HTML",
+        "reply_to_message_id": reply_to_id,
+    })
+    if result:
+        logger.info(f"[TG] Reply enviado (id={result.get('message_id')}, reply_to={reply_to_id})")
+        return result.get("message_id")
+    logger.error(f"[TG] Falló envío de reply a mensaje {reply_to_id}")
+    return None
+
 
 def tg_delete(message_id: int):
-    try: _tg_call(bot.delete_message, chat_id=CHAT_ID, message_id=message_id)
-    except: pass
+    """Elimina un mensaje."""
+    _api_call("deleteMessage", {
+        "chat_id": CHAT_ID,
+        "message_id": message_id,
+    })
+
 
 # ─── MOTOR DE SEÑALES ─────────────────────────────────────────────────────────
 WARMUP_SPINS = 20
 
-# Nombres de todas las estrategias (en orden fijo)
 STRATEGY_NAMES = ['Docenas', 'Columnas', 'Call + PLE', 'Color', 'Rango']
 
 CHECKERS = [
@@ -258,9 +384,9 @@ class StrategySlot:
     def __init__(self, name: str, checker):
         self.name    = name
         self.checker = checker
-        self.waiting  = False   # True = señal activa esperando resultado
-        self.sig      = None    # dict con bet/detail
-        self.msg_id   = None    # message_id del mensaje en Telegram
+        self.waiting  = False
+        self.sig      = None
+        self.msg_id   = None
 
     def try_detect(self, history: list) -> bool:
         """Intenta detectar señal. Retorna True si se activó."""
@@ -285,11 +411,18 @@ class StrategySlot:
             f"⚠️ <b>1 intento — sin gestión</b>"
         )
         self.msg_id = tg_send_with_button(text)
-        logger.info(f"📡 [{self.name}] Señal enviada | {result['bet']}")
+        if self.msg_id:
+            logger.info(f"📡 [{self.name}] Señal enviada | {result['bet']}")
+        else:
+            logger.error(f"📡 [{self.name}] ERROR: señal detectada pero NO se pudo enviar a Telegram")
+            # Reset para no quedar en estado inconsistente
+            self.waiting = False
+            self.sig = None
+            return False
         return True
 
     def resolve(self, n: int) -> Optional[bool]:
-        """Resuelve la señal activa con el número n. Retorna True/False o None si no había señal."""
+        """Resuelve la señal activa con el número n."""
         if not self.waiting:
             return None
 
@@ -301,7 +434,6 @@ class StrategySlot:
             SCORE.add_loss()
             emoji, label = "❌", "PERDIDA"
 
-        # Texto del resultado (sin marcador)
         result_text = (
             f"🎰 <b>{ROULETTE_NAME}</b>\n\n"
             f"{emoji} <b>SEÑAL {label}</b>\n\n"
@@ -310,14 +442,23 @@ class StrategySlot:
             f"🔢 <b>Número:</b> {_ball(n)}"
         )
 
+        sent = False
         if self.msg_id:
-            tg_reply(self.msg_id, result_text)
+            msg_id = tg_reply(self.msg_id, result_text)
+            if msg_id:
+                sent = True
+        if not sent:
+            # Fallback: enviar como mensaje normal
+            msg_id = tg_send(result_text)
+            if msg_id:
+                sent = True
+
+        if sent:
+            logger.info(f"{emoji} [{self.name}] Señal {label} | Número: {n}")
         else:
-            tg_send(result_text)
+            logger.error(f"{emoji} [{self.name}] Señal {label} pero NO se pudo notificar a Telegram | Número: {n}")
 
-        logger.info(f"{emoji} [{self.name}] Señal {label} | Número: {n}")
-
-        # reset
+        # reset siempre (no quedar en estado inconsistente)
         self.waiting = False
         self.sig     = None
         self.msg_id  = None
@@ -328,7 +469,6 @@ class SignalEngine:
     def __init__(self):
         self.history     = []
         self.warmup_done = False
-        # Un slot independiente por cada estrategia
         self.slots = [StrategySlot(name, checker)
                       for name, checker in zip(STRATEGY_NAMES, CHECKERS)]
 
@@ -425,7 +565,8 @@ async def ws_reader():
                             n = int(latest.get("result", ""))
                             if 0 <= n <= 36:
                                 logger.info(f"[WS] Nuevo número: {n}")
-                                ENGINE.on_number(n)
+                                # ── CLAVE: ejecutar en thread para NO bloquear el event loop ──
+                                await asyncio.to_thread(ENGINE.on_number, n)
                         except (ValueError, TypeError): pass
                         continue
 
@@ -438,7 +579,7 @@ async def ws_reader():
                                 n = int(data[key])
                                 if 0 <= n <= 36:
                                     logger.info(f"[WS-fallback] Nuevo número: {n}")
-                                    ENGINE.on_number(n)
+                                    await asyncio.to_thread(ENGINE.on_number, n)
                             except (ValueError, TypeError): pass
                             break
 
@@ -534,14 +675,10 @@ def run_flask():
 def run_bot_polling():
     """
     Loop de polling robusto que captura ReadTimeout y otras excepciones
-    de red, reconectando automáticamente. Esto evita que el hilo muera
-    en Render donde la red puede ser lenta.
+    de red, reconectando automáticamente.
     """
     while True:
         try:
-            # timeout=25 → Telegram API espera hasta 25s por updates
-            # long_polling_timeout=60 → HTTP read_timeout = 25+60 = 85s
-            # Esto da amplio margen para que la respuesta llegue
             bot.polling(
                 none_stop=True,
                 interval=1,
@@ -566,12 +703,27 @@ async def main():
     threading.Thread(target=run_flask, daemon=True).start()
     logger.info("[Main] ✅ Flask thread iniciado")
 
-    # ── Cambio clave: usar run_bot_polling() en lugar de lambda ──
     threading.Thread(target=run_bot_polling, daemon=True).start()
-    logger.info("[Main] ✅ Telegram bot thread iniciado (con retry robusto)")
+    logger.info("[Main] ✅ Telegram bot thread iniciado (polling robusto)")
 
-    await asyncio.sleep(3)
-    logger.info(f"[Main] 🎰 Bot iniciado — {ROULETTE_NAME} key={ROULETTE_KEY}")
+    await asyncio.sleep(5)
+
+    # ── Test de envío al iniciar ──
+    logger.info("[Main] Enviando mensaje de prueba a Telegram...")
+    test_id = tg_send(
+        f"🤖 <b>{ROULETTE_NAME} Bot</b> iniciado correctamente\n\n"
+        f"🎰 Key: {ROULETTE_KEY}\n"
+        f"📡 Estrategias: {', '.join(STRATEGY_NAMES)}\n"
+        f"⏳ Warmup: {WARMUP_SPINS} giros"
+    )
+    if test_id:
+        logger.info(f"[Main] ✅ Mensaje de prueba enviado (id={test_id})")
+    else:
+        logger.error("[Main] ❌ NO se pudo enviar mensaje de prueba — verificar TOKEN y CHAT_ID")
+        logger.error(f"[Main]    TOKEN termina en: ...{TOKEN[-6:]}")
+        logger.error(f"[Main]    CHAT_ID: {CHAT_ID}")
+
+    logger.info(f"[Main] 🎰 Bot en operación — {ROULETTE_NAME} key={ROULETTE_KEY}")
 
     await asyncio.gather(
         ws_reader(),
