@@ -56,7 +56,7 @@ g_ema20: list     = []
 
 # Estado global de señal: 'idle' | 'evaluating' | 'so'
 g_signal_state = 'idle'
-# Tipo de señal activa: 'alert150' | 'alert200' | None
+# Tipo de señal activa: 'alert200' | None
 g_signal_type: Optional[str] = None
 # Multiplicador que disparó la señal
 g_signal_trigger_mult: float = 0.0
@@ -81,7 +81,7 @@ def calc_ema(data: list, period: int) -> list:
 def get_quota_stats(n: int = 200) -> dict:
     """
     Calcula estadísticas de cuotas para los últimos n multiplicadores.
-    Condicion desfavorable: 1.00-1.99x > 52% Y 2.00-4.99x < 29%.
+    Condicion desfavorable: 1.00-1.99x > 52% O 2.00-4.99x < 29%.
     Solo se usa para bloquear el INICIO de sesion, nunca durante una sesion activa.
     """
     data  = g_mults[-n:] if len(g_mults) >= n else g_mults[:]
@@ -89,32 +89,37 @@ def get_quota_stats(n: int = 200) -> dict:
     if total == 0:
         return {
             'total': 0, 'has_enough': False, 'favorable': None,
-            'count_100_199': 0, 'count_200_499': 0, 'count_500_plus': 0,
-            'pct_100_199': 0.0, 'pct_200_499': 0.0, 'pct_500_plus': 0.0,
+            'count_100_199': 0, 'count_200_499': 0,
+            'count_500_999': 0, 'count_1000_plus': 0,
+            'pct_100_199': 0.0, 'pct_200_499': 0.0,
+            'pct_500_999': 0.0, 'pct_1000_plus': 0.0,
         }
 
-    r1 = sum(1 for m in data if 1.00 <= m['value'] < 2.00)
-    r2 = sum(1 for m in data if 2.00 <= m['value'] < 5.00)
-    r3 = sum(1 for m in data if m['value'] >= 5.00)
+    r1 = sum(1 for m in data if 1.00 <= m['value'] <  2.00)
+    r2 = sum(1 for m in data if 2.00 <= m['value'] <  5.00)
+    r3 = sum(1 for m in data if 5.00 <= m['value'] < 10.00)
+    r4 = sum(1 for m in data if m['value'] >= 10.00)
 
     pct1 = r1 / total * 100
     pct2 = r2 / total * 100
     pct3 = r3 / total * 100
+    pct4 = r4 / total * 100
 
     # Desfavorable: 1.00-1.99 supera 52% O 2.00-4.99 esta por debajo del 29%
-    # Basta que UNA condicion falle para bloquear el inicio de sesion
     unfavorable = pct1 > 52.0 or pct2 < 29.0
 
     return {
-        'total':          total,
-        'has_enough':     total >= 200,
-        'favorable':      not unfavorable,
-        'count_100_199':  r1,
-        'count_200_499':  r2,
-        'count_500_plus': r3,
-        'pct_100_199':    pct1,
-        'pct_200_499':    pct2,
-        'pct_500_plus':   pct3,
+        'total':           total,
+        'has_enough':      total >= 200,
+        'favorable':       not unfavorable,
+        'count_100_199':   r1,
+        'count_200_499':   r2,
+        'count_500_999':   r3,
+        'count_1000_plus': r4,
+        'pct_100_199':     pct1,
+        'pct_200_499':     pct2,
+        'pct_500_999':     pct3,
+        'pct_1000_plus':   pct4,
     }
 
 
@@ -123,34 +128,34 @@ def quota_stats_text(stats: dict) -> str:
     if stats['total'] == 0:
         return "📡 _Sin datos suficientes para analizar cuotas._\n"
 
-    n_label   = str(stats['total']) + ("" if stats['has_enough'] else " (acumulando 200...)")
-    fav_emoji = "✅" if stats['favorable'] else "⚠️"
-    fav_txt   = (
-        "FAVORABLE — Se recomienda operar"
-        if stats['favorable'] else
-        "DESFAVORABLE — Se recomienda esperar"
-    )
-    r1_flag = " ❌" if stats['pct_100_199'] > 52.0 else " ✅"
-    r2_flag = " ❌" if stats['pct_200_499'] < 29.0 else " ✅"
+    n_label = str(stats['total']) + ("" if stats['has_enough'] else " (acumulando...)")
+
+    r1_flag = " ✅" if stats['pct_100_199'] <= 52.0 else " ❌"
+    r2_flag = " ✅" if stats['pct_200_499'] >= 29.0 else " ❌"
+
+    if stats['favorable']:
+        fav_line = "✅ *¡TENDENCIA FAVORABLE!*\n      _Se recomienda operar_"
+    else:
+        fav_line = "⚠️ *TENDENCIA DESFAVORABLE*\n      _Se recomienda esperar_"
 
     return (
-        f"📊 *Analisis ultimos {n_label} multiplicadores:*\n"
-        f"  🔴 1.00-1.99x: `{stats['count_100_199']}` ({stats['pct_100_199']:.1f}%){r1_flag}\n"
-        f"  🟡 2.00-4.99x: `{stats['count_200_499']}` ({stats['pct_200_499']:.1f}%){r2_flag}\n"
-        f"  🟢 >=5.00x:     `{stats['count_500_plus']}` ({stats['pct_500_plus']:.1f}%)\n"
-        f"  _(Limites: 1.00-1.99 <=52%% | 2.00-4.99 >=29%%)_\n"
-        f"{fav_emoji} *{fav_txt}*\n"
+        f"📈 *Análisis de la Tendencia últimos*\n"
+        f"      *{n_label} multiplicadores*\n"
+        f"🔵 Cuotas (1.00-1.99x): `{stats['count_100_199']}` — {stats['pct_100_199']:.2f}%{r1_flag}\n"
+        f"🟣 Cuotas (2.00-4.99x): `{stats['count_200_499']}` — {stats['pct_200_499']:.2f}%{r2_flag}\n"
+        f"🟡 Cuotas (5.00-9.99x): `{stats['count_500_999']}` — {stats['pct_500_999']:.2f}%\n"
+        f"🔴 Cuotas (+10.00x):    `{stats['count_1000_plus']}` — {stats['pct_1000_plus']:.2f}%\n"
+        " \n"
+        f"{fav_line}\n"
     )
 
 
-# ─── DETECCIÓN DE SEÑAL (port exacto de checkModerateAlerts del HTML) ────────
+# ─── DETECCIÓN DE SEÑAL (checkModerateAlerts del HTML — solo alert200) ───────
 def check_moderate_signal() -> Optional[str]:
     """
-    Retorna:
-      'alert150' — señal menos restrictiva (para col 1)
-      'alert200' — señal más restrictiva   (para col 1, 2 y 3)
-      None       — sin señal
-    Lógica portada de checkModerateAlerts() en AMX_V20-SIN_EFECTOS.html
+    Retorna 'alert200' o None.
+    Las 3 condiciones del gráfico moderado del HTML, todas disparan alert200.
+    alert150 no entra a la estrategia (igual que en el HTML original).
     """
     pos  = g_positions
     e4   = g_ema4
@@ -165,37 +170,14 @@ def check_moderate_signal() -> Optional[str]:
     cur_e4  = e4[-1]  if e4           else cur_pos
     cur_e8  = e8[-1]  if e8           else cur_pos
     cur_e20 = e20[-1] if e20          else cur_pos
-    prv_e4  = e4[-2]  if len(e4)  > 1 else cur_e4
     prv_e8  = e8[-2]  if len(e8)  > 1 else cur_e8
     prv_e20 = e20[-2] if len(e20) > 1 else cur_e20
 
-    # ── alerta150 ─────────────────────────────────────────────────
-    # C1: 3 consecutivos <2.00 luego 1 ≥2.00, pos ≤ ema4 y ema8
-    if len(data) >= 4:
-        chg = [1 if data[-4 + i]['value'] >= 2.0 else -1 for i in range(4)]
-        c1, c2, c3, c4 = chg
-        if c1 == -1 and c2 == -1 and c3 == -1 and c4 == 1 \
-                and cur_pos <= cur_e4 and cur_pos <= cur_e8:
-            return 'alert150'
-
-    # C2: EMA4 cruza por encima de EMA8
-    if len(e4) >= 2 and prv_e4 <= prv_e8 and cur_e4 > cur_e8:
-        return 'alert150'
-
-    # C3: pos en soporte (últimos 20) con precio sobre las 3 EMAs
-    soporte = min(pos[-20:]) if len(pos) >= 20 else min(pos)
-    if (cur_pos <= soporte * 1.01
-            and cur_pos > cur_e4
-            and cur_pos > cur_e8
-            and cur_pos > cur_e20):
-        return 'alert150'
-
-    # ── alerta200 ─────────────────────────────────────────────────
-    # C1: EMA8 cruza por encima de EMA20
+    # Condición 1: EMA8 cruza por encima de EMA20
     if len(e8) >= 2 and prv_e8 <= prv_e20 and cur_e8 > cur_e20:
         return 'alert200'
 
-    # C2: patrón V en los últimos 3 puntos con precio sobre las 3 EMAs
+    # Condición 2: patrón V en los últimos 3 puntos con precio sobre las 3 EMAs
     if len(pos) >= 3:
         a, b, c = pos[-3], pos[-2], pos[-1]
         if (abs(a - c) <= 1 and b > a
@@ -204,7 +186,7 @@ def check_moderate_signal() -> Optional[str]:
                 and cur_pos > cur_e20):
             return 'alert200'
 
-    # C3: 2 consecutivos ≥2.00 con EMAs alineadas (4>8>20), anterior <2.00
+    # Condición 3: 2 consecutivos ≥2.00 + EMAs alineadas (4>8>20) + anterior <2.00
     if (len(data) >= 2
             and data[-1]['value'] >= WIN_TARGET
             and data[-2]['value'] >= WIN_TARGET
@@ -248,6 +230,9 @@ class UserSession:
         # ID del mensaje de "Perdida intento 1 / esperando SO"
         # Se elimina cuando se conoce el resultado del SO (ganado o perdido)
         self.attempt1_msg_id: Optional[int] = None
+
+        # Valor del resultado del intento 1 (para mostrarlo junto al SO en new_col)
+        self.attempt1_result_value: float = 0.0
 
     def on_result(self, win: bool) -> tuple:
         """
@@ -409,20 +394,34 @@ async def process_multiplier(value: float, round_id: str):
 
     # ── FASE 4: Detectar nueva señal ─────────────────────────────
     if g_signal_state == 'idle':
-        sig = check_moderate_signal()
-        if sig:
+        sig_result = check_moderate_signal()
+        if sig_result:
+            sig_type, sig_strictness = sig_result
             g_signal_state        = 'evaluating'
-            g_signal_type         = sig
+            g_signal_type         = sig_type
+            g_signal_strictness   = sig_strictness
             g_signal_trigger_mult = value
-            logger.info(f"🚀 SEÑAL {sig.upper()} | Trigger: {value:.2f}x")
+            logger.info(
+                f"🚀 SEÑAL {sig_type.upper()} "
+                f"S{sig_strictness} | Trigger: {value:.2f}x"
+            )
 
             for session in list(g_sessions.values()):
                 if session.state != UserSession.IDLE:
                     continue
-                # Gestión moderada restrictiva:
-                # • Col 1   → acepta alert150 (moderada) y alert200 (estricta)
-                # • Col 2-3 → SOLO alert200 (estricta) después de pérdida
-                if sig == 'alert150' and session.col >= 2:
+
+                # ── Restricción progresiva por columna ──────────────
+                # La gestión moderada exige señales más restrictivas
+                # conforme se pierden columnas:
+                #   Col 1 → acepta S1, S2 o S3  (cualquier alert200)
+                #   Col 2 → acepta solo S2 o S3  (más restrictiva)
+                #   Col 3 → acepta solo S3        (la más estricta)
+                # Regla: strictness de la señal debe ser >= col actual
+                if sig_strictness < session.col:
+                    logger.info(
+                        f"⏭️ User {session.user_id}: "
+                        f"S{sig_strictness} < Col {session.col} → señal omitida"
+                    )
                     continue
 
                 # Limpiar mensaje de intento1 residual por seguridad
@@ -435,44 +434,26 @@ async def process_multiplier(value: float, round_id: str):
                         pass
                     session.attempt1_msg_id = None
 
-                # Guardar el multiplicador que disparó esta señal en la sesión
                 session.signal_trigger_mult = value
                 session.state = UserSession.EVALUATING
-                await _send_signal(session, sig, value)
+                await _send_signal(session, sig_type, value)
 
 
 async def _send_signal(session: UserSession, sig_type: str, trigger: float):
-    """Envía alerta de señal al usuario con el multiplicador que la disparó."""
-    if sig_type == 'alert150':
-        tipo_label = "🔵 Moderado 1.50"
-        col_note   = "Col 1 — Señal moderada"
-    else:
-        tipo_label = "💎 Moderado 2.00 ⚡"
-        col_note   = (
-            f"Col {session.col}/{MAX_COLS} — Señal estricta"
-            if session.col >= 2 else
-            f"Col {session.col}/{MAX_COLS} — Señal estricta"
-        )
-
-    diff = session.balance - session.capital
-    sign = "+" if diff >= 0 else ""
-    rec_bet = session.capital * 0.01  # 1% recomendado
+    """Envia alerta de señal al usuario."""
+    # En el sistema moderado solo existe alert200 en la estrategia
+    # El nivel de restriccion viene de g_signal_strictness (global)
+    s = g_signal_strictness  # 1 | 2 | 3
+    nivel = {1: "S1 — EMA Cruce", 2: "S2 — Patrón V", 3: "S3 — Doble ≥2.00"}.get(s, "💎 2.00x")
 
     txt = (
-        "🚨 *¡SEÑAL DETECTADA!*\n"
+        f"🚨 *¡SEÑAL DETECTADA! 💎 2.00x*\n"
         "━━━━━━━━━━━━━━━━━━━━━━━\n"
-        f"{tipo_label} | {col_note}\n"
-        f"📊 *Mult disparador: `{trigger:.2f}x`*\n"
-        f"🎯 Objetivo: `≥ {WIN_TARGET:.2f}x`\n"
-        "━━━━━━━━━━━━━━━━━━━━━━━\n"
-        f"💵 *APUESTA AHORA: `${session.cur_bet:.2f}`*\n"
-        f"💡 Rec. 1% capital: `${rec_bet:.2f}`\n"
-        f"📊 Señal `{session.scale}/{CYCLE_SIZE}` | "
+        f"🆔 Último Multiplicador — `{trigger:.2f}x`\n"
+        f"💵 *Apostar Ahora: `${session.cur_bet:.2f}`*\n"
+        f"🕹️ Señal `{session.scale}/{CYCLE_SIZE}` | "
         f"Col `{session.col}/{MAX_COLS}` | "
-        f"Int `{session.attempt}/{MAX_ATTS}`\n"
-        f"💰 Balance real: `${session.balance:.0f}` ({sign}${diff:.0f})\n"
-        "━━━━━━━━━━━━━━━━━━━━━━━\n"
-        "⚡ _Entra al PRÓXIMO juego_"
+        f"Intento `{session.attempt}/{MAX_ATTS}`"
     )
     try:
         await bot.send_message(session.chat_id, txt, parse_mode='Markdown')
@@ -491,10 +472,8 @@ async def _dispatch_result(
     Despacha el mensaje de resultado.
     • is_so=True  → elimina el mensaje del intento 1 (ganado O perdido).
     • tipo='so'   → guarda el message_id del intento 1 para eliminarlo luego.
-    • Balance siempre refleja el capital real actualizado.
     """
     # ── Eliminar mensaje de intento 1 cuando llega el resultado del SO ──
-    # Se elimina tanto si el SO fue GANADO como si fue PERDIDO
     if is_so and session.attempt1_msg_id:
         try:
             await bot.delete_message(session.chat_id, session.attempt1_msg_id)
@@ -502,26 +481,24 @@ async def _dispatch_result(
             pass
         session.attempt1_msg_id = None
 
-    so_label    = "🔄 *2ª Oportunidad*" if is_so else "💎 *Señal Principal*"
-    emoji_val   = "🟢" if value >= WIN_TARGET else "🔴"
-    diff        = session.balance - session.capital
-    sign        = "+" if diff >= 0 else ""
-    trigger_txt = f"`{session.signal_trigger_mult:.2f}x`" if session.signal_trigger_mult else "—"
+    emoji_val = "🟢" if value >= WIN_TARGET else "🔴"
+    diff      = session.balance - session.capital
+    sign      = "+" if diff >= 0 else ""
 
+    # ── GANADA (intento 1 o 2ª oportunidad) ──────────────────────
     if tipo in ('win', 'cycle_win'):
-        txt = (
-            f"✅ *{'¡CICLO COMPLETO! 🏆' if tipo == 'cycle_win' else 'GANADA'}*\n"
-            f"{so_label}\n"
-            f"{emoji_val} Resultado: `{value:.2f}x` | Disparador: {trigger_txt}\n"
-            f"💵 Ganancia: `+${bet:.2f}`\n"
-            f"💰 Balance real: `${session.balance:.0f}` ({sign}${diff:.0f})\n"
-        )
+        so_prefix = "🔄 2ª Oportunidad — " if is_so else ""
+
         if tipo == 'cycle_win':
-            txt += (
-                "\n🎉 *¡Completaste 10 señales exitosas!*\n"
+            txt = (
+                f"✅ *GANADA* — {emoji_val} Resultado: `{value:.2f}x`\n"
+                "━━━━━━━━━━━━━━━━━━━━━━━\n"
+                f"{so_prefix}💵 Próxima Apuesta: `${session.base_bet:.2f}`\n"
+                f"💰 Balance Actual: `${session.balance:.0f}` ({sign}${abs(diff):.0f})\n"
+                "\n"
+                "🏆 *¡CICLO COMPLETO — 10 señales exitosas!*\n"
                 f"📈 Capital inicial: `${session.capital:.0f}`\n"
                 f"🏦 Balance final: `${session.balance:.0f}`\n"
-                f"💰 Ganancia total: `{sign}${diff:.0f}`\n"
                 f"📊 G/P: `{session.wins}/{session.losses}`\n\n"
                 "¿Deseas continuar o cerrar sesión?"
             )
@@ -532,28 +509,28 @@ async def _dispatch_result(
                     reply_markup=make_session_keyboard(session.user_id)
                 )
             except Exception as e:
-                logger.error(f"Error: {e}")
+                logger.error(f"Error cycle_win: {e}")
             return
-        else:
-            txt += f"\n⏳ _Esperando próxima señal... ({session.scale}/{CYCLE_SIZE})_"
 
-    elif tipo == 'so':
-        # ── Intento 1 PERDIDO → enviar alerta SO y guardar message_id ──
-        # El balance ya fue descontado en on_result(win=False)
         txt = (
-            f"❌ *Resultado Intento 1 — PERDIDA*\n"
+            f"✅ *GANADA* — {emoji_val} Resultado: `{value:.2f}x`\n"
             "━━━━━━━━━━━━━━━━━━━━━━━\n"
-            f"{emoji_val} Resultado: `{value:.2f}x`\n"
-            f"📊 Mult disparador: {trigger_txt}\n"
-            f"💵 Pérdida intento 1: `-${bet:.2f}`\n"
-            f"💰 Balance real: `${session.balance:.0f}` ({sign}${diff:.0f})\n"
+            f"{so_prefix}💵 Próxima Apuesta: `${session.base_bet:.2f}`\n"
+            f"💰 Balance Actual: `${session.balance:.0f}` ({sign}${abs(diff):.0f})\n"
+            "\n"
+            f"⏳ _Esperando próxima señal... ({session.scale}/{CYCLE_SIZE})_"
+        )
+
+    # ── PERDIDA INTENTO 1 → avisa SO ──────────────────────────────
+    elif tipo == 'so':
+        # Guardar el valor del resultado para mostrarlo si el SO también falla
+        session.attempt1_result_value = value
+        txt = (
+            f"❌ *Perdida* — {emoji_val} Resultado: `{value:.2f}x`\n"
             "━━━━━━━━━━━━━━━━━━━━━━━\n"
             "🔄 *¡SEGUNDA OPORTUNIDAD!*\n"
-            f"💵 *Apuesta SO: `${session.cur_bet:.2f}`*\n"
-            f"📊 Col `{session.col}/{MAX_COLS}` | Intento `2/{MAX_ATTS}`\n"
-            "━━━━━━━━━━━━━━━━━━━━━━━\n"
-            "⚡ _Espera el resultado del próximo juego_\n"
-            "_(Este mensaje se eliminará al conocer el resultado del SO)_"
+            f"💵 Apuesta: `${session.cur_bet:.2f}`\n"
+            f"🕹️ Col `{session.col}/{MAX_COLS}` | Intento `2/{MAX_ATTS}`"
         )
         try:
             msg = await bot.send_message(
@@ -564,30 +541,29 @@ async def _dispatch_result(
             logger.error(f"Error enviando SO a {session.user_id}: {e}")
         return
 
+    # ── SO FALLIDA → avanza columna ───────────────────────────────
     elif tipo == 'new_col':
-        # SO también falló → balance ya descontado en on_result
+        r1 = f"{session.attempt1_result_value:.2f}x" if session.attempt1_result_value else "—"
         txt = (
-            f"❌ *SO Fallida — Col {session.col - 1} terminada*\n"
+            f"🔴 *Resultados: `{r1}` — `{value:.2f}x`*\n"
             "━━━━━━━━━━━━━━━━━━━━━━━\n"
-            f"{emoji_val} Resultado SO: `{value:.2f}x`\n"
-            f"📊 Mult disparador original: {trigger_txt}\n"
-            f"💵 Pérdida acumulada: `-${session.lost:.2f}`\n"
-            f"💰 Balance real: `${session.balance:.0f}` ({sign}${diff:.0f})\n"
-            "━━━━━━━━━━━━━━━━━━━━━━━\n"
-            f"📍 *Avanzando a Columna {session.col}/{MAX_COLS}*\n"
-            f"💵 *Nueva apuesta: `${session.cur_bet:.2f}`*\n"
-            "⚡ _Solo señales estrictas 2.00 (col 2-3)_\n"
+            f"📍 Avanzando a Columna `{session.col}/{MAX_COLS}`\n"
+            f"💵 Nueva apuesta: `${session.cur_bet:.2f}`\n"
+            f"💰 Balance Actual: `${session.balance:.0f}`\n"
+            "\n"
             "⏳ _Esperando próxima señal..._"
         )
 
+    # ── CICLO PERDIDO (3 columnas fallidas) ───────────────────────
     elif tipo == 'cycle_loss':
+        r1 = f"{session.attempt1_result_value:.2f}x" if session.attempt1_result_value else "—"
         txt = (
-            f"⚠️ *CICLO TERMINADO — 3 Columnas Fallidas*\n"
-            f"{emoji_val} Resultado: `{value:.2f}x`\n"
+            f"🔴 *Resultados: `{r1}` — `{value:.2f}x`*\n"
             "━━━━━━━━━━━━━━━━━━━━━━━\n"
+            "⚠️ *CICLO TERMINADO — 3 Columnas Fallidas*\n"
             f"💰 Capital inicial: `${session.capital:.0f}`\n"
             f"📉 Balance final: `${session.balance:.0f}`\n"
-            f"🔴 Pérdida total: `${diff:.0f}`\n"
+            f"🔴 Pérdida total: `${abs(diff):.0f}`\n"
             f"📊 G/P: `{session.wins}/{session.losses}`\n\n"
             "¿Deseas iniciar una nueva sesión?"
         )
@@ -598,8 +574,9 @@ async def _dispatch_result(
                 reply_markup=make_session_keyboard(session.user_id)
             )
         except Exception as e:
-            logger.error(f"Error: {e}")
+            logger.error(f"Error cycle_loss: {e}")
         return
+
     else:
         txt = f"Resultado inesperado: {tipo}"
 
@@ -998,11 +975,8 @@ async def _receive_bet(message):
     session = UserSession(uid, chat, capital, bet)
     g_sessions[uid] = session
 
-    # Calculo ilustrativo de la columna mas pesada
-    c1_a1 = bet
-    c1_a2 = c1_a1 + c1_a1        # perdida c1a1 + nueva apuesta
-    c2_a1 = (c1_a2 + c1_a1) + c1_a1  # perdidas acumuladas + base
-    rec   = capital * 0.01
+    c1_apuesta = bet
+    c2_apuesta = bet * 2          # referencia ilustrativa
     data_count = len(g_mults)
 
     stats     = get_quota_stats(200)
@@ -1014,24 +988,19 @@ async def _receive_bet(message):
         "━━━━━━━━━━━━━━━━━━━━━━━\n"
         f"💰 Capital: `${capital:.0f}`\n"
         f"🎯 Apuesta base: `${bet:.2f}`\n"
-        f"💡 Recomendación 1%: `${rec:.2f}` del capital\n"
         "━━━━━━━━━━━━━━━━━━━━━━━\n"
         "*Gestión Moderada:*\n"
-        f"  📍 C1-Int1: `${c1_a1:.2f}` | C1-Int2 (SO): `${c1_a2:.2f}`\n"
-        f"  📍 C2-Int1: `${c2_a1:.2f}` (si falla col 1)\n"
-        "  ⚡ Col 1: señales moderadas *y* estrictas\n"
-        "  🔒 Col 2-3: *solo señales estrictas* >=2.00x\n"
+        f"  📍 C1 — Apuesta: `${c1_apuesta:.2f}`\n"
+        f"  📍 C2 — Apuesta: `${c2_apuesta:.2f}`\n"
+        "  📍 C3 — Recuperación máxima\n"
         "━━━━━━━━━━━━━━━━━━━━━━━\n"
         f"{stats_blk}"
         "━━━━━━━━━━━━━━━━━━━━━━━\n"
-        "*Mensajes automáticos:*\n"
-        "  📢 Señal → aparece con mult disparador\n"
-        "  ❌ Intento 1 perdido → avisa + espera SO\n"
-        "  ✅/❌ Resultado SO → borra msg intento 1\n"
-        "━━━━━━━━━━━━━━━━━━━━━━━\n"
-        f"📡 Datos WS: `{data_count}/400`\n\n"
-        "⚡ _Recibirás notificación automática con cada señal._\n\n"
-        "/status /datos /nueva /cerrar",
+        "📌 *Comandos útiles:*\n"
+        "/status — Ver estado\n"
+        "/datos — Últimos multiplicadores\n"
+        "/nueva — Nueva sesión\n"
+        "/cerrar — Terminar sesión",
         parse_mode='Markdown'
     )
 
