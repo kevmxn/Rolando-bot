@@ -743,6 +743,46 @@ async def cmd_start(message):
     stats     = get_quota_stats(200)
     stats_blk = quota_stats_text(stats)
 
+    # ── Bloquear inicio de NUEVA sesion si tendencia es desfavorable ──
+    # Solo aplica cuando NO hay sesion activa (no interrumpe sesiones en curso)
+    if stats['total'] >= 50 and not stats['favorable']:
+        n_label   = str(stats['total']) + ("" if stats['has_enough'] else " (acumulando...)")
+        r1_flag   = " ✅" if stats['pct_100_199'] <= 52.0 else " ❌"
+        r2_flag   = " ✅" if stats['pct_200_499'] >= 29.0 else " ❌"
+        unf_stats = (
+            f"📈 Análisis de la Tendencia últimos\n"
+            f"      {n_label} multiplicadores\n"
+            f"🔵 Cuotas (1.00-1.99x): {stats['count_100_199']} — {stats['pct_100_199']:.2f}%{r1_flag}\n"
+            f"🟣 Cuotas (2.00-4.99x): {stats['count_200_499']} — {stats['pct_200_499']:.2f}%{r2_flag}\n"
+            f"🟡 Cuotas (5.00-9.99x): {stats['count_500_999']} — {stats['pct_500_999']:.2f}%\n"
+            f"🔴 Cuotas (+10.00x):    {stats['count_1000_plus']} — {stats['pct_1000_plus']:.2f}%\n"
+            "\n"
+            "❌ TENDENCIA DESFAVORABLE\n"
+            "      No se recomienda esperar"
+        )
+        await bot.reply_to(
+            message,
+            f"🚀 *Bienvenido {name}!*\n\n"
+            "━━━━━━━━━━━━━━━━━━━━━━━\n"
+            "🤖 Bot de Señales Spaceman\n"
+            "📊 Sistema Moderado | Objetivo: 2.00x\n"
+            "🔄 Gestión: 3 Columnas × 2 Intentos\n"
+            "📈 Señales más estrictas en columnas 2 y 3\n"
+            "🏆 Ciclo: 10 señales exitosas\n"
+            "━━━━━━━━━━━━━━━━━━━━━━━\n"
+            f"{data_info}\n\n"
+            "━━━━━━━━━━━━━━━━━━━━━━━\n"
+            f"{unf_stats}\n"
+            "━━━━━━━━━━━━━━━━━━━━━━━\n"
+            "⚪ Espera una hora para volver a\n"
+            "consultar la tendencia del juego.\n"
+            "━━━━━━━━━━━━━━━━━━━━━━━\n"
+            "❇️ Presionar /start para volver a\n"
+            "consultar la tendencia del juego",
+            parse_mode='Markdown'
+        )
+        return  # No pedir capital — sesion bloqueada por tendencia desfavorable
+
     await bot.reply_to(
         message,
         f"🚀 *Bienvenido {name}!*\n\n"
