@@ -101,8 +101,9 @@ def get_quota_stats(n: int = 200) -> dict:
     pct2 = r2 / total * 100
     pct3 = r3 / total * 100
 
-    # Desfavorable: 1.00-1.99 supera 52% Y 2.00-4.99 esta por debajo del 29%
-    unfavorable = pct1 > 52.0 and pct2 < 29.0
+    # Desfavorable: 1.00-1.99 supera 52% O 2.00-4.99 esta por debajo del 29%
+    # Basta que UNA condicion falle para bloquear el inicio de sesion
+    unfavorable = pct1 > 52.0 or pct2 < 29.0
 
     return {
         'total':          total,
@@ -351,13 +352,26 @@ async def process_multiplier(value: float, round_id: str):
             s for s in g_sessions.values()
             if s.state == UserSession.EVALUATING
         ]
-        g_signal_state = 'idle' if win else 'so'
-        if not win:
-            g_signal_type = None   # será usado solo en fase SO
 
-        for session in sessions_eval:
-            tipo, bet = session.on_result(win)
-            await _dispatch_result(session, value, tipo, bet, is_so=False)
+        if sessions_eval:
+            # Hay sesiones evaluando: transicion normal
+            # Solo entramos en estado 'so' si alguna sesion realmente perdio
+            any_so = False
+            for session in sessions_eval:
+                tipo, bet = session.on_result(win)
+                await _dispatch_result(session, value, tipo, bet, is_so=False)
+                if session.state == UserSession.WAITING_SO:
+                    any_so = True
+
+            g_signal_state = 'so' if any_so else 'idle'
+            if g_signal_state == 'so':
+                g_signal_type = None  # tipo de SO no aplica aqui
+        else:
+            # Ninguna sesion estaba evaluando (ej: alert150 fue ignorada por C2/C3)
+            # Volvemos a idle de inmediato, igual que en el HTML
+            g_signal_state = 'idle'
+            g_signal_type  = None
+            logger.info("⚠️ Señal evaluada sin sesiones activas → idle inmediato")
 
     # ── FASE 2: Procesar resultado SO ─────────────────────────────
     elif g_signal_state == 'so':
@@ -960,12 +974,19 @@ async def _receive_bet(message):
     # ── Verificar cuotas ANTES de crear la sesion (solo bloquea al inicio) ──
     stats = get_quota_stats(200)
     if stats['total'] >= 50 and not stats['favorable']:
+        r1_ok = stats['pct_100_199'] <= 52.0
+        r2_ok = stats['pct_200_499'] >= 29.0
+        r1_line = (
+            f"🔴 1.00-1.99x: `{stats['pct_100_199']:.1f}%` (limite <=52%) {'✅' if r1_ok else '❌'}\n"
+        )
+        r2_line = (
+            f"🟡 2.00-4.99x: `{stats['pct_200_499']:.1f}%` (minimo >=29%) {'✅' if r2_ok else '❌'}\n"
+        )
         await bot.reply_to(
             message,
             "⛔ *Condiciones DESFAVORABLES — Sesion NO iniciada*\n"
             "━━━━━━━━━━━━━━━━━━━━━━━\n"
-            f"🔴 1.00-1.99x: `{stats['pct_100_199']:.1f}%` (limite: <=52%) ❌\n"
-            f"🟡 2.00-4.99x: `{stats['pct_200_499']:.1f}%` (minimo: >=29%) ❌\n"
+            + r1_line + r2_line +
             f"📊 Basado en los ultimos `{stats['total']}` multiplicadores\n"
             "━━━━━━━━━━━━━━━━━━━━━━━\n"
             "⏳ _Espera que las cuotas sean favorables._\n"
