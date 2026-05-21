@@ -1,30 +1,25 @@
-# ── Roulette Signal Bot — Dockerfile ──────────────────────────────────────────
-FROM python:3.13-slim
+FROM python:3.11-slim
 
-# Evita escritura de .pyc y asegura salida sin buffer
-ENV PYTHONDONTWRITEBYTECODE=1
+# Evitar prompts interactivos durante la instalación
+ENV DEBIAN_FRONTEND=noninteractive
 ENV PYTHONUNBUFFERED=1
+ENV PYTHONDONTWRITEBYTECODE=1
 
-# Dependencias del sistema para matplotlib
-RUN apt-get update && apt-get install -y --no-install-recommends \
-    libfreetype6-dev \
-    libpng-dev \
-    pkg-config \
-    && rm -rf /var/lib/apt/lists/*
-
-# Directorio de trabajo
 WORKDIR /app
 
-# Instala dependencias de Python
+# Instalar dependencias del sistema
+RUN apt-get update && apt-get install -y --no-install-recommends \
+    gcc \
+    && rm -rf /var/lib/apt/lists/*
+
+# Instalar dependencias de Python
 COPY requirements.txt .
 RUN pip install --no-cache-dir -r requirements.txt
 
-# Copia TODO el contenido del repositorio al contenedor
-COPY . .
+# Copiar código fuente
+COPY main.py .
 
-# Render asigna automáticamente la variable $PORT
-ENV PORT=10000
-EXPOSE 10000
+# Puerto que expone Flask (Render lo asigna vía $PORT)
+EXPOSE 8080
 
-# Comando de inicio
-CMD ["python", "ppc.py"]
+CMD ["python", "main.py"]
