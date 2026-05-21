@@ -745,7 +745,7 @@ async def cmd_start(message):
 
     # ── Bloquear inicio de NUEVA sesion si tendencia es desfavorable ──
     # Solo aplica cuando NO hay sesion activa (no interrumpe sesiones en curso)
-    if stats['total'] >= 50 and not stats['favorable']:
+    if stats['total'] > 0 and not stats['favorable']:
         n_label   = "200" if stats['has_enough'] else str(stats['total']) + " (acumulando...)"
         r1_flag   = " ✅" if stats['pct_100_199'] <= 52.0 else " ❌"
         r2_flag   = " ✅" if stats['pct_200_499'] >= 29.0 else " ❌"
@@ -995,7 +995,7 @@ async def _receive_bet(message):
 
     # ── Verificar cuotas ANTES de crear la sesion (solo bloquea al inicio) ──
     stats = get_quota_stats(200)
-    if stats['total'] >= 50 and not stats['favorable']:
+    if stats['total'] > 0 and not stats['favorable']:
         r1_ok = stats['pct_100_199'] <= 52.0
         r2_ok = stats['pct_200_499'] >= 29.0
         r1_line = (
@@ -1113,3 +1113,4 @@ if __name__ == '__main__':
     flask_thread.start()
     logger.info(f"🌐 Flask iniciado en puerto {os.environ.get('PORT', 8080)}")
     asyncio.run(main_async())
+
