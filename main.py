@@ -13,7 +13,7 @@ import logging
 import os
 import time
 from datetime import datetime
-from typing import Optional
+from typing import Optional, Tuple
 from flask import Flask
 import websockets
 from telebot.async_telebot import AsyncTeleBot
@@ -56,8 +56,10 @@ g_ema20: list     = []
 
 # Estado global de señal: 'idle' | 'evaluating' | 'so'
 g_signal_state = 'idle'
-# Tipo de señal activa: 'alert200' | None
+# Tipo de señal activa: 'alert200' (único tipo usado en moderado)
 g_signal_type: Optional[str] = None
+# Severidad de la señal (1, 2 o 3) según condición que disparó
+g_signal_strictness: int = 0
 # Multiplicador que disparó la señal
 g_signal_trigger_mult: float = 0.0
 
@@ -150,12 +152,14 @@ def quota_stats_text(stats: dict) -> str:
     )
 
 
-# ─── DETECCIÓN DE SEÑAL (checkModerateAlerts del HTML — solo alert200) ───────
-def check_moderate_signal() -> Optional[str]:
+# ─── DETECCIÓN DE SEÑAL (checkModerateAlerts del HTML) ───────────────────────
+def check_moderate_signal() -> Optional[Tuple[str, int]]:
     """
-    Retorna 'alert200' o None.
-    Las 3 condiciones del gráfico moderado del HTML, todas disparan alert200.
-    alert150 no entra a la estrategia (igual que en el HTML original).
+    Retorna ('alert200', strictness) o None.
+    Las 3 condiciones del gráfico moderado del HTML, cada una con su severidad:
+        strictness = 1 → EMA4 cruza EMA8 (S1)
+        strictness = 2 → patrón V (S2)
+        strictness = 3 → 2 consecutivos ≥2.00 + EMAs alineadas (S3)
     """
     pos  = g_positions
     e4   = g_ema4
@@ -173,27 +177,27 @@ def check_moderate_signal() -> Optional[str]:
     prv_e8  = e8[-2]  if len(e8)  > 1 else cur_e8
     prv_e20 = e20[-2] if len(e20) > 1 else cur_e20
 
-    # Condición 1: EMA8 cruza por encima de EMA20
+    # Condición 1: EMA8 cruza por encima de EMA20 (severidad 1 - S1)
     if len(e8) >= 2 and prv_e8 <= prv_e20 and cur_e8 > cur_e20:
-        return 'alert200'
+        return ('alert200', 1)
 
-    # Condición 2: patrón V en los últimos 3 puntos con precio sobre las 3 EMAs
+    # Condición 2: patrón V en los últimos 3 puntos con precio sobre las 3 EMAs (severidad 2 - S2)
     if len(pos) >= 3:
         a, b, c = pos[-3], pos[-2], pos[-1]
         if (abs(a - c) <= 1 and b > a
                 and cur_pos > cur_e4
                 and cur_pos > cur_e8
                 and cur_pos > cur_e20):
-            return 'alert200'
+            return ('alert200', 2)
 
-    # Condición 3: 2 consecutivos ≥2.00 + EMAs alineadas (4>8>20) + anterior <2.00
+    # Condición 3: 2 consecutivos ≥2.00 + EMAs alineadas (4>8>20) + anterior <2.00 (severidad 3 - S3)
     if (len(data) >= 2
             and data[-1]['value'] >= WIN_TARGET
             and data[-2]['value'] >= WIN_TARGET
             and cur_e4 > cur_e8 > cur_e20):
         before = data[-3] if len(data) >= 3 else None
         if before is None or before['value'] < WIN_TARGET:
-            return 'alert200'
+            return ('alert200', 3)
 
     return None
 
@@ -228,7 +232,6 @@ class UserSession:
         self.signal_trigger_mult: float = 0.0
 
         # ID del mensaje de "Perdida intento 1 / esperando SO"
-        # Se elimina cuando se conoce el resultado del SO (ganado o perdido)
         self.attempt1_msg_id: Optional[int] = None
 
         # Valor del resultado del intento 1 (para mostrarlo junto al SO en new_col)
@@ -322,12 +325,12 @@ def make_session_keyboard(user_id: int) -> types.InlineKeyboardMarkup:
 
 # ─── PROCESADOR DE MULTIPLICADORES ───────────────────────────────────────────
 async def process_multiplier(value: float, round_id: str):
-    global g_signal_state, g_signal_type, g_signal_trigger_mult
-    global g_positions, g_ema4, g_ema8, g_ema20
+    global g_signal_state, g_signal_type, g_signal_strictness, g_signal_trigger_mult
+    global g_positions, g_ema4, g_ema8, g_ema20, g_mults, g_seen_ids
 
     logger.info(
         f"🎲 {value:.2f}x | ID: {round_id} | "
-        f"Señal: {g_signal_state}/{g_signal_type}"
+        f"Señal: {g_signal_state}/{g_signal_type} (strictness={g_signal_strictness})"
     )
 
     # ── FASE 1: Procesar resultado principal ──────────────────────
@@ -339,8 +342,6 @@ async def process_multiplier(value: float, round_id: str):
         ]
 
         if sessions_eval:
-            # Hay sesiones evaluando: transicion normal
-            # Solo entramos en estado 'so' si alguna sesion realmente perdio
             any_so = False
             for session in sessions_eval:
                 tipo, bet = session.on_result(win)
@@ -350,12 +351,12 @@ async def process_multiplier(value: float, round_id: str):
 
             g_signal_state = 'so' if any_so else 'idle'
             if g_signal_state == 'so':
-                g_signal_type = None  # tipo de SO no aplica aqui
+                g_signal_type = None
+                # La severidad ya no aplica en SO
         else:
-            # Ninguna sesion estaba evaluando (ej: alert150 fue ignorada por C2/C3)
-            # Volvemos a idle de inmediato, igual que en el HTML
             g_signal_state = 'idle'
-            g_signal_type  = None
+            g_signal_type = None
+            g_signal_strictness = 0
             logger.info("⚠️ Señal evaluada sin sesiones activas → idle inmediato")
 
     # ── FASE 2: Procesar resultado SO ─────────────────────────────
@@ -366,7 +367,8 @@ async def process_multiplier(value: float, round_id: str):
             if s.state == UserSession.WAITING_SO
         ]
         g_signal_state = 'idle'
-        g_signal_type  = None
+        g_signal_type = None
+        g_signal_strictness = 0
 
         for session in sessions_so:
             tipo, bet = session.on_result(win)
@@ -396,31 +398,28 @@ async def process_multiplier(value: float, round_id: str):
     if g_signal_state == 'idle':
         sig_result = check_moderate_signal()
         if sig_result:
-            sig_type, sig_strictness = sig_result
+            sig_type, strictness = sig_result
             g_signal_state        = 'evaluating'
             g_signal_type         = sig_type
-            g_signal_strictness   = sig_strictness
+            g_signal_strictness   = strictness
             g_signal_trigger_mult = value
             logger.info(
                 f"🚀 SEÑAL {sig_type.upper()} "
-                f"S{sig_strictness} | Trigger: {value:.2f}x"
+                f"S{strictness} | Trigger: {value:.2f}x"
             )
 
             for session in list(g_sessions.values()):
                 if session.state != UserSession.IDLE:
                     continue
 
-                # ── Restricción progresiva por columna ──────────────
-                # La gestión moderada exige señales más restrictivas
-                # conforme se pierden columnas:
-                #   Col 1 → acepta S1, S2 o S3  (cualquier alert200)
-                #   Col 2 → acepta solo S2 o S3  (más restrictiva)
-                #   Col 3 → acepta solo S3        (la más estricta)
-                # Regla: strictness de la señal debe ser >= col actual
-                if sig_strictness < session.col:
+                # Restricción progresiva por columna:
+                #   Col 1 → acepta S1, S2 o S3  (strictness >= 1)
+                #   Col 2 → acepta solo S2 o S3  (strictness >= 2)
+                #   Col 3 → acepta solo S3        (strictness >= 3)
+                if strictness < session.col:
                     logger.info(
                         f"⏭️ User {session.user_id}: "
-                        f"S{sig_strictness} < Col {session.col} → señal omitida"
+                        f"S{strictness} < Col {session.col} → señal omitida"
                     )
                     continue
 
@@ -440,9 +439,8 @@ async def process_multiplier(value: float, round_id: str):
 
 
 async def _send_signal(session: UserSession, sig_type: str, trigger: float):
-    """Envia alerta de señal al usuario."""
+    """Envía alerta de señal al usuario."""
     # En el sistema moderado solo existe alert200 en la estrategia
-    # El nivel de restriccion viene de g_signal_strictness (global)
     s = g_signal_strictness  # 1 | 2 | 3
     nivel = {1: "S1 — EMA Cruce", 2: "S2 — Patrón V", 3: "S3 — Doble ≥2.00"}.get(s, "💎 2.00x")
 
@@ -744,7 +742,6 @@ async def cmd_start(message):
     stats_blk = quota_stats_text(stats)
 
     # ── Bloquear inicio de NUEVA sesion si tendencia es desfavorable ──
-    # Solo aplica cuando NO hay sesion activa (no interrumpe sesiones en curso)
     if stats['total'] > 0 and not stats['favorable']:
         n_label   = "200" if stats['has_enough'] else str(stats['total']) + " (acumulando...)"
         r1_flag   = " ✅" if stats['pct_100_199'] <= 52.0 else " ❌"
@@ -758,7 +755,7 @@ async def cmd_start(message):
             f"🔴 Cuotas (+10.00x):    {stats['count_1000_plus']} — {stats['pct_1000_plus']:.2f}%\n"
             "\n"
             "❌ TENDENCIA DESFAVORABLE\n"
-            "      No se recomienda esperar"
+            "      No se recomienda operar"
         )
         data_info_plain = (
             f"📡 {len(g_mults)}/400 multiplicadores recopilados"
@@ -1113,4 +1110,3 @@ if __name__ == '__main__':
     flask_thread.start()
     logger.info(f"🌐 Flask iniciado en puerto {os.environ.get('PORT', 8080)}")
     asyncio.run(main_async())
-
