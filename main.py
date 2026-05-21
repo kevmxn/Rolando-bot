@@ -15,11 +15,8 @@ import time
 from datetime import datetime
 from flask import Flask
 import websockets
-from telegram import Update, InlineKeyboardButton, InlineKeyboardMarkup
-from telegram.ext import (
-    Application, CommandHandler, CallbackQueryHandler,
-    ContextTypes, ConversationHandler, MessageHandler, filters
-)
+from telebot.async_telebot import AsyncTeleBot
+from telebot import types
 import aiohttp
 
 # ─── LOGGING ──────────────────────────────────────────────────────────────────
@@ -45,7 +42,8 @@ MAX_ATTS   = 2        # intentos por columna (intento + SO)
 CYCLE_SIZE = 10       # señales para completar un ciclo
 
 # ─── CONVERSATION STATES ──────────────────────────────────────────────────────
-ASK_CAPITAL, ASK_BET = range(2)
+ASK_CAPITAL = 'ASK_CAPITAL'
+ASK_BET     = 'ASK_BET'
 
 # ─── ESTADO GLOBAL ────────────────────────────────────────────────────────────
 g_mults:    list  = []          # [{id, value, ts}, ...]
@@ -61,8 +59,13 @@ g_signal_state = 'idle'
 # Sesiones de usuario: {user_id: UserSession}
 g_sessions: dict = {}
 
-# Referencia a la app de Telegram
-g_app = None
+# Estados de conversación: {user_id: ASK_CAPITAL | ASK_BET}
+user_states: dict = {}
+# Datos temporales de conversación: {user_id: {'capital': float}}
+user_temp: dict   = {}
+
+# Instancia del bot (pyTelegramBotAPI)
+bot = AsyncTeleBot(BOT_TOKEN)
 
 # ─── MOTOR DE EMAs ────────────────────────────────────────────────────────────
 def calc_ema(data: list, period: int) -> list:
@@ -75,7 +78,7 @@ def calc_ema(data: list, period: int) -> list:
         ema.append((data[i] - ema[i - 1]) * k + ema[i - 1])
     return ema
 
-# ─── DETECCIÓN DE SEÑAL (PORT de checkModerateAlerts del AMX) ─────────────────
+# ─── DETECCIÓN DE SEÑAL ───────────────────────────────────────────────────────
 def check_signal_2x() -> bool:
     """
     Detecta señal 2.00x del sistema moderado.
@@ -141,14 +144,12 @@ class UserSession:
         self.balance  = capital
         self.state    = self.IDLE
 
-        # Gestión de apuesta
-        self.scale   = 1         # señal actual (1‑10)
-        self.col     = 1         # columna actual (1‑3)
-        self.attempt = 1         # intento en la columna
-        self.lost    = 0.0       # pérdida acumulada en el ciclo de col
-        self.cur_bet = base_bet  # apuesta actual
+        self.scale   = 1
+        self.col     = 1
+        self.attempt = 1
+        self.lost    = 0.0
+        self.cur_bet = base_bet
 
-        # Estadísticas
         self.entries = 0
         self.wins    = 0
         self.losses  = 0
@@ -230,6 +231,16 @@ class UserSession:
         )
 
 
+# ─── HELPERS DE TECLADO ───────────────────────────────────────────────────────
+def make_session_keyboard(user_id: int) -> types.InlineKeyboardMarkup:
+    kb = types.InlineKeyboardMarkup()
+    kb.row(
+        types.InlineKeyboardButton("🔄 Nueva Sesión", callback_data=f"new_session:{user_id}"),
+        types.InlineKeyboardButton("❌ Cerrar",       callback_data=f"close_session:{user_id}")
+    )
+    return kb
+
+
 # ─── PROCESADOR DE MULTIPLICADORES ───────────────────────────────────────────
 async def process_multiplier(value: float, round_id: str):
     """
@@ -251,10 +262,7 @@ async def process_multiplier(value: float, round_id: str):
             s for s in g_sessions.values()
             if s.state == UserSession.EVALUATING
         ]
-        if win:
-            g_signal_state = 'idle'
-        else:
-            g_signal_state = 'so'
+        g_signal_state = 'idle' if win else 'so'
 
         for session in results_to_process:
             tipo, net = session.on_result(win)
@@ -279,18 +287,15 @@ async def process_multiplier(value: float, round_id: str):
     g_positions.append(prev + increment)
     g_mults.append({'id': round_id, 'value': value, 'ts': time.time()})
 
-    # Recorte de datos
     if len(g_mults) >= MAX_MULTS:
         g_mults[:]     = g_mults[-TRIM_MULTS:]
         g_positions[:] = g_positions[-TRIM_MULTS:]
         logger.info(f"✂️ Datos recortados a {TRIM_MULTS} registros")
 
-    # Recalcular EMAs
     g_ema4  = calc_ema(g_positions, 4)
     g_ema8  = calc_ema(g_positions, 8)
     g_ema20 = calc_ema(g_positions, 20)
 
-    # Limpiar IDs vistos si crece demasiado
     if len(g_seen_ids) > 2000:
         oldest = sorted(g_seen_ids)[:1000]
         for oid in oldest:
@@ -311,8 +316,6 @@ async def process_multiplier(value: float, round_id: str):
 
 async def _send_signal(session: UserSession):
     """Envía alerta de señal al usuario."""
-    if g_app is None:
-        return
     txt = (
         "🚨 *¡SEÑAL DETECTADA! 💎 2.00x*\n"
         "━━━━━━━━━━━━━━━━━━━━━━━\n"
@@ -326,17 +329,14 @@ async def _send_signal(session: UserSession):
         "⚡ _Entra al PRÓXIMO juego_"
     )
     try:
-        await g_app.bot.send_message(session.chat_id, txt, parse_mode='Markdown')
+        await bot.send_message(session.chat_id, txt, parse_mode='Markdown')
     except Exception as e:
         logger.error(f"Error enviando señal a {session.user_id}: {e}")
 
 
 async def _dispatch_result(session: UserSession, value: float, tipo: str, net: float, is_so: bool):
     """Despacha mensaje de resultado al usuario según el tipo."""
-    if g_app is None:
-        return
-
-    so_label = "🔄 *2ª Oportunidad*" if is_so else "💎 *Señal Principal*"
+    so_label  = "🔄 *2ª Oportunidad*" if is_so else "💎 *Señal Principal*"
     emoji_val = "🟢" if value >= WIN_TARGET else "🔴"
 
     if tipo in ('win', 'cycle_win'):
@@ -358,15 +358,11 @@ async def _dispatch_result(session: UserSession, value: float, tipo: str, net: f
                 f"📊 G/P: `{session.wins}/{session.losses}`\n\n"
                 "¿Deseas continuar o cerrar sesión?"
             )
-            kb = [[
-                InlineKeyboardButton("🔄 Nueva Sesión", callback_data=f"new_session:{session.user_id}"),
-                InlineKeyboardButton("❌ Cerrar", callback_data=f"close_session:{session.user_id}")
-            ]]
             try:
-                await g_app.bot.send_message(
+                await bot.send_message(
                     session.chat_id, txt,
                     parse_mode='Markdown',
-                    reply_markup=InlineKeyboardMarkup(kb)
+                    reply_markup=make_session_keyboard(session.user_id)
                 )
             except Exception as e:
                 logger.error(f"Error: {e}")
@@ -410,15 +406,11 @@ async def _dispatch_result(session: UserSession, value: float, tipo: str, net: f
             f"📊 G/P: `{session.wins}/{session.losses}`\n\n"
             "¿Deseas iniciar una nueva sesión?"
         )
-        kb = [[
-            InlineKeyboardButton("🔄 Nueva Sesión", callback_data=f"new_session:{session.user_id}"),
-            InlineKeyboardButton("❌ Cerrar", callback_data=f"close_session:{session.user_id}")
-        ]]
         try:
-            await g_app.bot.send_message(
+            await bot.send_message(
                 session.chat_id, txt,
                 parse_mode='Markdown',
-                reply_markup=InlineKeyboardMarkup(kb)
+                reply_markup=make_session_keyboard(session.user_id)
             )
         except Exception as e:
             logger.error(f"Error: {e}")
@@ -427,7 +419,7 @@ async def _dispatch_result(session: UserSession, value: float, tipo: str, net: f
         txt = f"Resultado inesperado: {tipo}"
 
     try:
-        await g_app.bot.send_message(session.chat_id, txt, parse_mode='Markdown')
+        await bot.send_message(session.chat_id, txt, parse_mode='Markdown')
     except Exception as e:
         logger.error(f"Error enviando resultado a {session.user_id}: {e}")
 
@@ -472,7 +464,6 @@ async def ws_collector():
                         if value <= 0:
                             continue
 
-                        # Construir ID único para deduplicar
                         round_id = str(
                             first.get('roundId') or
                             first.get('gameRoundId') or
@@ -480,7 +471,6 @@ async def ws_collector():
                             f"{value}_{int(time.time() * 1000)}"
                         )
 
-                        # Deduplicar por ID y por valor consecutivo igual
                         if round_id in g_seen_ids:
                             continue
                         if value == last_value:
@@ -560,24 +550,33 @@ async def self_ping_loop():
             logger.warning(f"Self-ping falló: {e}")
 
 
-# ─── HANDLERS DE TELEGRAM ─────────────────────────────────────────────────────
+# ─── HANDLERS DE TELEGRAM (pyTelegramBotAPI) ──────────────────────────────────
 
-async def cmd_start(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> int:
-    uid  = update.effective_user.id
-    name = update.effective_user.first_name or "usuario"
+@bot.message_handler(commands=['start', 'nueva'])
+async def cmd_start(message):
+    uid  = message.from_user.id
+    name = message.from_user.first_name or "usuario"
+
+    # Limpiar estado de conversación previo
+    user_states.pop(uid, None)
+    user_temp.pop(uid, None)
 
     # Si ya existe sesión activa no finalizada
     if uid in g_sessions and g_sessions[uid].state != UserSession.DONE:
         s = g_sessions[uid]
-        await update.message.reply_text(
-            f"✅ ¡Hola {name}! Ya tienes una sesión activa:\n\n"
-            f"{s.status_md()}\n\n"
-            "Usa /status para ver detalles\n"
-            "Usa /nueva para reiniciar la sesión\n"
-            "Usa /cerrar para terminar",
-            parse_mode='Markdown'
-        )
-        return ConversationHandler.END
+        if message.text.startswith('/nueva'):
+            del g_sessions[uid]
+        else:
+            await bot.reply_to(
+                message,
+                f"✅ ¡Hola {name}! Ya tienes una sesión activa:\n\n"
+                f"{s.status_md()}\n\n"
+                "Usa /status para ver detalles\n"
+                "Usa /nueva para reiniciar la sesión\n"
+                "Usa /cerrar para terminar",
+                parse_mode='Markdown'
+            )
+            return
 
     data_info = (
         f"📡 `{len(g_mults)}/400` multiplicadores recopilados"
@@ -585,7 +584,8 @@ async def cmd_start(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> int:
         "📡 Recopilando datos en tiempo real..."
     )
 
-    await update.message.reply_text(
+    await bot.reply_to(
+        message,
         f"🚀 *Bienvenido {name}!*\n\n"
         "━━━━━━━━━━━━━━━━━━━━━━━\n"
         "🤖 *Bot de Señales Spaceman*\n"
@@ -598,71 +598,189 @@ async def cmd_start(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> int:
         "_Ejemplo: 100_",
         parse_mode='Markdown'
     )
-    return ASK_CAPITAL
+    user_states[uid] = ASK_CAPITAL
 
 
-async def receive_capital(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> int:
-    txt = update.message.text.strip().replace(',', '.')
+@bot.message_handler(commands=['status'])
+async def cmd_status(message):
+    uid = message.from_user.id
+    if uid not in g_sessions:
+        await bot.reply_to(message, "❌ No tienes una sesión activa.\nUsa /start para comenzar.")
+        return
+
+    s = g_sessions[uid]
+    sig_txt = {
+        'idle':       "✅ En espera de señal",
+        'evaluating': "⚡ Evaluando resultado del juego actual",
+        'so':         "🔄 Evaluando 2ª Oportunidad",
+    }.get(g_signal_state, "—")
+
+    last_mult = f"`{g_mults[-1]['value']:.2f}x`" if g_mults else "—"
+
+    await bot.reply_to(
+        message,
+        f"{s.status_md()}\n"
+        "━━━━━━━━━━━━━━━━━━━━━━━\n"
+        f"📡 *WebSocket:* Activo\n"
+        f"🎲 *Último multi:* {last_mult}\n"
+        f"📊 *Datos:* `{len(g_mults)}/400`\n"
+        f"🔭 *Señal global:* {sig_txt}",
+        parse_mode='Markdown'
+    )
+
+
+@bot.message_handler(commands=['datos'])
+async def cmd_datos(message):
+    if not g_mults:
+        await bot.reply_to(message, "📡 Sin datos aún. Conectando al WebSocket...")
+        return
+
+    last  = g_mults[-30:]
+    lines = []
+    above = sum(1 for m in g_mults if m['value'] >= WIN_TARGET)
+    below = len(g_mults) - above
+    pct   = (above / len(g_mults) * 100) if g_mults else 0
+
+    for m in reversed(last):
+        emoji = "🟢" if m['value'] >= WIN_TARGET else "🔴"
+        lines.append(f"{emoji} `{m['value']:.2f}x`")
+
+    txt = (
+        "📊 *Últimos 30 multiplicadores:*\n\n"
+        + "\n".join(lines)
+        + f"\n\n*Estadísticas ({len(g_mults)} totales):*\n"
+        + f"🟢 ≥2.00x: `{above}` ({pct:.1f}%)\n"
+        + f"🔴 <2.00x: `{below}` ({100-pct:.1f}%)"
+    )
+    await bot.reply_to(message, txt, parse_mode='Markdown')
+
+
+@bot.message_handler(commands=['cerrar', 'cancel'])
+async def cmd_cerrar(message):
+    uid = message.from_user.id
+    user_states.pop(uid, None)
+    user_temp.pop(uid, None)
+
+    if uid in g_sessions:
+        s    = g_sessions[uid]
+        diff = s.balance - s.capital
+        sign = "+" if diff >= 0 else ""
+        del g_sessions[uid]
+        await bot.reply_to(
+            message,
+            f"✅ *Sesión cerrada.*\n\n"
+            f"💰 Balance final: `${s.balance:.0f}` ({sign}${diff:.0f})\n"
+            f"📊 G/P: `{s.wins}/{s.losses}` | Entradas: `{s.entries}`\n\n"
+            "Usa /start para comenzar una nueva sesión.",
+            parse_mode='Markdown'
+        )
+    else:
+        await bot.reply_to(message, "ℹ️ No hay sesión activa.")
+
+
+@bot.message_handler(commands=['ayuda'])
+async def cmd_ayuda(message):
+    await bot.reply_to(
+        message,
+        "🤖 *COMANDOS DEL BOT*\n"
+        "━━━━━━━━━━━━━━━━━━━━━━━\n"
+        "/start — Iniciar nueva sesión\n"
+        "/status — Ver estado de tu sesión\n"
+        "/datos — Últimos multiplicadores\n"
+        "/nueva — Reiniciar sesión\n"
+        "/cerrar — Terminar sesión\n"
+        "/ayuda — Esta ayuda\n"
+        "━━━━━━━━━━━━━━━━━━━━━━━\n"
+        "*Cómo funciona:*\n"
+        "1. El bot analiza Spaceman en tiempo real\n"
+        "2. Detecta señales del sistema moderado (2.00x)\n"
+        "3. Te notifica con la apuesta exacta\n"
+        "4. Gestiona automáticamente pérdidas con 2ª oportunidad\n"
+        "5. Completa el ciclo en 10 señales ganadas\n",
+        parse_mode='Markdown'
+    )
+
+
+@bot.message_handler(func=lambda m: m.content_type == 'text' and not m.text.startswith('/'))
+async def handle_text(message):
+    """Maneja respuestas de conversación (capital y apuesta base)."""
+    uid   = message.from_user.id
+    state = user_states.get(uid)
+
+    if state == ASK_CAPITAL:
+        await _receive_capital(message)
+    elif state == ASK_BET:
+        await _receive_bet(message)
+    # Si no hay estado activo, ignorar silenciosamente
+
+
+async def _receive_capital(message):
+    uid = message.from_user.id
+    txt = message.text.strip().replace(',', '.')
     try:
         capital = float(txt)
     except ValueError:
-        await update.message.reply_text("⚠️ Ingresa un número válido.\n_Ejemplo: 100_", parse_mode='Markdown')
-        return ASK_CAPITAL
+        await bot.reply_to(message, "⚠️ Ingresa un número válido.\n_Ejemplo: 100_", parse_mode='Markdown')
+        return
 
     if capital < 10:
-        await update.message.reply_text("⚠️ El capital mínimo es $10.")
-        return ASK_CAPITAL
+        await bot.reply_to(message, "⚠️ El capital mínimo es $10.")
+        return
 
-    ctx.user_data['capital'] = capital
+    user_temp[uid] = {'capital': capital}
+    user_states[uid] = ASK_BET
     rec = capital * 0.05
 
-    await update.message.reply_text(
+    await bot.reply_to(
+        message,
         f"✅ Capital: `${capital:.0f}`\n\n"
         "🎯 *¿Cuál es tu apuesta base?*\n"
         f"💡 Recomendado: `${rec:.2f}` (5% del capital)\n"
         "_Esta es la apuesta mínima por señal._",
         parse_mode='Markdown'
     )
-    return ASK_BET
 
 
-async def receive_bet(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> int:
-    txt = update.message.text.strip().replace(',', '.')
+async def _receive_bet(message):
+    uid = message.from_user.id
+    txt = message.text.strip().replace(',', '.')
     try:
         bet = float(txt)
     except ValueError:
-        await update.message.reply_text("⚠️ Ingresa un número válido.\n_Ejemplo: 5_", parse_mode='Markdown')
-        return ASK_BET
+        await bot.reply_to(message, "⚠️ Ingresa un número válido.\n_Ejemplo: 5_", parse_mode='Markdown')
+        return
 
-    capital = ctx.user_data.get('capital', 100)
+    capital = user_temp.get(uid, {}).get('capital', 100)
 
     if bet < 1:
-        await update.message.reply_text("⚠️ La apuesta mínima es $1.")
-        return ASK_BET
+        await bot.reply_to(message, "⚠️ La apuesta mínima es $1.")
+        return
 
     if bet > capital * 0.25:
         limite = capital * 0.25
-        await update.message.reply_text(
+        await bot.reply_to(
+            message,
             f"⚠️ La apuesta no puede superar el 25% del capital (`${limite:.2f}`).\n"
             "_Ingresa un valor menor para una gestión segura._",
             parse_mode='Markdown'
         )
-        return ASK_BET
+        return
 
-    uid  = update.effective_user.id
-    chat = update.effective_chat.id
+    chat = message.chat.id
+
+    # Limpiar estado de conversación
+    user_states.pop(uid, None)
+    user_temp.pop(uid, None)
 
     # Crear sesión
     session = UserSession(uid, chat, capital, bet)
     g_sessions[uid] = session
 
-    # Calcular peor caso para info
     worst_col1 = bet
-    worst_col2 = (bet + (bet + bet)) + bet
-    worst_col3 = worst_col2 + (worst_col2 + bet) + bet
     data_count = len(g_mults)
 
-    await update.message.reply_text(
+    await bot.reply_to(
+        message,
         "✅ *¡Sesión iniciada!*\n"
         "━━━━━━━━━━━━━━━━━━━━━━━\n"
         f"💰 Capital: `${capital:.0f}`\n"
@@ -682,136 +800,39 @@ async def receive_bet(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> int:
         "/cerrar — Terminar sesión",
         parse_mode='Markdown'
     )
-    return ConversationHandler.END
 
 
-async def cmd_status(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
-    uid = update.effective_user.id
-    if uid not in g_sessions:
-        await update.message.reply_text(
-            "❌ No tienes una sesión activa.\nUsa /start para comenzar."
-        )
-        return
+@bot.callback_query_handler(func=lambda call: True)
+async def callback_handler(call):
+    await bot.answer_callback_query(call.id)
 
-    s = g_sessions[uid]
-    sig_txt = {
-        'idle':       "✅ En espera de señal",
-        'evaluating': "⚡ Evaluando resultado del juego actual",
-        'so':         "🔄 Evaluando 2ª Oportunidad",
-    }.get(g_signal_state, "—")
-
-    last_mult = f"`{g_mults[-1]['value']:.2f}x`" if g_mults else "—"
-
-    await update.message.reply_text(
-        f"{s.status_md()}\n"
-        "━━━━━━━━━━━━━━━━━━━━━━━\n"
-        f"📡 *WebSocket:* Activo\n"
-        f"🎲 *Último multi:* {last_mult}\n"
-        f"📊 *Datos:* `{len(g_mults)}/400`\n"
-        f"🔭 *Señal global:* {sig_txt}",
-        parse_mode='Markdown'
-    )
-
-
-async def cmd_datos(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
-    if not g_mults:
-        await update.message.reply_text("📡 Sin datos aún. Conectando al WebSocket...")
-        return
-
-    last = g_mults[-30:]
-    lines = []
-    above = sum(1 for m in g_mults if m['value'] >= WIN_TARGET)
-    below = len(g_mults) - above
-    pct   = (above / len(g_mults) * 100) if g_mults else 0
-
-    for m in reversed(last):
-        emoji = "🟢" if m['value'] >= WIN_TARGET else "🔴"
-        lines.append(f"{emoji} `{m['value']:.2f}x`")
-
-    txt = (
-        "📊 *Últimos 30 multiplicadores:*\n\n"
-        + "\n".join(lines)
-        + f"\n\n*Estadísticas ({len(g_mults)} totales):*\n"
-        + f"🟢 ≥2.00x: `{above}` ({pct:.1f}%)\n"
-        + f"🔴 <2.00x: `{below}` ({100-pct:.1f}%)"
-    )
-    await update.message.reply_text(txt, parse_mode='Markdown')
-
-
-async def cmd_nueva(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> int:
-    uid = update.effective_user.id
-    if uid in g_sessions:
-        del g_sessions[uid]
-    return await cmd_start(update, ctx)
-
-
-async def cmd_cerrar(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> int:
-    uid = update.effective_user.id
-    if uid in g_sessions:
-        s   = g_sessions[uid]
-        diff = s.balance - s.capital
-        sign = "+" if diff >= 0 else ""
-        del g_sessions[uid]
-        await update.message.reply_text(
-            f"✅ *Sesión cerrada.*\n\n"
-            f"💰 Balance final: `${s.balance:.0f}` ({sign}${diff:.0f})\n"
-            f"📊 G/P: `{s.wins}/{s.losses}` | Entradas: `{s.entries}`\n\n"
-            "Usa /start para comenzar una nueva sesión.",
-            parse_mode='Markdown'
-        )
-    else:
-        await update.message.reply_text("ℹ️ No hay sesión activa.")
-    return ConversationHandler.END
-
-
-async def cmd_ayuda(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
-    await update.message.reply_text(
-        "🤖 *COMANDOS DEL BOT*\n"
-        "━━━━━━━━━━━━━━━━━━━━━━━\n"
-        "/start — Iniciar nueva sesión\n"
-        "/status — Ver estado de tu sesión\n"
-        "/datos — Últimos multiplicadores\n"
-        "/nueva — Reiniciar sesión (mantiene config)\n"
-        "/cerrar — Terminar sesión\n"
-        "/ayuda — Esta ayuda\n"
-        "━━━━━━━━━━━━━━━━━━━━━━━\n"
-        "*Cómo funciona:*\n"
-        "1. El bot analiza Spaceman en tiempo real\n"
-        "2. Detecta señales del sistema moderado (2.00x)\n"
-        "3. Te notifica con la apuesta exacta\n"
-        "4. Gestiona automáticamente pérdidas con 2ª oportunidad\n"
-        "5. Completa el ciclo en 10 señales ganadas\n",
-        parse_mode='Markdown'
-    )
-
-
-async def callback_handler(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
-    query = update.callback_query
-    await query.answer()
-
-    parts = query.data.split(':')
+    parts  = call.data.split(':')
     action = parts[0]
-    uid    = int(parts[1]) if len(parts) > 1 else update.effective_user.id
+    uid    = int(parts[1]) if len(parts) > 1 else call.from_user.id
 
     if action == "new_session":
         if uid in g_sessions:
-            old = g_sessions[uid]
+            old     = g_sessions[uid]
             session = UserSession(uid, old.chat_id, old.capital, old.base_bet)
             g_sessions[uid] = session
             try:
-                await query.edit_message_text(
+                await bot.edit_message_text(
                     "🔄 *Nueva sesión iniciada*\n\n"
                     f"💰 Capital: `${old.capital:.0f}`\n"
                     f"🎯 Apuesta base: `${old.base_bet:.2f}`\n\n"
                     "⚡ _Esperando próxima señal..._",
+                    call.message.chat.id,
+                    call.message.message_id,
                     parse_mode='Markdown'
                 )
             except Exception:
                 pass
         else:
             try:
-                await query.edit_message_text(
+                await bot.edit_message_text(
                     "ℹ️ Sesión no encontrada. Usa /start para comenzar.",
+                    call.message.chat.id,
+                    call.message.message_id,
                     parse_mode='Markdown'
                 )
             except Exception:
@@ -821,67 +842,25 @@ async def callback_handler(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
         if uid in g_sessions:
             del g_sessions[uid]
         try:
-            await query.edit_message_text(
-                "✅ Sesión cerrada. Usa /start cuando quieras volver."
+            await bot.edit_message_text(
+                "✅ Sesión cerrada. Usa /start cuando quieras volver.",
+                call.message.chat.id,
+                call.message.message_id
             )
         except Exception:
             pass
 
 
-async def cmd_cancel(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> int:
-    await cmd_cerrar(update, ctx)
-    return ConversationHandler.END
-
-
 # ─── MAIN ─────────────────────────────────────────────────────────────────────
 async def main_async():
-    global g_app
+    logger.info("🤖 Iniciando SpacemanBot con pyTelegramBotAPI...")
 
-    # Construir aplicación Telegram
-    g_app = Application.builder().token(BOT_TOKEN).build()
+    # Lanzar recolector WS y self-ping en paralelo
+    asyncio.create_task(ws_collector())
+    asyncio.create_task(self_ping_loop())
 
-    # Conversation handler para setup de sesión
-    conv = ConversationHandler(
-        entry_points=[
-            CommandHandler('start', cmd_start),
-            CommandHandler('nueva', cmd_nueva),
-        ],
-        states={
-            ASK_CAPITAL: [MessageHandler(filters.TEXT & ~filters.COMMAND, receive_capital)],
-            ASK_BET:     [MessageHandler(filters.TEXT & ~filters.COMMAND, receive_bet)],
-        },
-        fallbacks=[
-            CommandHandler('cancel', cmd_cancel),
-            CommandHandler('cerrar', cmd_cancel),
-        ],
-        allow_reentry=True,
-    )
-
-    g_app.add_handler(conv)
-    g_app.add_handler(CommandHandler('status', cmd_status))
-    g_app.add_handler(CommandHandler('datos',  cmd_datos))
-    g_app.add_handler(CommandHandler('cerrar', cmd_cerrar))
-    g_app.add_handler(CommandHandler('ayuda',  cmd_ayuda))
-    g_app.add_handler(CallbackQueryHandler(callback_handler))
-
-    async with g_app:
-        await g_app.initialize()
-        await g_app.start()
-
-        logger.info("🤖 Bot iniciado. Lanzando tareas en segundo plano...")
-
-        # Lanzar recolector WS y self-ping
-        asyncio.create_task(ws_collector())
-        asyncio.create_task(self_ping_loop())
-
-        await g_app.updater.start_polling(
-            drop_pending_updates=True,
-            allowed_updates=Update.ALL_TYPES
-        )
-
-        logger.info("✅ Todo activo. Esperando eventos...")
-        # Mantener corriendo indefinidamente
-        await asyncio.Event().wait()
+    logger.info("✅ Tareas de fondo iniciadas. Iniciando polling...")
+    await bot.infinity_polling(skip_pending=True)
 
 
 if __name__ == '__main__':
