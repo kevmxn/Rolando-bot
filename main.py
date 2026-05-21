@@ -128,7 +128,7 @@ def quota_stats_text(stats: dict) -> str:
     if stats['total'] == 0:
         return "📡 _Sin datos suficientes para analizar cuotas._\n"
 
-    n_label = str(stats['total']) + ("" if stats['has_enough'] else " (acumulando...)")
+    n_label = "200" if stats['has_enough'] else str(stats['total']) + " (acumulando...)"
 
     r1_flag = " ✅" if stats['pct_100_199'] <= 52.0 else " ❌"
     r2_flag = " ✅" if stats['pct_200_499'] >= 29.0 else " ❌"
@@ -746,7 +746,7 @@ async def cmd_start(message):
     # ── Bloquear inicio de NUEVA sesion si tendencia es desfavorable ──
     # Solo aplica cuando NO hay sesion activa (no interrumpe sesiones en curso)
     if stats['total'] >= 50 and not stats['favorable']:
-        n_label   = str(stats['total']) + ("" if stats['has_enough'] else " (acumulando...)")
+        n_label   = "200" if stats['has_enough'] else str(stats['total']) + " (acumulando...)"
         r1_flag   = " ✅" if stats['pct_100_199'] <= 52.0 else " ❌"
         r2_flag   = " ✅" if stats['pct_200_499'] >= 29.0 else " ❌"
         unf_stats = (
@@ -760,6 +760,11 @@ async def cmd_start(message):
             "❌ TENDENCIA DESFAVORABLE\n"
             "      No se recomienda esperar"
         )
+        data_info_plain = (
+            f"📡 {len(g_mults)}/400 multiplicadores recopilados"
+            if g_mults else
+            "📡 Recopilando datos en tiempo real..."
+        )
         await bot.reply_to(
             message,
             f"🚀 *Bienvenido {name}!*\n\n"
@@ -770,12 +775,12 @@ async def cmd_start(message):
             "📈 Señales más estrictas en columnas 2 y 3\n"
             "🏆 Ciclo: 10 señales exitosas\n"
             "━━━━━━━━━━━━━━━━━━━━━━━\n"
-            f"{data_info}\n\n"
+            f"{data_info_plain}\n\n"
             "━━━━━━━━━━━━━━━━━━━━━━━\n"
             f"{unf_stats}\n"
             "━━━━━━━━━━━━━━━━━━━━━━━\n"
             "⚪ Espera una hora para volver a\n"
-            "consultar la tendencia del juego.\n"
+            "consulta la tendencia del juego.\n"
             "━━━━━━━━━━━━━━━━━━━━━━━\n"
             "❇️ Presionar /start para volver a\n"
             "consultar la tendencia del juego",
