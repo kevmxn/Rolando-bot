@@ -2,7 +2,7 @@
 """
 ╔══════════════════════════════════════════════════╗
 ║   SPACEMAN BOT — Sistema Moderado 2.00x         ║
-║   WebSocket en tiempo real | Multi-sesión       ║
+║   WebSocket en tiempo real | Sesión Global      ║
 ╚══════════════════════════════════════════════════╝
 """
 
@@ -12,7 +12,7 @@ import json
 import logging
 import os
 import time
-from datetime import datetime
+from datetime import datetime, timedelta
 from typing import Optional, Tuple
 from flask import Flask
 import websockets
@@ -41,10 +41,7 @@ WIN_TARGET = 2.00
 MAX_COLS   = 3
 MAX_ATTS   = 2
 CYCLE_SIZE = 10
-
-# ─── CONVERSATION STATES ──────────────────────────────────────────────────────
-ASK_CAPITAL = 'ASK_CAPITAL'
-ASK_BET     = 'ASK_BET'
+BASE_BET   = 0.10   # Apuesta base fija (USD)
 
 # ─── ESTADO GLOBAL ────────────────────────────────────────────────────────────
 g_mults:    list  = []
@@ -54,20 +51,46 @@ g_ema4:  list     = []
 g_ema8:  list     = []
 g_ema20: list     = []
 
-# Estado global de señal: 'idle' | 'evaluating' | 'so'
-g_signal_state = 'idle'
-# Tipo de señal activa: 'alert200' (único tipo usado en moderado)
+g_signal_state        = 'idle'     # 'idle' | 'evaluating' | 'so'
 g_signal_type: Optional[str] = None
-# Severidad de la señal (1, 2 o 3) según condición que disparó
-g_signal_strictness: int = 0
-# Multiplicador que disparó la señal
+g_signal_strictness: int     = 0
 g_signal_trigger_mult: float = 0.0
 
-g_sessions: dict = {}
-user_states: dict = {}
-user_temp: dict   = {}
+g_all_chats: set              = set()   # Todos los chats que alguna vez enviaron /start
+g_trend_favorable: Optional[bool] = None
 
 bot = AsyncTeleBot(BOT_TOKEN)
+
+
+# ─── HORA ARGENTINA ───────────────────────────────────────────────────────────
+def argentina_time() -> str:
+    now_arg = datetime.utcnow() - timedelta(hours=3)
+    return now_arg.strftime("%H:%M")
+
+
+# ─── BROADCAST ────────────────────────────────────────────────────────────────
+async def broadcast(msg: str, parse_mode: str = None):
+    """Envía un mensaje a todos los chats registrados. Elimina chats inactivos."""
+    dead = set()
+    for chat_id in list(g_all_chats):
+        try:
+            await bot.send_message(chat_id, msg, parse_mode=parse_mode)
+        except Exception as e:
+            err = str(e).lower()
+            if any(x in err for x in ('blocked', 'not found', 'deactivated', 'kicked')):
+                dead.add(chat_id)
+                logger.warning(f"Chat {chat_id} inactivo → removido")
+            else:
+                logger.warning(f"Broadcast error → {chat_id}: {e}")
+    g_all_chats.difference_update(dead)
+
+
+async def broadcast_trend_change(favorable: bool):
+    hora = argentina_time()
+    msg  = f"🟢 TENDENCIA FAVORABLE  {hora}" if favorable else f"🔴 TENDENCIA DESFAVORABLE  {hora}"
+    logger.info(f"📢 Broadcast tendencia: {msg} → {len(g_all_chats)} chats")
+    await broadcast(msg)
+
 
 # ─── MOTOR DE EMAs ────────────────────────────────────────────────────────────
 def calc_ema(data: list, period: int) -> list:
@@ -79,12 +102,12 @@ def calc_ema(data: list, period: int) -> list:
         ema.append((data[i] - ema[i - 1]) * k + ema[i - 1])
     return ema
 
+
 # ─── ESTADÍSTICAS DE CUOTAS ───────────────────────────────────────────────────
 def get_quota_stats(n: int = 200) -> dict:
     """
     Calcula estadísticas de cuotas para los últimos n multiplicadores.
-    Condicion desfavorable: 1.00-1.99x > 52% O 2.00-4.99x < 29%.
-    Solo se usa para bloquear el INICIO de sesion, nunca durante una sesion activa.
+    Desfavorable: 1.00-1.99x > 52% O 2.00-4.99x < 29%.
     """
     data  = g_mults[-n:] if len(g_mults) >= n else g_mults[:]
     total = len(data)
@@ -107,7 +130,6 @@ def get_quota_stats(n: int = 200) -> dict:
     pct3 = r3 / total * 100
     pct4 = r4 / total * 100
 
-    # Desfavorable: 1.00-1.99 supera 52% O 2.00-4.99 esta por debajo del 29%
     unfavorable = pct1 > 52.0 or pct2 < 29.0
 
     return {
@@ -126,19 +148,18 @@ def get_quota_stats(n: int = 200) -> dict:
 
 
 def quota_stats_text(stats: dict) -> str:
-    """Formatea el bloque de estadisticas de cuotas para Telegram."""
+    """Formatea el bloque de estadísticas de cuotas para Telegram."""
     if stats['total'] == 0:
         return "📡 _Sin datos suficientes para analizar cuotas._\n"
 
     n_label = "200" if stats['has_enough'] else str(stats['total']) + " (acumulando...)"
-
     r1_flag = " ✅" if stats['pct_100_199'] <= 52.0 else " ❌"
     r2_flag = " ✅" if stats['pct_200_499'] >= 29.0 else " ❌"
-
-    if stats['favorable']:
-        fav_line = "✅ *¡TENDENCIA FAVORABLE!*\n      _Se recomienda operar_"
-    else:
-        fav_line = "⚠️ *TENDENCIA DESFAVORABLE*\n      _Se recomienda esperar_"
+    fav_line = (
+        "✅ *¡TENDENCIA FAVORABLE!*\n      _Se recomienda operar_"
+        if stats['favorable'] else
+        "⚠️ *TENDENCIA DESFAVORABLE*\n      _Se recomienda esperar_"
+    )
 
     return (
         f"📈 *Análisis de la Tendencia últimos*\n"
@@ -152,14 +173,13 @@ def quota_stats_text(stats: dict) -> str:
     )
 
 
-# ─── DETECCIÓN DE SEÑAL (checkModerateAlerts del HTML) ───────────────────────
+# ─── DETECCIÓN DE SEÑAL ───────────────────────────────────────────────────────
 def check_moderate_signal() -> Optional[Tuple[str, int]]:
     """
     Retorna ('alert200', strictness) o None.
-    Las 3 condiciones del gráfico moderado del HTML, cada una con su severidad:
-        strictness = 1 → EMA4 cruza EMA8 (S1)
-        strictness = 2 → patrón V (S2)
-        strictness = 3 → 2 consecutivos ≥2.00 + EMAs alineadas (S3)
+      S1 → EMA8 cruza por encima de EMA20
+      S2 → patrón V + precio sobre las 3 EMAs
+      S3 → 2 consecutivos ≥2.00 + EMAs alineadas (4>8>20)
     """
     pos  = g_positions
     e4   = g_ema4
@@ -177,11 +197,11 @@ def check_moderate_signal() -> Optional[Tuple[str, int]]:
     prv_e8  = e8[-2]  if len(e8)  > 1 else cur_e8
     prv_e20 = e20[-2] if len(e20) > 1 else cur_e20
 
-    # Condición 1: EMA8 cruza por encima de EMA20 (severidad 1 - S1)
+    # S1: EMA8 cruza por encima de EMA20
     if len(e8) >= 2 and prv_e8 <= prv_e20 and cur_e8 > cur_e20:
         return ('alert200', 1)
 
-    # Condición 2: patrón V en los últimos 3 puntos con precio sobre las 3 EMAs (severidad 2 - S2)
+    # S2: patrón V + precio sobre las 3 EMAs
     if len(pos) >= 3:
         a, b, c = pos[-3], pos[-2], pos[-1]
         if (abs(a - c) <= 1 and b > a
@@ -190,7 +210,7 @@ def check_moderate_signal() -> Optional[Tuple[str, int]]:
                 and cur_pos > cur_e20):
             return ('alert200', 2)
 
-    # Condición 3: 2 consecutivos ≥2.00 + EMAs alineadas (4>8>20) + anterior <2.00 (severidad 3 - S3)
+    # S3: 2 consecutivos ≥2.00 + EMAs alineadas + anterior <2.00
     if (len(data) >= 2
             and data[-1]['value'] >= WIN_TARGET
             and data[-2]['value'] >= WIN_TARGET
@@ -201,101 +221,117 @@ def check_moderate_signal() -> Optional[Tuple[str, int]]:
 
     return None
 
-# ─── SESIÓN DE USUARIO ────────────────────────────────────────────────────────
-class UserSession:
+
+# ─── SESIÓN GLOBAL ────────────────────────────────────────────────────────────
+class GlobalSession:
+    """
+    Sesión única compartida por todos los usuarios.
+    Apuesta base fija: BASE_BET ($0.10).
+    Rastrea fichas (C1+C2+C3) para estadísticas reales.
+    """
     IDLE       = 'idle'
     EVALUATING = 'evaluating'
     WAITING_SO = 'waiting_so'
     DONE       = 'done'
 
-    def __init__(self, user_id: int, chat_id: int, capital: float, base_bet: float):
-        self.user_id  = user_id
-        self.chat_id  = chat_id
-        self.capital  = capital
-        self.base_bet = base_bet
-        self.balance  = capital
+    def __init__(self, carry_fichas: list = None):
+        self.base_bet = BASE_BET
         self.state    = self.IDLE
 
         self.scale   = 1
         self.col     = 1
         self.attempt = 1
         self.lost    = 0.0
-        self.cur_bet = base_bet
+        self.cur_bet = BASE_BET
 
         self.entries = 0
         self.wins    = 0
         self.losses  = 0
-        self.history = []
         self.created = datetime.now()
 
-        # Multiplicador que disparó la señal activa
-        self.signal_trigger_mult: float = 0.0
+        self.signal_trigger_mult:    float = 0.0
+        self.attempt1_result_value:  float = 0.0
 
-        # ID del mensaje de "Perdida intento 1 / esperando SO"
-        self.attempt1_msg_id: Optional[int] = None
+        # Historial de fichas completas (se preserva entre ciclos via carry_fichas)
+        self.fichas: list = carry_fichas if carry_fichas is not None else []
+        self._cur_ficha: dict = None   # ficha en curso (abarca C1→C2→C3 si fuera necesario)
 
-        # Valor del resultado del intento 1 (para mostrarlo junto al SO en new_col)
-        self.attempt1_result_value: float = 0.0
+    def start_ficha(self):
+        """Inicia una nueva ficha al recibir señal en columna 1."""
+        self._cur_ficha = {
+            'n':      len(self.fichas) + 1,
+            'c1':     0.0,   # Total apostado en columna 1 (intento 1 + SO si hubo)
+            'c2':     0.0,   # Total apostado en columna 2
+            'c3':     0.0,   # Total apostado en columna 3
+            'result': None,  # 'win' | 'loss'
+            'ts':     argentina_time(),
+        }
 
     def on_result(self, win: bool) -> tuple:
         """
-        Retorna (tipo, bet_amount):
-          'win' | 'cycle_win' | 'so' | 'new_col' | 'cycle_loss'
-        Balance se actualiza con el capital real en CADA resultado (+ o -).
+        Retorna (tipo, bet_amount).
+        Tipos: 'win' | 'cycle_win' | 'so' | 'new_col' | 'cycle_loss'
+        Actualiza la ficha activa con el gasto real de cada columna.
         """
         self.entries += 1
         prev_bet = self.cur_bet
+        prev_col = self.col   # columna activa ANTES de que on_result la cambie
+
+        # Acumular gasto en la columna correspondiente de la ficha activa
+        if self._cur_ficha is not None:
+            col_key = f'c{prev_col}'
+            self._cur_ficha[col_key] = self._cur_ficha.get(col_key, 0.0) + prev_bet
 
         if win:
-            # Suma la apuesta ganada al balance real
-            self.balance += prev_bet
-            self.wins    += 1
-            self._log('WIN', prev_bet)
+            self.wins   += 1
             self.lost    = 0.0
             self.cur_bet = self.base_bet
             self.col     = 1
             self.attempt = 1
             self.scale  += 1
+
+            # Cerrar ficha como ganada
+            if self._cur_ficha is not None:
+                self._cur_ficha['result'] = 'win'
+                self.fichas.append(self._cur_ficha)
+                self._cur_ficha = None
+            if len(self.fichas) > 100:
+                self.fichas = self.fichas[-100:]
+
             if self.scale > CYCLE_SIZE:
                 self.state = self.DONE
                 return ('cycle_win', prev_bet)
             self.state = self.IDLE
             return ('win', prev_bet)
+
         else:
-            # Descuenta la apuesta perdida del balance real inmediatamente
-            self.balance -= prev_bet
-            self.lost    += prev_bet
             self.losses  += 1
+            self.lost    += prev_bet
             self.cur_bet  = self.lost + self.base_bet
             self.attempt += 1
-            self._log('LOSS', -prev_bet)
 
             if self.attempt > MAX_ATTS:
                 self.attempt = 1
                 self.col    += 1
                 if self.col > MAX_COLS:
+                    # Ciclo perdido — cerrar ficha como pérdida
+                    if self._cur_ficha is not None:
+                        self._cur_ficha['result'] = 'loss'
+                        self.fichas.append(self._cur_ficha)
+                        self._cur_ficha = None
+                    if len(self.fichas) > 100:
+                        self.fichas = self.fichas[-100:]
                     self.state = self.DONE
                     return ('cycle_loss', prev_bet)
+                # Avanzar a siguiente columna — la ficha continúa abierta
                 self.state = self.IDLE
                 return ('new_col', prev_bet)
             else:
                 self.state = self.WAITING_SO
                 return ('so', prev_bet)
 
-    def _log(self, result: str, net: float):
-        self.history.append({
-            'n': self.entries, 'scale': self.scale, 'col': self.col,
-            'att': self.attempt, 'bet': self.cur_bet, 'result': result,
-            'net': net, 'balance': self.balance
-        })
-        if len(self.history) > 100:
-            self.history.pop(0)
-
-    def status_md(self) -> str:
-        diff  = self.balance - self.capital
-        sign  = "+" if diff >= 0 else ""
-        emoji = "🟢" if diff >= 0 else "🔴"
-        state_txt = {
+    def status_short(self) -> str:
+        estado_txt = {
             self.IDLE:       "⏳ Esperando señal",
             self.EVALUATING: "⚡ Evaluando resultado",
             self.WAITING_SO: "🔄 Esperando 2ª Oportunidad",
@@ -303,78 +339,64 @@ class UserSession:
         }.get(self.state, "—")
 
         return (
-            f"📊 *ESTADO DE TU SESIÓN*\n"
-            f"{emoji} Balance: `${self.balance:.0f}` ({sign}${diff:.0f})\n"
+            f"📡 Estado: {estado_txt}\n"
             f"🎯 Señal: `{min(self.scale, CYCLE_SIZE)}/{CYCLE_SIZE}`\n"
             f"📍 Col: `{self.col}/{MAX_COLS}` | Intento: `{self.attempt}/{MAX_ATTS}`\n"
             f"💵 Próxima apuesta: `${self.cur_bet:.2f}`\n"
-            f"📈 G/P: `{self.wins}/{self.losses}`\n"
-            f"📡 Estado: {state_txt}"
+            f"📈 G/P: `{self.wins}/{self.losses}`"
         )
 
 
-# ─── HELPERS DE TECLADO ───────────────────────────────────────────────────────
-def make_session_keyboard(user_id: int) -> types.InlineKeyboardMarkup:
-    kb = types.InlineKeyboardMarkup()
-    kb.row(
-        types.InlineKeyboardButton("🔄 Nueva Sesión", callback_data=f"new_session:{user_id}"),
-        types.InlineKeyboardButton("❌ Cerrar",       callback_data=f"close_session:{user_id}")
-    )
-    return kb
+# ─── INSTANCIA GLOBAL ─────────────────────────────────────────────────────────
+g_session: GlobalSession = GlobalSession()
+
+
+def reset_global_session():
+    """Reinicia la sesión global preservando el historial de fichas."""
+    global g_session
+    old_fichas = list(g_session.fichas)   # preservar historial completo
+    g_session  = GlobalSession(carry_fichas=old_fichas)
+    logger.info("🔄 Sesión global reiniciada — fichas preservadas")
 
 
 # ─── PROCESADOR DE MULTIPLICADORES ───────────────────────────────────────────
 async def process_multiplier(value: float, round_id: str):
     global g_signal_state, g_signal_type, g_signal_strictness, g_signal_trigger_mult
     global g_positions, g_ema4, g_ema8, g_ema20, g_mults, g_seen_ids
+    global g_trend_favorable, g_session
 
     logger.info(
         f"🎲 {value:.2f}x | ID: {round_id} | "
-        f"Señal: {g_signal_state}/{g_signal_type} (strictness={g_signal_strictness})"
+        f"Señal: {g_signal_state}/{g_signal_type} (S{g_signal_strictness})"
     )
 
-    # ── FASE 1: Procesar resultado principal ──────────────────────
+    # ── FASE 1: Procesar resultado principal ──────────────────────────────────
     if g_signal_state == 'evaluating':
         win = value >= WIN_TARGET
-        sessions_eval = [
-            s for s in g_sessions.values()
-            if s.state == UserSession.EVALUATING
-        ]
-
-        if sessions_eval:
-            any_so = False
-            for session in sessions_eval:
-                tipo, bet = session.on_result(win)
-                await _dispatch_result(session, value, tipo, bet, is_so=False)
-                if session.state == UserSession.WAITING_SO:
-                    any_so = True
-
-            g_signal_state = 'so' if any_so else 'idle'
-            if g_signal_state == 'so':
-                g_signal_type = None
-                # La severidad ya no aplica en SO
+        if g_session.state == GlobalSession.EVALUATING:
+            tipo, bet = g_session.on_result(win)
+            await _dispatch_result(value, tipo, bet, is_so=False)
+            # Después del dispatch (que puede hacer reset), actualizar signal state
+            g_signal_state = 'so' if g_session.state == GlobalSession.WAITING_SO else 'idle'
+            if g_signal_state != 'so':
+                g_signal_type       = None
+                g_signal_strictness = 0
         else:
-            g_signal_state = 'idle'
-            g_signal_type = None
+            g_signal_state      = 'idle'
+            g_signal_type       = None
             g_signal_strictness = 0
-            logger.info("⚠️ Señal evaluada sin sesiones activas → idle inmediato")
 
-    # ── FASE 2: Procesar resultado SO ─────────────────────────────
+    # ── FASE 2: Procesar resultado SO ─────────────────────────────────────────
     elif g_signal_state == 'so':
         win = value >= WIN_TARGET
-        sessions_so = [
-            s for s in g_sessions.values()
-            if s.state == UserSession.WAITING_SO
-        ]
-        g_signal_state = 'idle'
-        g_signal_type = None
+        g_signal_state      = 'idle'
+        g_signal_type       = None
         g_signal_strictness = 0
+        if g_session.state == GlobalSession.WAITING_SO:
+            tipo, bet = g_session.on_result(win)
+            await _dispatch_result(value, tipo, bet, is_so=True)
 
-        for session in sessions_so:
-            tipo, bet = session.on_result(win)
-            await _dispatch_result(session, value, tipo, bet, is_so=True)
-
-    # ── FASE 3: Actualizar datos ──────────────────────────────────
+    # ── FASE 3: Actualizar datos y EMAs ───────────────────────────────────────
     increment = 1 if value >= WIN_TARGET else -1
     prev = g_positions[-1] if g_positions else 0
     g_positions.append(prev + increment)
@@ -394,197 +416,173 @@ async def process_multiplier(value: float, round_id: str):
         for oid in oldest:
             g_seen_ids.discard(oid)
 
-    # ── FASE 4: Detectar nueva señal ─────────────────────────────
-    if g_signal_state == 'idle':
+    # ── FASE 4.5: Detectar cambio de tendencia → broadcast a todos ────────────
+    if g_all_chats:
+        stats_trend = get_quota_stats(200)
+        if stats_trend['total'] >= 10:
+            new_fav = stats_trend['favorable']
+            if new_fav != g_trend_favorable:
+                g_trend_favorable = new_fav
+                asyncio.create_task(broadcast_trend_change(new_fav))
+
+    # ── FASE 4: Detectar nueva señal ─────────────────────────────────────────
+    if g_signal_state == 'idle' and g_session.state == GlobalSession.IDLE:
         sig_result = check_moderate_signal()
         if sig_result:
             sig_type, strictness = sig_result
-            g_signal_state        = 'evaluating'
-            g_signal_type         = sig_type
-            g_signal_strictness   = strictness
-            g_signal_trigger_mult = value
-            logger.info(
-                f"🚀 SEÑAL {sig_type.upper()} "
-                f"S{strictness} | Trigger: {value:.2f}x"
-            )
+            # Restricción por columna: Col2 requiere S2+, Col3 requiere S3
+            if strictness >= g_session.col:
+                # Col > 1 → ficha en curso, continuar SIEMPRE sin importar tendencia
+                # Col == 1 → nueva ficha, solo si tendencia favorable
+                if g_session.col > 1:
+                    proceed = True
+                else:
+                    stats_now = get_quota_stats(200)
+                    proceed   = (stats_now['total'] == 0) or (stats_now['favorable'] is not False)
 
-            for session in list(g_sessions.values()):
-                if session.state != UserSession.IDLE:
-                    continue
+                if proceed:
+                    g_signal_state        = 'evaluating'
+                    g_signal_type         = sig_type
+                    g_signal_strictness   = strictness
+                    g_signal_trigger_mult = value
+                    g_session.signal_trigger_mult = value
+                    g_session.state = GlobalSession.EVALUATING
 
-                # Restricción progresiva por columna:
-                #   Col 1 → acepta S1, S2 o S3  (strictness >= 1)
-                #   Col 2 → acepta solo S2 o S3  (strictness >= 2)
-                #   Col 3 → acepta solo S3        (strictness >= 3)
-                if strictness < session.col:
-                    logger.info(
-                        f"⏭️ User {session.user_id}: "
-                        f"S{strictness} < Col {session.col} → señal omitida"
-                    )
-                    continue
+                    # Iniciar nueva ficha solo al arrancar desde columna 1
+                    if g_session.col == 1:
+                        g_session.start_ficha()
 
-                # Limpiar mensaje de intento1 residual por seguridad
-                if session.attempt1_msg_id:
-                    try:
-                        await bot.delete_message(
-                            session.chat_id, session.attempt1_msg_id
-                        )
-                    except Exception:
-                        pass
-                    session.attempt1_msg_id = None
-
-                session.signal_trigger_mult = value
-                session.state = UserSession.EVALUATING
-                await _send_signal(session, sig_type, value)
+                    logger.info(f"🚀 SEÑAL S{strictness} Col{g_session.col} | Trigger: {value:.2f}x")
+                    await _send_signal(value, strictness)
 
 
-async def _send_signal(session: UserSession, sig_type: str, trigger: float):
-    """Envía alerta de señal al usuario."""
-    # En el sistema moderado solo existe alert200 en la estrategia
-    s = g_signal_strictness  # 1 | 2 | 3
-    nivel = {1: "S1 — EMA Cruce", 2: "S2 — Patrón V", 3: "S3 — Doble ≥2.00"}.get(s, "💎 2.00x")
+# ─── MENSAJERÍA ───────────────────────────────────────────────────────────────
+async def _send_signal(trigger: float, strictness: int):
+    """Broadcast de señal a todos los chats registrados."""
+    nivel = {
+        1: "S1 — EMA Cruce",
+        2: "S2 — Patrón V",
+        3: "S3 — Doble ≥2.00",
+    }.get(strictness, "💎 2.00x")
 
     txt = (
         f"🚨 *¡SEÑAL DETECTADA! 💎 2.00x*\n"
         "━━━━━━━━━━━━━━━━━━━━━━━\n"
         f"🆔 Último Multiplicador — `{trigger:.2f}x`\n"
-        f"💵 *Apostar Ahora: `${session.cur_bet:.2f}`*\n"
-        f"🕹️ Señal `{session.scale}/{CYCLE_SIZE}` | "
-        f"Col `{session.col}/{MAX_COLS}` | "
-        f"Intento `{session.attempt}/{MAX_ATTS}`"
+        f"💵 *Apostar Ahora: `${g_session.cur_bet:.2f}`*\n"
+        f"🕹️ Señal `{g_session.scale}/{CYCLE_SIZE}` | "
+        f"Col `{g_session.col}/{MAX_COLS}` | "
+        f"Intento `{g_session.attempt}/{MAX_ATTS}`\n"
+        f"📊 Nivel: _{nivel}_"
     )
-    try:
-        await bot.send_message(session.chat_id, txt, parse_mode='Markdown')
-    except Exception as e:
-        logger.error(f"Error enviando señal a {session.user_id}: {e}")
+    await broadcast(txt, parse_mode='Markdown')
 
 
-async def _dispatch_result(
-    session: UserSession,
-    value: float,
-    tipo: str,
-    bet: float,
-    is_so: bool
-):
+async def _check_trend_after_cycle():
     """
-    Despacha el mensaje de resultado.
-    • is_so=True  → elimina el mensaje del intento 1 (ganado O perdido).
-    • tipo='so'   → guarda el message_id del intento 1 para eliminarlo luego.
+    Llamada justo después de cerrar un ciclo (win o loss).
+    Si la tendencia es favorable, no hace nada (el bot seguirá analizando).
+    Si es desfavorable, notifica a todos y el bot esperará a que mejore.
     """
-    # ── Eliminar mensaje de intento 1 cuando llega el resultado del SO ──
-    if is_so and session.attempt1_msg_id:
-        try:
-            await bot.delete_message(session.chat_id, session.attempt1_msg_id)
-        except Exception:
-            pass
-        session.attempt1_msg_id = None
+    stats = get_quota_stats(200)
+    if stats['total'] > 0 and not stats['favorable']:
+        hora  = argentina_time()
+        r1_flag = "✅" if stats['pct_100_199'] <= 52.0 else "❌"
+        r2_flag = "✅" if stats['pct_200_499'] >= 29.0 else "❌"
+        await broadcast(
+            f"🔴 *TENDENCIA DESFAVORABLE — {hora}*\n"
+            "━━━━━━━━━━━━━━━━━━━━━━━\n"
+            f"🔵 1.00-1.99x: `{stats['pct_100_199']:.1f}%` (límite ≤52%) {r1_flag}\n"
+            f"🟣 2.00-4.99x: `{stats['pct_200_499']:.1f}%` (mínimo ≥29%) {r2_flag}\n"
+            f"📊 Basado en los últimos `{stats['total']}` multiplicadores\n"
+            "━━━━━━━━━━━━━━━━━━━━━━━\n"
+            "⏳ _El bot esperará hasta que la tendencia mejore._\n"
+            "_Se notificará automáticamente cuando sea favorable._",
+            parse_mode='Markdown'
+        )
+        logger.info("⚠️ Post-ciclo: tendencia desfavorable — bot en espera")
+    else:
+        logger.info("✅ Post-ciclo: tendencia favorable — bot continúa analizando")
+
+
+async def _dispatch_result(value: float, tipo: str, bet: float, is_so: bool):
+    """Broadcast del resultado a todos los chats. Resetea sesión si el ciclo terminó."""
+    global g_session
 
     emoji_val = "🟢" if value >= WIN_TARGET else "🔴"
-    diff      = session.balance - session.capital
-    sign      = "+" if diff >= 0 else ""
+    so_prefix = "🔄 2ª Oportunidad — " if is_so else ""
 
-    # ── GANADA (intento 1 o 2ª oportunidad) ──────────────────────
+    # ── GANADA ────────────────────────────────────────────────────────────────
     if tipo in ('win', 'cycle_win'):
-        so_prefix = "🔄 2ª Oportunidad — " if is_so else ""
-
         if tipo == 'cycle_win':
             txt = (
                 f"✅ *GANADA* — {emoji_val} Resultado: `{value:.2f}x`\n"
                 "━━━━━━━━━━━━━━━━━━━━━━━\n"
-                f"{so_prefix}💵 Próxima Apuesta: `${session.base_bet:.2f}`\n"
-                f"💰 Balance Actual: `${session.balance:.0f}` ({sign}${abs(diff):.0f})\n"
+                f"{so_prefix}💵 Próxima Apuesta: `${BASE_BET:.2f}`\n"
                 "\n"
                 "🏆 *¡CICLO COMPLETO — 10 señales exitosas!*\n"
-                f"📈 Capital inicial: `${session.capital:.0f}`\n"
-                f"🏦 Balance final: `${session.balance:.0f}`\n"
-                f"📊 G/P: `{session.wins}/{session.losses}`\n\n"
-                "¿Deseas continuar o cerrar sesión?"
+                f"📊 G/P: `{g_session.wins}/{g_session.losses}`\n"
+                "🔄 _Sesión reiniciada automáticamente_"
             )
-            try:
-                await bot.send_message(
-                    session.chat_id, txt,
-                    parse_mode='Markdown',
-                    reply_markup=make_session_keyboard(session.user_id)
-                )
-            except Exception as e:
-                logger.error(f"Error cycle_win: {e}")
+            await broadcast(txt, parse_mode='Markdown')
+            reset_global_session()
+            await _check_trend_after_cycle()
             return
+
 
         txt = (
             f"✅ *GANADA* — {emoji_val} Resultado: `{value:.2f}x`\n"
             "━━━━━━━━━━━━━━━━━━━━━━━\n"
-            f"{so_prefix}💵 Próxima Apuesta: `${session.base_bet:.2f}`\n"
-            f"💰 Balance Actual: `${session.balance:.0f}` ({sign}${abs(diff):.0f})\n"
-            "\n"
-            f"⏳ _Esperando próxima señal... ({session.scale}/{CYCLE_SIZE})_"
+            f"{so_prefix}💵 Próxima Apuesta: `${BASE_BET:.2f}`\n"
+            f"⏳ _Esperando próxima señal... ({g_session.scale}/{CYCLE_SIZE})_"
         )
 
-    # ── PERDIDA INTENTO 1 → avisa SO ──────────────────────────────
+    # ── PERDIDA INTENTO 1 → Segunda Oportunidad ───────────────────────────────
     elif tipo == 'so':
-        # Guardar el valor del resultado para mostrarlo si el SO también falla
-        session.attempt1_result_value = value
+        g_session.attempt1_result_value = value
         txt = (
             f"❌ *Perdida* — {emoji_val} Resultado: `{value:.2f}x`\n"
             "━━━━━━━━━━━━━━━━━━━━━━━\n"
             "🔄 *¡SEGUNDA OPORTUNIDAD!*\n"
-            f"💵 Apuesta: `${session.cur_bet:.2f}`\n"
-            f"🕹️ Col `{session.col}/{MAX_COLS}` | Intento `2/{MAX_ATTS}`"
+            f"💵 Apuesta: `${g_session.cur_bet:.2f}`\n"
+            f"🕹️ Col `{g_session.col}/{MAX_COLS}` | Intento `2/{MAX_ATTS}`"
         )
-        try:
-            msg = await bot.send_message(
-                session.chat_id, txt, parse_mode='Markdown'
-            )
-            session.attempt1_msg_id = msg.message_id
-        except Exception as e:
-            logger.error(f"Error enviando SO a {session.user_id}: {e}")
+        await broadcast(txt, parse_mode='Markdown')
         return
 
-    # ── SO FALLIDA → avanza columna ───────────────────────────────
+    # ── SO FALLIDA → Avanzar columna ─────────────────────────────────────────
     elif tipo == 'new_col':
-        r1 = f"{session.attempt1_result_value:.2f}x" if session.attempt1_result_value else "—"
+        r1  = f"{g_session.attempt1_result_value:.2f}x" if g_session.attempt1_result_value else "—"
         txt = (
             f"🔴 *Resultados: `{r1}` — `{value:.2f}x`*\n"
             "━━━━━━━━━━━━━━━━━━━━━━━\n"
-            f"📍 Avanzando a Columna `{session.col}/{MAX_COLS}`\n"
-            f"💵 Nueva apuesta: `${session.cur_bet:.2f}`\n"
-            f"💰 Balance Actual: `${session.balance:.0f}`\n"
-            "\n"
+            f"📍 Avanzando a Columna `{g_session.col}/{MAX_COLS}`\n"
+            f"💵 Nueva apuesta: `${g_session.cur_bet:.2f}`\n"
             "⏳ _Esperando próxima señal..._"
         )
 
-    # ── CICLO PERDIDO (3 columnas fallidas) ───────────────────────
+    # ── CICLO PERDIDO (3 columnas fallidas) ───────────────────────────────────
     elif tipo == 'cycle_loss':
-        r1 = f"{session.attempt1_result_value:.2f}x" if session.attempt1_result_value else "—"
+        r1  = f"{g_session.attempt1_result_value:.2f}x" if g_session.attempt1_result_value else "—"
         txt = (
             f"🔴 *Resultados: `{r1}` — `{value:.2f}x`*\n"
             "━━━━━━━━━━━━━━━━━━━━━━━\n"
             "⚠️ *CICLO TERMINADO — 3 Columnas Fallidas*\n"
-            f"💰 Capital inicial: `${session.capital:.0f}`\n"
-            f"📉 Balance final: `${session.balance:.0f}`\n"
-            f"🔴 Pérdida total: `${abs(diff):.0f}`\n"
-            f"📊 G/P: `{session.wins}/{session.losses}`\n\n"
-            "¿Deseas iniciar una nueva sesión?"
+            f"📊 G/P: `{g_session.wins}/{g_session.losses}`\n"
+            "🔄 _Sesión reiniciada automáticamente_"
         )
-        try:
-            await bot.send_message(
-                session.chat_id, txt,
-                parse_mode='Markdown',
-                reply_markup=make_session_keyboard(session.user_id)
-            )
-        except Exception as e:
-            logger.error(f"Error cycle_loss: {e}")
+        await broadcast(txt, parse_mode='Markdown')
+        reset_global_session()
+        await _check_trend_after_cycle()
         return
 
     else:
         txt = f"Resultado inesperado: {tipo}"
 
-    try:
-        await bot.send_message(session.chat_id, txt, parse_mode='Markdown')
-    except Exception as e:
-        logger.error(f"Error enviando resultado a {session.user_id}: {e}")
+    await broadcast(txt, parse_mode='Markdown')
 
 
-# ─── RECOLECTOR WEBSOCKET ────────────────────────────────────────────────────
+# ─── RECOLECTOR WEBSOCKET ─────────────────────────────────────────────────────
 async def ws_collector():
     last_value = None
 
@@ -648,7 +646,7 @@ async def ws_collector():
         await asyncio.sleep(5)
 
 
-# ─── KEEP-ALIVE ───────────────────────────────────────────────────────────────
+# ─── KEEP-ALIVE FLASK ─────────────────────────────────────────────────────────
 flask_app = Flask(__name__)
 
 @flask_app.route('/')
@@ -656,8 +654,9 @@ def home():
     return (
         f"🤖 SpacemanBot ACTIVO | "
         f"Datos: {len(g_mults)}/400 | "
-        f"Sesiones: {len(g_sessions)} | "
-        f"Señal: {g_signal_state}/{g_signal_type}"
+        f"Sesión: {g_session.state} | "
+        f"Señal: {g_signal_state} | "
+        f"Chats: {len(g_all_chats)}"
     ), 200
 
 @flask_app.route('/ping')
@@ -665,16 +664,22 @@ def ping():
     return "pong", 200
 
 @flask_app.route('/stats')
-def stats():
+def stats_route():
     last5 = [f"{m['value']:.2f}x" for m in g_mults[-5:]] if g_mults else []
     return {
-        "status": "ok",
-        "mults_collected": len(g_mults),
-        "signal_state": g_signal_state,
-        "signal_type": g_signal_type,
-        "trigger_mult": g_signal_trigger_mult,
-        "active_sessions": len(g_sessions),
-        "last_5": last5
+        "status":           "ok",
+        "mults_collected":  len(g_mults),
+        "signal_state":     g_signal_state,
+        "signal_type":      g_signal_type,
+        "trigger_mult":     g_signal_trigger_mult,
+        "session_state":    g_session.state,
+        "session_col":      g_session.col,
+        "wins":             g_session.wins,
+        "losses":           g_session.losses,
+        "fichas_total":     len(g_session.fichas),
+        "registered_chats": len(g_all_chats),
+        "trend_favorable":  g_trend_favorable,
+        "last_5":           last5,
     }
 
 def run_flask():
@@ -696,409 +701,125 @@ async def self_ping_loop():
         try:
             async with aiohttp.ClientSession(
                 connector=aiohttp.TCPConnector()
-            ) as session:
-                async with session.get(
-                    url, timeout=aiohttp.ClientTimeout(total=10)
-                ) as r:
+            ) as s:
+                async with s.get(url, timeout=aiohttp.ClientTimeout(total=10)) as r:
                     logger.info(f"Self-ping OK: {r.status}")
         except Exception as e:
             logger.warning(f"Self-ping falló: {e}")
 
 
-# ─── HANDLERS DE TELEGRAM ────────────────────────────────────────────────────
+# ─── HANDLERS DE TELEGRAM ─────────────────────────────────────────────────────
 
-@bot.message_handler(commands=['start', 'nueva'])
+@bot.message_handler(commands=['start'])
 async def cmd_start(message):
-    uid  = message.from_user.id
+    """
+    Registra el chat para recibir señales y broadcasts.
+    Muestra estado actual de la tendencia.
+    """
     name = message.from_user.first_name or "usuario"
+    g_all_chats.add(message.chat.id)
 
-    user_states.pop(uid, None)
-    user_temp.pop(uid, None)
-
-    if uid in g_sessions and g_sessions[uid].state != UserSession.DONE:
-        s = g_sessions[uid]
-        if message.text.startswith('/nueva'):
-            del g_sessions[uid]
-        else:
-            await bot.reply_to(
-                message,
-                f"✅ ¡Hola {name}! Ya tienes una sesión activa:\n\n"
-                f"{s.status_md()}\n\n"
-                "Usa /status para ver detalles\n"
-                "Usa /nueva para reiniciar\n"
-                "Usa /cerrar para terminar",
-                parse_mode='Markdown'
-            )
-            return
-
+    stats     = get_quota_stats(200)
+    stats_blk = quota_stats_text(stats)
     data_info = (
         f"📡 `{len(g_mults)}/400` multiplicadores recopilados"
         if g_mults else
         "📡 Recopilando datos en tiempo real..."
     )
 
-    # ── Analisis de cuotas sobre los ultimos 200 multiplicadores ──
-    stats     = get_quota_stats(200)
-    stats_blk = quota_stats_text(stats)
-
-    # ── Bloquear inicio de NUEVA sesion si tendencia es desfavorable ──
-    if stats['total'] > 0 and not stats['favorable']:
-        n_label   = "200" if stats['has_enough'] else str(stats['total']) + " (acumulando...)"
-        r1_flag   = " ✅" if stats['pct_100_199'] <= 52.0 else " ❌"
-        r2_flag   = " ✅" if stats['pct_200_499'] >= 29.0 else " ❌"
-        unf_stats = (
-            f"📈 Análisis de la Tendencia últimos\n"
-            f"      {n_label} multiplicadores\n"
-            f"🔵 Cuotas (1.00-1.99x): {stats['count_100_199']} — {stats['pct_100_199']:.2f}%{r1_flag}\n"
-            f"🟣 Cuotas (2.00-4.99x): {stats['count_200_499']} — {stats['pct_200_499']:.2f}%{r2_flag}\n"
-            f"🟡 Cuotas (5.00-9.99x): {stats['count_500_999']} — {stats['pct_500_999']:.2f}%\n"
-            f"🔴 Cuotas (+10.00x):    {stats['count_1000_plus']} — {stats['pct_1000_plus']:.2f}%\n"
-            "\n"
-            "❌ TENDENCIA DESFAVORABLE\n"
-            "      No se recomienda operar"
-        )
-        data_info_plain = (
-            f"📡 {len(g_mults)}/400 multiplicadores recopilados"
-            if g_mults else
-            "📡 Recopilando datos en tiempo real..."
-        )
-        await bot.reply_to(
-            message,
-            f"🚀 *Bienvenido {name}!*\n\n"
-            "━━━━━━━━━━━━━━━━━━━━━━━\n"
-            "🤖 Bot de Señales Spaceman\n"
-            "📊 Sistema Moderado | Objetivo: 2.00x\n"
-            "🔄 Gestión: 3 Columnas × 2 Intentos\n"
-            "📈 Señales más estrictas en columnas 2 y 3\n"
-            "🏆 Ciclo: 10 señales exitosas\n"
-            "━━━━━━━━━━━━━━━━━━━━━━━\n"
-            f"{data_info_plain}\n\n"
-            "━━━━━━━━━━━━━━━━━━━━━━━\n"
-            f"{unf_stats}\n"
-            "━━━━━━━━━━━━━━━━━━━━━━━\n"
-            "⚪ Espera una hora para volver a\n"
-            "consulta la tendencia del juego.\n"
-            "━━━━━━━━━━━━━━━━━━━━━━━\n"
-            "❇️ Presionar /start para volver a\n"
-            "consultar la tendencia del juego",
-            parse_mode='Markdown'
-        )
-        return  # No pedir capital — sesion bloqueada por tendencia desfavorable
-
     await bot.reply_to(
         message,
-        f"🚀 *Bienvenido {name}!*\n\n"
+        f"🚀 *¡Bienvenido {name}!*\n\n"
         "━━━━━━━━━━━━━━━━━━━━━━━\n"
         "🤖 *Bot de Señales Spaceman*\n"
         "📊 Sistema Moderado | Objetivo: `2.00x`\n"
         "🔄 Gestión: 3 Columnas × 2 Intentos\n"
-        "📈 Señales más estrictas en columnas 2 y 3\n"
+        f"💵 Apuesta base fija: `${BASE_BET:.2f}`\n"
         "🏆 Ciclo: 10 señales exitosas\n"
         "━━━━━━━━━━━━━━━━━━━━━━━\n"
         f"{data_info}\n\n"
         "━━━━━━━━━━━━━━━━━━━━━━━\n"
         f"{stats_blk}"
         "━━━━━━━━━━━━━━━━━━━━━━━\n"
-        "💰 *¿Cuál es tu capital inicial?*\n"
-        "_Ejemplo: 100_",
-        parse_mode='Markdown'
-    )
-    user_states[uid] = ASK_CAPITAL
-
-
-@bot.message_handler(commands=['status'])
-async def cmd_status(message):
-    uid = message.from_user.id
-    if uid not in g_sessions:
-        await bot.reply_to(
-            message,
-            "❌ No tienes una sesión activa.\nUsa /start para comenzar."
-        )
-        return
-
-    s = g_sessions[uid]
-    sig_txt = {
-        'idle':       "✅ En espera de señal",
-        'evaluating': f"⚡ Evaluando ({g_signal_type or '?'}) | Trigger: `{g_signal_trigger_mult:.2f}x`",
-        'so':         "🔄 Evaluando 2ª Oportunidad",
-    }.get(g_signal_state, "—")
-
-    last_mult = f"`{g_mults[-1]['value']:.2f}x`" if g_mults else "—"
-
-    await bot.reply_to(
-        message,
-        f"{s.status_md()}\n"
-        "━━━━━━━━━━━━━━━━━━━━━━━\n"
-        f"📡 *WebSocket:* Activo\n"
-        f"🎲 *Último multi:* {last_mult}\n"
-        f"📊 *Datos:* `{len(g_mults)}/400`\n"
-        f"🔭 *Señal global:* {sig_txt}",
+        "✅ *¡Registrado!*\n"
+        "_Recibirás señales automáticamente_\n"
+        "_cuando la tendencia sea favorable._",
         parse_mode='Markdown'
     )
 
 
-@bot.message_handler(commands=['datos'])
-async def cmd_datos(message):
-    if not g_mults:
-        await bot.reply_to(
-            message, "📡 Sin datos aún. Conectando al WebSocket..."
-        )
-        return
+@bot.message_handler(commands=['estadisticas'])
+async def cmd_estadisticas(message):
+    """
+    Muestra estadísticas reales de la sesión global:
+    estado actual + historial de fichas con C1+C2+C3 por ficha.
+    """
+    g_all_chats.add(message.chat.id)
 
-    last  = g_mults[-30:]
-    above = sum(1 for m in g_mults if m['value'] >= WIN_TARGET)
-    below = len(g_mults) - above
-    pct   = (above / len(g_mults) * 100) if g_mults else 0
+    s      = g_session
+    stats  = get_quota_stats(200)
+    trend  = quota_stats_text(stats)
 
-    lines = [
-        f"{'🟢' if m['value'] >= WIN_TARGET else '🔴'} `{m['value']:.2f}x`"
-        for m in reversed(last)
-    ]
+    # ── Historial de fichas (últimas 15) ──────────────────────────────────────
+    fichas_recientes = s.fichas[-15:]
+    if fichas_recientes:
+        lineas = []
+        for f in fichas_recientes:
+            c1    = f['c1']
+            c2    = f['c2']
+            c3    = f['c3']
+            total = c1 + c2 + c3
+            net   = BASE_BET if f['result'] == 'win' else -total
+            res   = "✅" if f['result'] == 'win' else "❌"
+            hora  = f.get('ts', '--:--')
 
-    txt = (
-        "📊 *Últimos 30 multiplicadores:*\n\n"
-        + "\n".join(lines)
-        + f"\n\n*Estadísticas ({len(g_mults)} totales):*\n"
-        + f"🟢 ≥2.00x: `{above}` ({pct:.1f}%)\n"
-        + f"🔴 <2.00x: `{below}` ({100-pct:.1f}%)"
-    )
-    await bot.reply_to(message, txt, parse_mode='Markdown')
+            # Solo mostrar columnas con gasto real
+            partes = [f"C1:${c1:.2f}"]
+            if c2 > 0:
+                partes.append(f"C2:${c2:.2f}")
+            if c3 > 0:
+                partes.append(f"C3:${c3:.2f}")
+            cols_txt = " ".join(partes)
 
+            net_txt = f"+${net:.2f}" if net >= 0 else f"-${abs(net):.2f}"
+            lineas.append(f"{res} #{f['n']} {hora} | {cols_txt} | {net_txt}")
 
-@bot.message_handler(commands=['cerrar', 'cancel'])
-async def cmd_cerrar(message):
-    uid = message.from_user.id
-    user_states.pop(uid, None)
-    user_temp.pop(uid, None)
-
-    if uid in g_sessions:
-        s    = g_sessions[uid]
-        diff = s.balance - s.capital
-        sign = "+" if diff >= 0 else ""
-        del g_sessions[uid]
-        await bot.reply_to(
-            message,
-            f"✅ *Sesión cerrada.*\n\n"
-            f"💰 Balance final: `${s.balance:.0f}` ({sign}${diff:.0f})\n"
-            f"📊 G/P: `{s.wins}/{s.losses}` | Entradas: `{s.entries}`\n\n"
-            "Usa /start para comenzar una nueva sesión.",
-            parse_mode='Markdown'
-        )
+        fichas_txt = "\n".join(lineas)
+        total_fichas = len(s.fichas)
+        wins_f  = sum(1 for f in s.fichas if f['result'] == 'win')
+        loss_f  = sum(1 for f in s.fichas if f['result'] == 'loss')
+        resumen = f"Total fichas: `{total_fichas}` | ✅ `{wins_f}` | ❌ `{loss_f}`"
     else:
-        await bot.reply_to(message, "ℹ️ No hay sesión activa.")
+        fichas_txt = "_Sin fichas registradas aún._"
+        resumen    = "Total fichas: `0`"
 
-
-@bot.message_handler(commands=['ayuda'])
-async def cmd_ayuda(message):
     await bot.reply_to(
         message,
-        "🤖 *COMANDOS DEL BOT*\n"
+        "📊 *ESTADÍSTICAS DEL BOT*\n"
         "━━━━━━━━━━━━━━━━━━━━━━━\n"
-        "/start — Iniciar nueva sesión\n"
-        "/status — Ver estado de tu sesión\n"
-        "/datos — Últimos multiplicadores\n"
-        "/nueva — Reiniciar sesión\n"
-        "/cerrar — Terminar sesión\n"
-        "/ayuda — Esta ayuda\n"
+        f"{s.status_short()}\n"
         "━━━━━━━━━━━━━━━━━━━━━━━\n"
-        "*Cómo funciona:*\n"
-        "1. Analiza Spaceman en tiempo real\n"
-        "2. Señal con mult disparador visible\n"
-        "3. Col 1: señales moderadas + estrictas\n"
-        "4. Col 2-3: SOLO estrictas (≥2.00x) tras pérdida\n"
-        "5. Intento 1 perdido → SO automática\n"
-        "6. Resultado SO → mensaje intento 1 eliminado\n"
-        "7. Balance real actualizado en cada pérdida\n"
-        "8. Apuesta recomendada: 1% del capital\n",
+        f"*Últimas fichas (C1 + C2 + C3):*\n"
+        f"{fichas_txt}\n"
+        "━━━━━━━━━━━━━━━━━━━━━━━\n"
+        f"{resumen}\n"
+        "━━━━━━━━━━━━━━━━━━━━━━━\n"
+        f"{trend}",
         parse_mode='Markdown'
     )
 
 
-@bot.message_handler(
-    func=lambda m: m.content_type == 'text' and not m.text.startswith('/')
-)
-async def handle_text(message):
-    uid   = message.from_user.id
-    state = user_states.get(uid)
-    if state == ASK_CAPITAL:
-        await _receive_capital(message)
-    elif state == ASK_BET:
-        await _receive_bet(message)
-
-
-async def _receive_capital(message):
-    uid = message.from_user.id
-    txt = message.text.strip().replace(',', '.')
-    try:
-        capital = float(txt)
-    except ValueError:
-        await bot.reply_to(
-            message,
-            "⚠️ Ingresa un número válido.\n_Ejemplo: 100_",
-            parse_mode='Markdown'
-        )
-        return
-
-    if capital < 10:
-        await bot.reply_to(message, "⚠️ El capital mínimo es $10.")
-        return
-
-    user_temp[uid] = {'capital': capital}
-    user_states[uid] = ASK_BET
-    rec = capital * 0.01  # 1% recomendado
-
-    await bot.reply_to(
-        message,
-        f"✅ Capital: `${capital:.0f}`\n\n"
-        "🎯 *¿Cuál es tu apuesta base?*\n"
-        f"💡 Recomendado: `${rec:.2f}` (1% del capital)\n"
-        "_Esta es la apuesta mínima por señal._",
-        parse_mode='Markdown'
-    )
-
-
-async def _receive_bet(message):
-    uid = message.from_user.id
-    txt = message.text.strip().replace(',', '.')
-    try:
-        bet = float(txt)
-    except ValueError:
-        await bot.reply_to(
-            message,
-            "⚠️ Ingresa un número válido.\n_Ejemplo: 1_",
-            parse_mode='Markdown'
-        )
-        return
-
-    capital = user_temp.get(uid, {}).get('capital', 100)
-
-    if bet < 0.5:
-        await bot.reply_to(message, "⚠️ La apuesta mínima es $0.50.")
-        return
-
-    if bet > capital * 0.25:
-        limite = capital * 0.25
-        await bot.reply_to(
-            message,
-            f"⚠️ Máximo 25% del capital (`${limite:.2f}`).\n"
-            "_Ingresa un valor menor para gestión segura._",
-            parse_mode='Markdown'
-        )
-        return
-
-    chat = message.chat.id
-    user_states.pop(uid, None)
-    user_temp.pop(uid, None)
-
-    # ── Verificar cuotas ANTES de crear la sesion (solo bloquea al inicio) ──
-    stats = get_quota_stats(200)
-    if stats['total'] > 0 and not stats['favorable']:
-        r1_ok = stats['pct_100_199'] <= 52.0
-        r2_ok = stats['pct_200_499'] >= 29.0
-        r1_line = (
-            f"🔴 1.00-1.99x: `{stats['pct_100_199']:.1f}%` (limite <=52%) {'✅' if r1_ok else '❌'}\n"
-        )
-        r2_line = (
-            f"🟡 2.00-4.99x: `{stats['pct_200_499']:.1f}%` (minimo >=29%) {'✅' if r2_ok else '❌'}\n"
-        )
-        await bot.reply_to(
-            message,
-            "⛔ *Condiciones DESFAVORABLES — Sesion NO iniciada*\n"
-            "━━━━━━━━━━━━━━━━━━━━━━━\n"
-            + r1_line + r2_line +
-            f"📊 Basado en los ultimos `{stats['total']}` multiplicadores\n"
-            "━━━━━━━━━━━━━━━━━━━━━━━\n"
-            "⏳ _Espera que las cuotas sean favorables._\n"
-            "Usa /start para verificar nuevamente cuando mejoren.",
-            parse_mode='Markdown'
-        )
-        return
-
-    session = UserSession(uid, chat, capital, bet)
-    g_sessions[uid] = session
-
-    c1_apuesta = bet
-    c2_apuesta = bet * 2          # referencia ilustrativa
-    data_count = len(g_mults)
-
-    stats     = get_quota_stats(200)
-    stats_blk = quota_stats_text(stats)
-
-    await bot.reply_to(
-        message,
-        "✅ *¡Sesión iniciada!*\n"
-        "━━━━━━━━━━━━━━━━━━━━━━━\n"
-        f"💰 Capital: `${capital:.0f}`\n"
-        f"🎯 Apuesta base: `${bet:.2f}`\n"
-        "━━━━━━━━━━━━━━━━━━━━━━━\n"
-        "*Gestión Moderada:*\n"
-        f"  📍 C1 — Apuesta: `${c1_apuesta:.2f}`\n"
-        f"  📍 C2 — Apuesta: `${c2_apuesta:.2f}`\n"
-        "  📍 C3 — Recuperación máxima\n"
-        "━━━━━━━━━━━━━━━━━━━━━━━\n"
-        f"{stats_blk}"
-        "━━━━━━━━━━━━━━━━━━━━━━━\n"
-        "📌 *Comandos útiles:*\n"
-        "/status — Ver estado\n"
-        "/datos — Últimos multiplicadores\n"
-        "/nueva — Nueva sesión\n"
-        "/cerrar — Terminar sesión",
-        parse_mode='Markdown'
-    )
-
-
-@bot.callback_query_handler(func=lambda call: True)
-async def callback_handler(call):
-    await bot.answer_callback_query(call.id)
-
-    parts  = call.data.split(':')
-    action = parts[0]
-    uid    = int(parts[1]) if len(parts) > 1 else call.from_user.id
-
-    if action == "new_session":
-        if uid in g_sessions:
-            old     = g_sessions[uid]
-            session = UserSession(uid, old.chat_id, old.capital, old.base_bet)
-            g_sessions[uid] = session
-            try:
-                await bot.edit_message_text(
-                    "🔄 *Nueva sesión iniciada*\n\n"
-                    f"💰 Capital: `${old.capital:.0f}`\n"
-                    f"🎯 Apuesta base: `${old.base_bet:.2f}`\n\n"
-                    "⚡ _Esperando próxima señal..._",
-                    call.message.chat.id,
-                    call.message.message_id,
-                    parse_mode='Markdown'
-                )
-            except Exception:
-                pass
-        else:
-            try:
-                await bot.edit_message_text(
-                    "ℹ️ Sesión no encontrada. Usa /start para comenzar.",
-                    call.message.chat.id,
-                    call.message.message_id,
-                    parse_mode='Markdown'
-                )
-            except Exception:
-                pass
-
-    elif action == "close_session":
-        if uid in g_sessions:
-            del g_sessions[uid]
-        try:
-            await bot.edit_message_text(
-                "✅ Sesión cerrada. Usa /start cuando quieras volver.",
-                call.message.chat.id,
-                call.message.message_id
-            )
-        except Exception:
-            pass
-
-
-# ─── MAIN ─────────────────────────────────────────────────────────────────────
+# ─── MAIN ──────────────────────────────────────────────────────────────────────
 async def main_async():
-    logger.info("🤖 Iniciando SpacemanBot con pyTelegramBotAPI...")
+    logger.info("🤖 Iniciando SpacemanBot (Sesión Global / Apuesta $0.10)...")
+
+    # Configurar botones de menú en Telegram (bandeja qwerty, junto a emojis)
+    await bot.set_my_commands([
+        types.BotCommand('start',        '🚀 Iniciar / Ver tendencia'),
+        types.BotCommand('estadisticas', '📊 Ver estadísticas'),
+    ])
+    logger.info("✅ Comandos de Telegram configurados: /start y /estadisticas")
+
     asyncio.create_task(ws_collector())
     asyncio.create_task(self_ping_loop())
     logger.info("✅ Tareas de fondo iniciadas. Iniciando polling...")
