@@ -14,7 +14,7 @@ import os
 import time
 from datetime import datetime, timedelta
 from typing import Optional, Tuple
-from flask import Flask
+from flask import Flask, request
 import websockets
 from telebot.async_telebot import AsyncTeleBot
 from telebot import types
@@ -93,6 +93,9 @@ g_last_signal_msgs: dict = {}  # chat_id → message_id
 _persist_counter: int = 0
 
 bot = AsyncTeleBot(BOT_TOKEN)
+
+# Referencia al loop principal de asyncio (necesaria para el webhook)
+_main_loop: asyncio.AbstractEventLoop = None
 
 
 # ─── HORA ARGENTINA ───────────────────────────────────────────────────────────
@@ -811,6 +814,25 @@ def home():
 def ping():
     return "pong", 200
 
+@flask_app.route('/webhook', methods=['POST'])
+def webhook():
+    """
+    Recibe los updates de Telegram vía webhook.
+    Usa run_coroutine_threadsafe para pasar el update al loop asyncio principal.
+    """
+    if _main_loop is None:
+        return "Loop no iniciado", 503
+    try:
+        update = types.Update.de_json(request.get_json())
+        asyncio.run_coroutine_threadsafe(
+            bot.process_new_updates([update]),
+            _main_loop
+        )
+        return '', 200
+    except Exception as e:
+        logger.error(f"Error procesando webhook: {e}")
+        return "Error interno", 500
+
 @flask_app.route('/stats')
 def stats_route():
     last5 = [f"{m['value']:.2f}x" for m in g_mults[-5:]] if g_mults else []
@@ -998,6 +1020,9 @@ async def cmd_tendencia(message):
 
 # ─── MAIN ──────────────────────────────────────────────────────────────────────
 async def main_async():
+    global _main_loop
+    _main_loop = asyncio.get_running_loop()
+
     logger.info("🤖 Iniciando SpacemanBot (Sesión Global / Apuesta $0.10)...")
 
     # Cargar historial de multiplicadores desde disco (sobrevive reinicios)
@@ -1011,8 +1036,39 @@ async def main_async():
 
     asyncio.create_task(ws_collector())
     asyncio.create_task(self_ping_loop())
-    logger.info("✅ Tareas de fondo iniciadas. Iniciando polling...")
-    await bot.infinity_polling(skip_pending=True)
+    logger.info("✅ Tareas de fondo iniciadas.")
+
+    render_url = os.environ.get('RENDER_EXTERNAL_URL', '').rstrip('/')
+
+    if render_url:
+        # ── Modo Webhook (Render) ─────────────────────────────────────────────
+        # Eliminar cualquier webhook o polling previo antes de registrar el nuevo.
+        # Esto evita el error 409 causado por múltiples instancias compitiendo.
+        await bot.remove_webhook()
+        await asyncio.sleep(1)   # Pequeña pausa para que Telegram libere la sesión
+
+        webhook_url = f"{render_url}/webhook"
+        await bot.set_webhook(url=webhook_url)
+        logger.info(f"✅ Webhook configurado: {webhook_url}")
+        logger.info("🔔 Bot esperando updates via webhook...")
+
+        # Mantener el loop corriendo indefinidamente;
+        # los updates llegan por Flask → /webhook → process_new_updates
+        try:
+            while True:
+                await asyncio.sleep(3600)
+        finally:
+            logger.info("🛑 Cerrando bot — eliminando webhook y sesión...")
+            await bot.remove_webhook()
+            await bot.close_session()
+    else:
+        # ── Modo Polling (desarrollo local, sin RENDER_EXTERNAL_URL) ─────────
+        logger.warning("⚠️ RENDER_EXTERNAL_URL no configurada — usando polling (solo para desarrollo local)")
+        try:
+            await bot.infinity_polling(skip_pending=True)
+        finally:
+            logger.info("🛑 Cerrando sesión de polling...")
+            await bot.close_session()   # Evita "Unclosed client session"
 
 
 if __name__ == '__main__':
