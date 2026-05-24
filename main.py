@@ -62,6 +62,9 @@ THRESH_MID_MIN = 28.0  # % mínimo requerido para cuotas 2.00-4.99x
 MAX_MULTS  = 400
 TRIM_MULTS = 200
 
+# Archivo de persistencia del historial de multiplicadores (sobrevive reinicios)
+PERSIST_FILE = "spaceman_history.json"
+
 # ─── ESTADO GLOBAL ────────────────────────────────────────────────────────────
 g_mults:    list  = []
 g_seen_ids: set   = set()
@@ -85,6 +88,9 @@ g_daily_date:  str = ""        # "YYYY-MM-DD" en hora Argentina
 
 # ─── IDs DE MENSAJES DE SEÑAL (para borrar intento 1 si hay intento 2) ───────
 g_last_signal_msgs: dict = {}  # chat_id → message_id
+
+# Contador interno para guardar en disco cada N multiplicadores
+_persist_counter: int = 0
 
 bot = AsyncTeleBot(BOT_TOKEN)
 
@@ -144,11 +150,74 @@ def calc_ema(data: list, period: int) -> list:
     return ema
 
 
+# ─── PERSISTENCIA EN DISCO ────────────────────────────────────────────────────
+def save_mults_to_disk():
+    """
+    Guarda el historial de multiplicadores y posiciones en disco.
+    Llamado cada 10 nuevos multiplicadores para no perder datos en reinicios.
+    """
+    try:
+        payload = {
+            'mults':     [{'id': m['id'], 'value': m['value'], 'ts': m['ts']}
+                          for m in g_mults],
+            'positions': g_positions,
+        }
+        tmp = PERSIST_FILE + ".tmp"
+        with open(tmp, 'w') as f:
+            json.dump(payload, f)
+        os.replace(tmp, PERSIST_FILE)   # Escritura atómica: evita archivo corrupto
+        logger.debug(f"💾 Historial guardado: {len(g_mults)} multiplicadores")
+    except Exception as e:
+        logger.warning(f"No se pudo guardar historial en disco: {e}")
+
+
+def load_mults_from_disk():
+    """
+    Carga el historial desde disco al arrancar.
+    Restaura g_mults, g_positions, g_ema* y g_seen_ids.
+    """
+    global g_mults, g_positions, g_ema4, g_ema8, g_ema20
+    if not os.path.exists(PERSIST_FILE):
+        logger.info("📂 Sin historial previo en disco — comenzando desde cero")
+        return
+    try:
+        with open(PERSIST_FILE) as f:
+            data = json.load(f)
+
+        loaded_mults = data.get('mults', [])
+        loaded_pos   = data.get('positions', [])
+
+        # Sanidad: recortar si excede el límite
+        if len(loaded_mults) > MAX_MULTS:
+            loaded_mults = loaded_mults[-TRIM_MULTS:]
+            loaded_pos   = loaded_pos[-TRIM_MULTS:]
+
+        g_mults[:]     = loaded_mults
+        g_positions[:] = loaded_pos
+
+        # Recalcular EMAs con los datos cargados
+        g_ema4[:]  = calc_ema(g_positions, 4)
+        g_ema8[:]  = calc_ema(g_positions, 8)
+        g_ema20[:] = calc_ema(g_positions, 20)
+
+        # Restaurar IDs vistos para evitar duplicados tras reconexión WS
+        for m in g_mults:
+            g_seen_ids.add(str(m['id']))
+
+        logger.info(
+            f"✅ Historial cargado desde disco: "
+            f"{len(g_mults)} multiplicadores | "
+            f"IDs restaurados: {len(g_seen_ids)}"
+        )
+    except Exception as e:
+        logger.warning(f"Error cargando historial desde disco: {e} — comenzando desde cero")
+
+
 # ─── ESTADÍSTICAS DE CUOTAS ───────────────────────────────────────────────────
 def get_quota_stats(n: int = 200) -> dict:
     """
     Calcula estadísticas de cuotas para los últimos n multiplicadores.
-    Desfavorable: 1.00-1.99x > 52% O 2.00-4.99x < 29%.
+    Desfavorable si: 1.00-1.99x > THRESH_LOW_MAX  O  2.00-4.99x < THRESH_MID_MIN.
     """
     data  = g_mults[-n:] if len(g_mults) >= n else g_mults[:]
     total = len(data)
@@ -474,6 +543,7 @@ async def process_multiplier(value: float, round_id: str):
             await _dispatch_result(value, tipo, bet, is_so=True, attempt_num=attempt_num)
 
     # ── FASE 3: Actualizar datos y EMAs ───────────────────────────────────────
+    global _persist_counter
     increment = 1 if value >= WIN_TARGET else -1
     prev = g_positions[-1] if g_positions else 0
     g_positions.append(prev + increment)
@@ -483,6 +553,12 @@ async def process_multiplier(value: float, round_id: str):
         g_mults[:]     = g_mults[-TRIM_MULTS:]
         g_positions[:] = g_positions[-TRIM_MULTS:]
         logger.info(f"✂️ Datos recortados a {TRIM_MULTS} registros")
+        save_mults_to_disk()   # Guardar siempre que se recorta
+    else:
+        _persist_counter += 1
+        if _persist_counter >= 10:
+            _persist_counter = 0
+            save_mults_to_disk()   # Guardar cada 10 multiplicadores nuevos
 
     g_ema4  = calc_ema(g_positions, 4)
     g_ema8  = calc_ema(g_positions, 8)
@@ -493,14 +569,13 @@ async def process_multiplier(value: float, round_id: str):
         for oid in oldest:
             g_seen_ids.discard(oid)
 
-    # ── FASE 4.5: Detectar cambio de tendencia → broadcast a todos ────────────
-    if g_all_chats:
-        stats_trend = get_quota_stats(200)
-        if stats_trend['total'] >= 10:
-            new_fav = stats_trend['favorable']
-            if new_fav != g_trend_favorable:
-                g_trend_favorable = new_fav
-                asyncio.create_task(broadcast_trend_change(new_fav))
+    # ── FASE 4.5: Detectar cambio de tendencia (solo log, sin broadcast) ──────
+    stats_trend = get_quota_stats(200)
+    if stats_trend['total'] >= 10:
+        new_fav = stats_trend['favorable']
+        if new_fav != g_trend_favorable:
+            g_trend_favorable = new_fav
+            asyncio.create_task(broadcast_trend_change(new_fav))
 
     # ── FASE 4: Detectar nueva señal ─────────────────────────────────────────
     if g_signal_state == 'idle' and g_session.state == GlobalSession.IDLE:
@@ -924,6 +999,9 @@ async def cmd_tendencia(message):
 # ─── MAIN ──────────────────────────────────────────────────────────────────────
 async def main_async():
     logger.info("🤖 Iniciando SpacemanBot (Sesión Global / Apuesta $0.10)...")
+
+    # Cargar historial de multiplicadores desde disco (sobrevive reinicios)
+    load_mults_from_disk()
 
     # Configurar botones de menú en Telegram (bandeja qwerty, junto a emojis)
     await bot.set_my_commands([
