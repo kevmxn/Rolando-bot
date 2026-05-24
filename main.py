@@ -28,20 +28,39 @@ logging.basicConfig(
 logger = logging.getLogger(__name__)
 
 # ─── CONFIG ───────────────────────────────────────────────────────────────────
-BOT_TOKEN  = os.environ.get("BOT_TOKEN", "8889373350:AAFU7R1ENyANVR-DiZbBMbeyAHZOi9DLlXY")
-WS_URL     = "wss://dga.pragmaticplaylive.net/ws"
-CASINO_ID  = "ppcdk00000005349"
-CURRENCY   = "BRL"
-GAME_ID    = 1301
+# ┌─────────────────────────────────────────────────────────────────────────────┐
+# │  VARIABLES CONFIGURABLES — Modificar según necesidad                        │
+# └─────────────────────────────────────────────────────────────────────────────┘
 
+BOT_TOKEN  = os.environ.get("BOT_TOKEN", "8889373350:AAFU7R1ENyANVR-DiZbBMbeyAHZOi9DLlXY")
+
+# ID del canal de Telegram donde se publican señales, resultados y marcador diario
+CHANNEL_ID = -1003815888467
+
+WS_URL    = "wss://dga.pragmaticplaylive.net/ws"
+CASINO_ID = "ppcdk00000005349"
+CURRENCY  = "BRL"
+GAME_ID   = 1301
+
+# ── Objetivos de apuesta ──────────────────────────────────────────────────────
+WIN_TARGET    = 2.00   # Multiplicador objetivo de la señal
+SEGURO_TARGET = 1.50   # Multiplicador de stop seguro
+
+# ── Gestión de sesión ─────────────────────────────────────────────────────────
+MAX_COLS   = 3         # Columnas máximas antes de ciclo perdido
+MAX_ATTS   = 2         # Intentos por columna (intento 1 + seguro)
+CYCLE_SIZE = 10        # Señales exitosas para completar un ciclo
+BASE_BET   = 0.10      # Apuesta base fija (USD)
+
+# ── Umbrales de tendencia (detección favorable/desfavorable) ──────────────────
+# Desfavorable si: cuotas 1.00-1.99x superan THRESH_LOW_MAX
+#              O si: cuotas 2.00-4.99x caen por debajo de THRESH_MID_MIN
+THRESH_LOW_MAX = 54.0  # % máximo permitido para cuotas 1.00-1.99x
+THRESH_MID_MIN = 28.0  # % mínimo requerido para cuotas 2.00-4.99x
+
+# ── Parámetros internos ───────────────────────────────────────────────────────
 MAX_MULTS  = 400
 TRIM_MULTS = 200
-WIN_TARGET = 2.00
-
-MAX_COLS   = 3
-MAX_ATTS   = 2
-CYCLE_SIZE = 10
-BASE_BET   = 0.10   # Apuesta base fija (USD)
 
 # ─── ESTADO GLOBAL ────────────────────────────────────────────────────────────
 g_mults:    list  = []
@@ -59,6 +78,14 @@ g_signal_trigger_mult: float = 0.0
 g_all_chats: set              = set()   # Todos los chats que alguna vez enviaron /start
 g_trend_favorable: Optional[bool] = None
 
+# ─── MARCADOR DIARIO ──────────────────────────────────────────────────────────
+g_daily_wins:  int = 0
+g_daily_losses: int = 0
+g_daily_date:  str = ""        # "YYYY-MM-DD" en hora Argentina
+
+# ─── IDs DE MENSAJES DE SEÑAL (para borrar intento 1 si hay intento 2) ───────
+g_last_signal_msgs: dict = {}  # chat_id → message_id
+
 bot = AsyncTeleBot(BOT_TOKEN)
 
 
@@ -68,28 +95,42 @@ def argentina_time() -> str:
     return now_arg.strftime("%H:%M")
 
 
-# ─── BROADCAST ────────────────────────────────────────────────────────────────
+# ─── BROADCAST AL CANAL ───────────────────────────────────────────────────────
 async def broadcast(msg: str, parse_mode: str = None):
-    """Envía un mensaje a todos los chats registrados. Elimina chats inactivos."""
-    dead = set()
-    for chat_id in list(g_all_chats):
-        try:
-            await bot.send_message(chat_id, msg, parse_mode=parse_mode)
-        except Exception as e:
-            err = str(e).lower()
-            if any(x in err for x in ('blocked', 'not found', 'deactivated', 'kicked')):
-                dead.add(chat_id)
-                logger.warning(f"Chat {chat_id} inactivo → removido")
-            else:
-                logger.warning(f"Broadcast error → {chat_id}: {e}")
-    g_all_chats.difference_update(dead)
+    """Publica un mensaje en el canal de Telegram configurado."""
+    try:
+        await bot.send_message(CHANNEL_ID, msg, parse_mode=parse_mode)
+    except Exception as e:
+        logger.warning(f"Error enviando al canal {CHANNEL_ID}: {e}")
 
 
 async def broadcast_trend_change(favorable: bool):
-    hora = argentina_time()
-    msg  = f"🟢 TENDENCIA FAVORABLE  {hora}" if favorable else f"🔴 TENDENCIA DESFAVORABLE  {hora}"
-    logger.info(f"📢 Broadcast tendencia: {msg} → {len(g_all_chats)} chats")
-    await broadcast(msg)
+    # Ya no se emiten mensajes automáticos de tendencia al canal
+    logger.info(f"Tendencia cambió → {'FAVORABLE' if favorable else 'DESFAVORABLE'} (sin broadcast)")
+
+
+async def broadcast_signal(msg: str):
+    """Envía señal al canal y guarda el message_id para borrado posterior."""
+    global g_last_signal_msgs
+    g_last_signal_msgs = {}
+    try:
+        sent = await bot.send_message(CHANNEL_ID, msg, parse_mode='Markdown')
+        g_last_signal_msgs[CHANNEL_ID] = sent.message_id
+        logger.info(f"✅ Señal enviada al canal — msg_id: {sent.message_id}")
+    except Exception as e:
+        logger.warning(f"Error enviando señal al canal {CHANNEL_ID}: {e}")
+
+
+async def delete_last_signal():
+    """Borra el mensaje de señal del intento 1 en el canal."""
+    msg_id = g_last_signal_msgs.get(CHANNEL_ID)
+    if msg_id:
+        try:
+            await bot.delete_message(CHANNEL_ID, msg_id)
+            logger.info(f"🗑️ Señal intento 1 borrada del canal (msg_id: {msg_id})")
+        except Exception as e:
+            logger.warning(f"No se pudo borrar señal del canal: {e}")
+    g_last_signal_msgs.clear()
 
 
 # ─── MOTOR DE EMAs ────────────────────────────────────────────────────────────
@@ -130,7 +171,7 @@ def get_quota_stats(n: int = 200) -> dict:
     pct3 = r3 / total * 100
     pct4 = r4 / total * 100
 
-    unfavorable = pct1 > 52.0 or pct2 < 29.0
+    unfavorable = pct1 > THRESH_LOW_MAX or pct2 < THRESH_MID_MIN
 
     return {
         'total':           total,
@@ -153,8 +194,8 @@ def quota_stats_text(stats: dict) -> str:
         return "📡 _Sin datos suficientes para analizar cuotas._\n"
 
     n_label = "200" if stats['has_enough'] else str(stats['total']) + " (acumulando...)"
-    r1_flag = " ✅" if stats['pct_100_199'] <= 52.0 else " ❌"
-    r2_flag = " ✅" if stats['pct_200_499'] >= 29.0 else " ❌"
+    r1_flag = " ✅" if stats['pct_100_199'] <= THRESH_LOW_MAX else " ❌"
+    r2_flag = " ✅" if stats['pct_200_499'] >= THRESH_MID_MIN else " ❌"
     fav_line = (
         "✅ *¡TENDENCIA FAVORABLE!*\n      _Se recomienda operar_"
         if stats['favorable'] else
@@ -330,6 +371,24 @@ class GlobalSession:
                 self.state = self.WAITING_SO
                 return ('so', prev_bet)
 
+    def on_seguro_win(self) -> tuple:
+        """
+        Ganamos con seguro (>= 1.50x, < 2.00x).
+        Se mantiene el nivel de columna; solo se resetea el intento.
+        Retorna ('win_seguro', cur_bet).
+        """
+        prev_bet = self.cur_bet
+        prev_col = self.col
+        # Acumular gasto en la columna activa
+        if self._cur_ficha is not None:
+            col_key = f'c{prev_col}'
+            self._cur_ficha[col_key] = self._cur_ficha.get(col_key, 0.0) + prev_bet
+        # Resetear intento pero mantener columna (y lost/cur_bet sin cambios)
+        self.attempt = 1
+        self.state   = self.IDLE
+        # La ficha queda abierta — se cerrará con el próximo win a 2x o loss
+        return ('win_seguro', prev_bet)
+
     def status_short(self) -> str:
         estado_txt = {
             self.IDLE:       "⏳ Esperando señal",
@@ -370,15 +429,28 @@ async def process_multiplier(value: float, round_id: str):
         f"Señal: {g_signal_state}/{g_signal_type} (S{g_signal_strictness})"
     )
 
+    # ── RESET DIARIO ──────────────────────────────────────────────────────────
+    _check_daily_reset()
+
     # ── FASE 1: Procesar resultado principal ──────────────────────────────────
     if g_signal_state == 'evaluating':
-        win = value >= WIN_TARGET
         if g_session.state == GlobalSession.EVALUATING:
-            tipo, bet = g_session.on_result(win)
-            await _dispatch_result(value, tipo, bet, is_so=False)
-            # Después del dispatch (que puede hacer reset), actualizar signal state
-            g_signal_state = 'so' if g_session.state == GlobalSession.WAITING_SO else 'idle'
-            if g_signal_state != 'so':
+            attempt_num = g_session.attempt   # 1 = GALE #0
+            if value >= WIN_TARGET:
+                tipo, bet = g_session.on_result(True)
+            elif value >= SEGURO_TARGET:
+                tipo, bet = g_session.on_seguro_win()
+            else:
+                tipo, bet = g_session.on_result(False)
+
+            await _dispatch_result(value, tipo, bet, is_so=False, attempt_num=attempt_num)
+
+            # Si tipo=='so': _dispatch_result borró señal y regresa; aquí enviamos señal #2
+            if tipo == 'so':
+                g_signal_state = 'so'
+                await _send_signal(g_signal_trigger_mult, g_signal_strictness, attempt=2)
+            else:
+                g_signal_state      = 'idle'
                 g_signal_type       = None
                 g_signal_strictness = 0
         else:
@@ -388,13 +460,18 @@ async def process_multiplier(value: float, round_id: str):
 
     # ── FASE 2: Procesar resultado SO ─────────────────────────────────────────
     elif g_signal_state == 'so':
-        win = value >= WIN_TARGET
         g_signal_state      = 'idle'
         g_signal_type       = None
         g_signal_strictness = 0
         if g_session.state == GlobalSession.WAITING_SO:
-            tipo, bet = g_session.on_result(win)
-            await _dispatch_result(value, tipo, bet, is_so=True)
+            attempt_num = g_session.attempt   # 2 = GALE #1
+            if value >= WIN_TARGET:
+                tipo, bet = g_session.on_result(True)
+            elif value >= SEGURO_TARGET:
+                tipo, bet = g_session.on_seguro_win()
+            else:
+                tipo, bet = g_session.on_result(False)
+            await _dispatch_result(value, tipo, bet, is_so=True, attempt_num=attempt_num)
 
     # ── FASE 3: Actualizar datos y EMAs ───────────────────────────────────────
     increment = 1 if value >= WIN_TARGET else -1
@@ -456,130 +533,126 @@ async def process_multiplier(value: float, round_id: str):
                     await _send_signal(value, strictness)
 
 
-# ─── MENSAJERÍA ───────────────────────────────────────────────────────────────
-async def _send_signal(trigger: float, strictness: int):
-    """Broadcast de señal a todos los chats registrados."""
-    nivel = {
-        1: "S1 — EMA Cruce",
-        2: "S2 — Patrón V",
-        3: "S3 — Doble ≥2.00",
-    }.get(strictness, "💎 2.00x")
+# ─── MARCADOR DIARIO ──────────────────────────────────────────────────────────
+def _check_daily_reset():
+    """Resetea el marcador diario a las 00:00 hora Argentina."""
+    global g_daily_wins, g_daily_losses, g_daily_date
+    now_arg  = datetime.utcnow() - timedelta(hours=3)
+    today    = now_arg.strftime("%Y-%m-%d")
+    if today != g_daily_date:
+        g_daily_wins   = 0
+        g_daily_losses = 0
+        g_daily_date   = today
+        logger.info(f"📅 Marcador diario reseteado para {today}")
 
-    txt = (
-        f"🚨 *¡SEÑAL DETECTADA! 💎 2.00x*\n"
-        "━━━━━━━━━━━━━━━━━━━━━━━\n"
-        f"🆔 Último Multiplicador — `{trigger:.2f}x`\n"
-        f"💵 *Apostar Ahora: `${g_session.cur_bet:.2f}`*\n"
-        f"🕹️ Señal `{g_session.scale}/{CYCLE_SIZE}` | "
-        f"Col `{g_session.col}/{MAX_COLS}` | "
-        f"Intento `{g_session.attempt}/{MAX_ATTS}`\n"
-        f"📊 Nivel: _{nivel}_"
+
+async def _broadcast_scoreboard():
+    """Envía el marcador diario a todos los chats."""
+    total = g_daily_wins + g_daily_losses
+    pct   = (g_daily_wins / total * 100) if total > 0 else 0.0
+    txt   = (
+        f"📊 *MARCADOR DIARIO:*\n"
+        f"✅ GANADAS: `{g_daily_wins}`\n"
+        f"❌ PERDIDAS: `{g_daily_losses}`\n"
+        f"📈 ACIERTOS = `{pct:.2f}%`"
     )
     await broadcast(txt, parse_mode='Markdown')
 
 
+# ─── MENSAJERÍA ───────────────────────────────────────────────────────────────
+async def _send_signal(trigger: float, strictness: int, attempt: int = 1):
+    """Broadcast de señal a todos los chats registrados."""
+    txt = (
+        f"🚨 Entrar después de: `{trigger:.2f}x`\n"
+        f"💎 Señal para `2.00x`\n"
+        f"⚪ Seguro en `1.50x`\n"
+        f"🆔 Intento `{attempt}/2`"
+    )
+    if attempt == 1:
+        await broadcast_signal(txt)   # Guarda IDs para borrado posterior
+    else:
+        await broadcast(txt, parse_mode='Markdown')
+
+
 async def _check_trend_after_cycle():
-    """
-    Llamada justo después de cerrar un ciclo (win o loss).
-    Si la tendencia es favorable, no hace nada (el bot seguirá analizando).
-    Si es desfavorable, notifica a todos y el bot esperará a que mejore.
-    """
+    """Verifica la tendencia post-ciclo (sin broadcast automático)."""
     stats = get_quota_stats(200)
     if stats['total'] > 0 and not stats['favorable']:
-        hora  = argentina_time()
-        r1_flag = "✅" if stats['pct_100_199'] <= 52.0 else "❌"
-        r2_flag = "✅" if stats['pct_200_499'] >= 29.0 else "❌"
-        await broadcast(
-            f"🔴 *TENDENCIA DESFAVORABLE — {hora}*\n"
-            "━━━━━━━━━━━━━━━━━━━━━━━\n"
-            f"🔵 1.00-1.99x: `{stats['pct_100_199']:.1f}%` (límite ≤52%) {r1_flag}\n"
-            f"🟣 2.00-4.99x: `{stats['pct_200_499']:.1f}%` (mínimo ≥29%) {r2_flag}\n"
-            f"📊 Basado en los últimos `{stats['total']}` multiplicadores\n"
-            "━━━━━━━━━━━━━━━━━━━━━━━\n"
-            "⏳ _El bot esperará hasta que la tendencia mejore._\n"
-            "_Se notificará automáticamente cuando sea favorable._",
-            parse_mode='Markdown'
-        )
         logger.info("⚠️ Post-ciclo: tendencia desfavorable — bot en espera")
     else:
         logger.info("✅ Post-ciclo: tendencia favorable — bot continúa analizando")
 
 
-async def _dispatch_result(value: float, tipo: str, bet: float, is_so: bool):
-    """Broadcast del resultado a todos los chats. Resetea sesión si el ciclo terminó."""
-    global g_session
+async def _dispatch_result(value: float, tipo: str, bet: float,
+                           is_so: bool, attempt_num: int):
+    """
+    Broadcast del resultado a todos los chats.
+    attempt_num: 1 = GALE #0, 2 = GALE #1
+    """
+    global g_session, g_daily_wins, g_daily_losses
 
-    emoji_val = "🟢" if value >= WIN_TARGET else "🔴"
-    so_prefix = "🔄 2ª Oportunidad — " if is_so else ""
+    gale_tag   = f"#{ attempt_num - 1 }"  # #0 o #1
+    r1_stored  = getattr(g_session, 'attempt1_result_value', 0.0)
 
-    # ── GANADA ────────────────────────────────────────────────────────────────
-    if tipo in ('win', 'cycle_win'):
-        if tipo == 'cycle_win':
-            txt = (
-                f"✅ *GANADA* — {emoji_val} Resultado: `{value:.2f}x`\n"
-                "━━━━━━━━━━━━━━━━━━━━━━━\n"
-                f"{so_prefix}💵 Próxima Apuesta: `${BASE_BET:.2f}`\n"
-                "\n"
-                "🏆 *¡CICLO COMPLETO — 10 señales exitosas!*\n"
-                f"📊 G/P: `{g_session.wins}/{g_session.losses}`\n"
-                "🔄 _Sesión reiniciada automáticamente_"
-            )
-            await broadcast(txt, parse_mode='Markdown')
-            reset_global_session()
-            await _check_trend_after_cycle()
-            return
-
-
-        txt = (
-            f"✅ *GANADA* — {emoji_val} Resultado: `{value:.2f}x`\n"
-            "━━━━━━━━━━━━━━━━━━━━━━━\n"
-            f"{so_prefix}💵 Próxima Apuesta: `${BASE_BET:.2f}`\n"
-            f"⏳ _Esperando próxima señal... ({g_session.scale}/{CYCLE_SIZE})_"
-        )
-
-    # ── PERDIDA INTENTO 1 → Segunda Oportunidad ───────────────────────────────
-    elif tipo == 'so':
+    # ── PERDIDA INTENTO 1 → borrar señal y enviar intento 2 ──────────────────
+    if tipo == 'so':
         g_session.attempt1_result_value = value
-        txt = (
-            f"❌ *Perdida* — {emoji_val} Resultado: `{value:.2f}x`\n"
-            "━━━━━━━━━━━━━━━━━━━━━━━\n"
-            "🔄 *¡SEGUNDA OPORTUNIDAD!*\n"
-            f"💵 Apuesta: `${g_session.cur_bet:.2f}`\n"
-            f"🕹️ Col `{g_session.col}/{MAX_COLS}` | Intento `2/{MAX_ATTS}`"
-        )
-        await broadcast(txt, parse_mode='Markdown')
+        await delete_last_signal()
+        # El intento 2 se envía desde process_multiplier justo después
         return
 
-    # ── SO FALLIDA → Avanzar columna ─────────────────────────────────────────
-    elif tipo == 'new_col':
-        r1  = f"{g_session.attempt1_result_value:.2f}x" if g_session.attempt1_result_value else "—"
-        txt = (
-            f"🔴 *Resultados: `{r1}` — `{value:.2f}x`*\n"
-            "━━━━━━━━━━━━━━━━━━━━━━━\n"
-            f"📍 Avanzando a Columna `{g_session.col}/{MAX_COLS}`\n"
-            f"💵 Nueva apuesta: `${g_session.cur_bet:.2f}`\n"
-            "⏳ _Esperando próxima señal..._"
-        )
+    # ── WIN GALE ──────────────────────────────────────────────────────────────
+    if tipo in ('win', 'cycle_win'):
+        g_daily_wins += 1
+        txt = f"✅ WIN GALE {gale_tag} — `{value:.2f}x`"
+        await broadcast(txt, parse_mode='Markdown')
+        await _broadcast_scoreboard()
+        if tipo == 'cycle_win':
+            await broadcast(
+                "🏆 *¡CICLO COMPLETO — 10 señales exitosas!*\n"
+                "🔄 _Sesión reiniciada automáticamente_",
+                parse_mode='Markdown'
+            )
+            reset_global_session()
+            await _check_trend_after_cycle()
+        return
 
-    # ── CICLO PERDIDO (3 columnas fallidas) ───────────────────────────────────
-    elif tipo == 'cycle_loss':
-        r1  = f"{g_session.attempt1_result_value:.2f}x" if g_session.attempt1_result_value else "—"
+    # ── WIN SEGURO ────────────────────────────────────────────────────────────
+    if tipo == 'win_seguro':
+        g_daily_wins += 1
+        txt = f"✅ WIN SEGURO {gale_tag} — `{value:.2f}x`"
+        await broadcast(txt, parse_mode='Markdown')
+        await _broadcast_scoreboard()
+        return
+
+    # ── LOSS: avanzar columna ────────────────────────────────────────────────
+    if tipo == 'new_col':
+        g_daily_losses += 1
+        r1 = f"{r1_stored:.2f}x" if r1_stored else "—"
         txt = (
-            f"🔴 *Resultados: `{r1}` — `{value:.2f}x`*\n"
-            "━━━━━━━━━━━━━━━━━━━━━━━\n"
+            f"❌ LOSS SEÑAL — `{r1}` y `{value:.2f}x`\n"
+            f"📍 _Avanzando a Columna `{g_session.col}/{MAX_COLS}`..._"
+        )
+        await broadcast(txt, parse_mode='Markdown')
+        await _broadcast_scoreboard()
+        return
+
+    # ── LOSS: ciclo completo perdido ─────────────────────────────────────────
+    if tipo == 'cycle_loss':
+        g_daily_losses += 1
+        r1 = f"{r1_stored:.2f}x" if r1_stored else "—"
+        txt = (
+            f"❌ LOSS SEÑAL — `{r1}` y `{value:.2f}x`\n"
             "⚠️ *CICLO TERMINADO — 3 Columnas Fallidas*\n"
-            f"📊 G/P: `{g_session.wins}/{g_session.losses}`\n"
             "🔄 _Sesión reiniciada automáticamente_"
         )
         await broadcast(txt, parse_mode='Markdown')
+        await _broadcast_scoreboard()
         reset_global_session()
         await _check_trend_after_cycle()
         return
 
-    else:
-        txt = f"Resultado inesperado: {tipo}"
-
-    await broadcast(txt, parse_mode='Markdown')
+    logger.warning(f"Resultado inesperado: tipo={tipo}")
 
 
 # ─── RECOLECTOR WEBSOCKET ─────────────────────────────────────────────────────
@@ -809,16 +882,54 @@ async def cmd_estadisticas(message):
     )
 
 
+@bot.message_handler(commands=['tendencia'])
+async def cmd_tendencia(message):
+    """Muestra la tendencia actual con el nuevo formato completo."""
+    g_all_chats.add(message.chat.id)
+    hora  = argentina_time()
+    stats = get_quota_stats(200)
+
+    if stats['total'] == 0:
+        await bot.reply_to(message,
+            "📡 _Sin datos suficientes para analizar la tendencia._",
+            parse_mode='Markdown')
+        return
+
+    n_label = "200" if stats['has_enough'] else str(stats['total'])
+    r1_flag = "✅" if stats['pct_100_199'] <= THRESH_LOW_MAX else "❌"
+    r2_flag = "✅" if stats['pct_200_499'] >= THRESH_MID_MIN else "❌"
+
+    if stats['favorable']:
+        header   = f"🟢 TENDENCIA FAVORABLE — {hora}"
+        footer   = "✅ ¡TENDENCIA FAVORABLE!\n      Se recomienda operar"
+    else:
+        header   = f"🔴 TENDENCIA DESFAVORABLE — {hora}"
+        footer   = "⚠️ TENDENCIA DESFAVORABLE\n      Se recomienda esperar"
+
+    txt = (
+        f"*{header}*\n"
+        "━━━━━━━━━━━━━━━━━━━━━━━\n"
+        f"📈 Análisis de la Tendencia últimos\n"
+        f"      {n_label} multiplicadores\n"
+        f"🔵 Cuotas (1.00-1.99x): `{stats['count_100_199']}` — {stats['pct_100_199']:.2f}%{r1_flag}\n"
+        f"🟣 Cuotas (2.00-4.99x): `{stats['count_200_499']}` — {stats['pct_200_499']:.2f}%{r2_flag}\n"
+        f"🟡 Cuotas (5.00-9.99x): `{stats['count_500_999']}` — {stats['pct_500_999']:.2f}%\n"
+        f"🔴 Cuotas (+10.00x):    `{stats['count_1000_plus']}` — {stats['pct_1000_plus']:.2f}%\n"
+        " \n"
+        f"*{footer}*"
+    )
+    await bot.reply_to(message, txt, parse_mode='Markdown')
+
+
 # ─── MAIN ──────────────────────────────────────────────────────────────────────
 async def main_async():
     logger.info("🤖 Iniciando SpacemanBot (Sesión Global / Apuesta $0.10)...")
 
     # Configurar botones de menú en Telegram (bandeja qwerty, junto a emojis)
     await bot.set_my_commands([
-        types.BotCommand('start',        '🚀 Iniciar / Ver tendencia'),
-        types.BotCommand('estadisticas', '📊 Ver estadísticas'),
+        types.BotCommand('tendencia', '📈 Ver tendencia actual'),
     ])
-    logger.info("✅ Comandos de Telegram configurados: /start y /estadisticas")
+    logger.info("✅ Comandos de Telegram configurados: /tendencia")
 
     asyncio.create_task(ws_collector())
     asyncio.create_task(self_ping_loop())
