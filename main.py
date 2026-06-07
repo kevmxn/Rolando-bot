@@ -695,18 +695,29 @@ async def _broadcast_scoreboard():
     total_cyc = g_daily_cycles_won + g_daily_cycles_lost
     pct_cyc   = (g_daily_cycles_won / total_cyc * 100) if total_cyc > 0 else 0.0
 
-    hora = argentina_time()
-    txt  = (
-        f"📊 *MARCADOR DIARIO* — {hora}\n"
-        f"━━━━━━━━━━━━━━━━━━━━━━━\n"
-        f"✅ GANADAS:  `{g_daily_wins}`\n"
-        f"❌ PERDIDAS: `{g_daily_losses}`\n"
-        f"📈 ACIERTOS: `{pct_sig:.1f}%`\n"
-        f"━━━━━━━━━━━━━━━━━━━━━━━\n"
-        f"🔄 *CICLOS DEL DÍA* — Necesitan 4 victorias en 12 entradas\n"
-        f"🏆 Exitosos: `{g_daily_cycles_won}`\n"
-        f"💥 Fallidos: `{g_daily_cycles_lost}`\n"
-        f"📊 Efectividad: `{pct_cyc:.1f}%`"
+    hora  = argentina_time()
+
+    # Barras visuales
+    sig_bar = '🟢' * g_daily_wins + '🔴' * g_daily_losses
+    sig_bar = sig_bar[:20] + ('…' if (g_daily_wins + g_daily_losses) > 20 else '')
+
+    cyc_bar = '🏆' * g_daily_cycles_won + '💥' * g_daily_cycles_lost
+
+    txt = (
+        f"📊 *MARCADOR DEL DÍA*\n"
+        f"┄┄┄┄┄┄┄┄┄┄┄┄┄┄┄┄┄┄┄┄┄┄┄\n"
+        f"✅ Ganadas:   `{g_daily_wins}`\n"
+        f"❌ Perdidas:  `{g_daily_losses}`\n"
+        f"📈 Acierto:   `{pct_sig:.1f}%`\n"
+        f"{sig_bar}\n"
+        f"┄┄┄┄┄┄┄┄┄┄┄┄┄┄┄┄┄┄┄┄┄┄┄\n"
+        f"🔄 *Ciclos*  `{MAX_COLS}` entradas · `{WINS_PER_CYCLE}` victorias\n"
+        f"🏆 Ganados:  `{g_daily_cycles_won}`\n"
+        f"💥 Perdidos: `{g_daily_cycles_lost}`\n"
+        f"📊 Efectivo: `{pct_cyc:.1f}%`\n"
+        f"{cyc_bar}\n"
+        f"┄┄┄┄┄┄┄┄┄┄┄┄┄┄┄┄┄┄┄┄┄┄┄\n"
+        f"🕐 {hora}"
     )
 
     # Borrar marcador anterior si existe
@@ -729,20 +740,34 @@ async def _broadcast_scoreboard():
 
 # ─── MENSAJERÍA ───────────────────────────────────────────────────────────────
 async def _send_signal(trigger: float, signal_name: str, strictness: int):
-    """Broadcast de señal al canal con nombre y probabilidad del sistema HTML."""
+    """Broadcast de señal al canal."""
     prob_map = {'EMA3↑EMA4': 78, 'Doble Piso': 72, 'Wabe ↑': 62}
-    prob = prob_map.get(signal_name, 60)
+    prob  = prob_map.get(signal_name, 60)
+    hora  = argentina_time()
+    wins  = g_session.wins_in_cycle
+    ents  = g_session.entries_in_cycle
+    col   = g_session.col
+
+    # Barra de progreso del ciclo (victorias)
+    wins_bar  = '🟢' * wins  + '⚪' * (WINS_PER_CYCLE - wins)
+    # Barra de entradas usadas
+    ents_bar  = '🔵' * ents  + '⚫' * (MAX_COLS - ents)
+
     txt = (
-        f"🎯 *SEÑAL 2x DETECTADA*\n"
-        f"━━━━━━━━━━━━━━━━━━━━━━━\n"
-        f"📊 Tipo: `{signal_name}` — {prob}%\n"
-        f"🚨 Entrar después de: `{trigger:.2f}x`\n"
-        f"💎 Objetivo: `2.00x`\n"
-        f"📍 S{strictness} | Col `{g_session.col}/{MAX_COLS}` | "
-        f"Ciclo `{g_session.wins_in_cycle}/{WINS_PER_CYCLE}` victorias | "
-        f"`{g_session.entries_in_cycle}/{MAX_COLS}` entradas"
+        f"🚀 *ENTRADA SPACEMAN*\n"
+        f"┄┄┄┄┄┄┄┄┄┄┄┄┄┄┄┄┄┄┄┄┄┄┄\n"
+        f"🎰 *{signal_name}*  `{prob}%` de acierto\n"
+        f"⏱ Después de:  `{trigger:.2f}x`\n"
+        f"🎯 Objetivo:    `2.00x`\n"
+        f"┄┄┄┄┄┄┄┄┄┄┄┄┄┄┄┄┄┄┄┄┄┄┄\n"
+        f"📦 Col `{col}`  |  Entradas `{ents}/{MAX_COLS}`\n"
+        f"{ents_bar}\n"
+        f"🏆 Ciclo `{wins}/{WINS_PER_CYCLE}` victorias\n"
+        f"{wins_bar}\n"
+        f"┄┄┄┄┄┄┄┄┄┄┄┄┄┄┄┄┄┄┄┄┄┄┄\n"
+        f"🕐 {hora}"
     )
-    await broadcast_signal(txt)   # Guarda ID para borrado al resolverse
+    await broadcast_signal(txt)
 
 
 async def _check_trend_after_cycle():
@@ -755,65 +780,84 @@ async def _check_trend_after_cycle():
 
 
 async def _dispatch_result(value: float, tipo: str, bet: float, attempt_num: int):
-    """
-    Broadcast del resultado al canal.
-    Borra el mensaje de señal antes de publicar el resultado.
-    Sistema de 12 entradas por ciclo, 4 victorias = ciclo ganado.
-    """
+    """Broadcast del resultado al canal. La señal NO se borra."""
     global g_session, g_daily_wins, g_daily_losses, g_daily_cycles_won, g_daily_cycles_lost
 
-    # Borrar el mensaje de señal (ya fue resuelta)
-    await delete_last_signal()
+    hora = argentina_time()
 
-    # ── WIN (victoria parcial dentro del ciclo) ───────────────────────────────
+    # ── WIN parcial ───────────────────────────────────────────────────────────
     if tipo == 'win':
         g_daily_wins += 1
+        wins = g_session.wins_in_cycle
+        ents = g_session.entries_in_cycle
+        wins_bar = '🟢' * wins + '⚪' * (WINS_PER_CYCLE - wins)
         txt = (
-            f"✅ *WIN* — `{value:.2f}x`\n"
-            f"🎯 Ciclo: `{g_session.wins_in_cycle}/{WINS_PER_CYCLE}` victorias | "
-            f"`{g_session.entries_in_cycle}/{MAX_COLS}` entradas"
+            f"✅ *WIN*  `{value:.2f}x`\n"
+            f"┄┄┄┄┄┄┄┄┄┄┄┄┄┄┄┄┄┄┄┄┄┄┄\n"
+            f"🏆 Ciclo  {wins_bar}  `{wins}/{WINS_PER_CYCLE}`\n"
+            f"📦 Entradas usadas: `{ents}/{MAX_COLS}`\n"
+            f"🕐 {hora}"
         )
         await broadcast(txt, parse_mode='Markdown')
         await _broadcast_scoreboard()
         return
 
-    # ── CYCLE WIN (4 victorias completadas) ───────────────────────────────────
+    # ── CYCLE WIN ─────────────────────────────────────────────────────────────
     if tipo == 'cycle_win':
         g_daily_wins       += 1
         g_daily_cycles_won += 1
-        txt = f"✅ *WIN* — `{value:.2f}x`"
+        total_cyc = g_daily_cycles_won + g_daily_cycles_lost
+        pct_cyc   = (g_daily_cycles_won / total_cyc * 100) if total_cyc > 0 else 0.0
+        txt = (
+            f"✅ *WIN*  `{value:.2f}x`\n"
+            f"┄┄┄┄┄┄┄┄┄┄┄┄┄┄┄┄┄┄┄┄┄┄┄\n"
+            f"🏆 *¡CICLO COMPLETADO!*\n"
+            f"{'🟢' * WINS_PER_CYCLE}  `{WINS_PER_CYCLE}/{WINS_PER_CYCLE}` victorias\n"
+            f"📊 Ciclos ganados hoy: `{g_daily_cycles_won}` — `{pct_cyc:.0f}%`\n"
+            f"🔄 _Nueva sesión iniciada_\n"
+            f"🕐 {hora}"
+        )
         await broadcast(txt, parse_mode='Markdown')
         await _broadcast_scoreboard()
-        await broadcast(
-            f"🏆 *¡CICLO GANADO — {WINS_PER_CYCLE} victorias en {MAX_COLS} entradas!*\n"
-            "🔄 _Sesión reiniciada automáticamente_",
-            parse_mode='Markdown'
-        )
         reset_global_session()
         await _check_trend_after_cycle()
         return
 
-    # ── LOSS: avanzar columna (ciclo continúa) ────────────────────────────────
+    # ── LOSS: ciclo continúa ──────────────────────────────────────────────────
     if tipo == 'new_col':
         g_daily_losses += 1
+        wins = g_session.wins_in_cycle
+        ents = g_session.entries_in_cycle
+        col  = g_session.col
+        ents_bar = '🔵' * (ents - 1) + '🔴' + '⚫' * (MAX_COLS - ents)
+        wins_bar = '🟢' * wins + '⚪' * (WINS_PER_CYCLE - wins)
         txt = (
-            f"❌ *LOSS* — `{value:.2f}x`\n"
-            f"📍 _Columna `{g_session.col}/{MAX_COLS}` | "
-            f"Ciclo `{g_session.wins_in_cycle}/{WINS_PER_CYCLE}` victorias | "
-            f"`{g_session.entries_in_cycle}/{MAX_COLS}` entradas_"
+            f"❌ *LOSS*  `{value:.2f}x`\n"
+            f"┄┄┄┄┄┄┄┄┄┄┄┄┄┄┄┄┄┄┄┄┄┄┄\n"
+            f"📦 {ents_bar}  `{ents}/{MAX_COLS}`\n"
+            f"🏆 Ciclo  {wins_bar}  `{wins}/{WINS_PER_CYCLE}`\n"
+            f"➡️ _Siguiente entrada: Col `{col}`_\n"
+            f"🕐 {hora}"
         )
         await broadcast(txt, parse_mode='Markdown')
         await _broadcast_scoreboard()
         return
 
-    # ── CYCLE LOSS (12 entradas agotadas sin 4 victorias) ─────────────────────
+    # ── CYCLE LOSS ────────────────────────────────────────────────────────────
     if tipo == 'cycle_loss':
         g_daily_losses      += 1
         g_daily_cycles_lost += 1
+        total_cyc = g_daily_cycles_won + g_daily_cycles_lost
+        pct_cyc   = (g_daily_cycles_won / total_cyc * 100) if total_cyc > 0 else 0.0
+        ents_bar  = '🔴' * MAX_COLS
         txt = (
-            f"❌ *LOSS* — `{value:.2f}x`\n"
-            f"⚠️ *CICLO PERDIDO — {MAX_COLS} entradas sin {WINS_PER_CYCLE} victorias*\n"
-            "🔄 _Sesión reiniciada automáticamente_"
+            f"❌ *LOSS*  `{value:.2f}x`\n"
+            f"┄┄┄┄┄┄┄┄┄┄┄┄┄┄┄┄┄┄┄┄┄┄┄\n"
+            f"💥 *CICLO PERDIDO*\n"
+            f"{ents_bar}  `{MAX_COLS}/{MAX_COLS}`\n"
+            f"📊 Ciclos ganados hoy: `{g_daily_cycles_won}` — `{pct_cyc:.0f}%`\n"
+            f"🔄 _Nueva sesión iniciada_\n"
+            f"🕐 {hora}"
         )
         await broadcast(txt, parse_mode='Markdown')
         await _broadcast_scoreboard()
