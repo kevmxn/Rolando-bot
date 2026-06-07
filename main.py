@@ -652,7 +652,7 @@ async def process_multiplier(value: float, round_id: str):
                 g_session.start_ficha()
 
             logger.info(
-                f"🚀 SEÑAL {sig_type} (S{strictness}) "
+                f"🎯 SEÑAL {sig_type} (S{strictness}) "
                 f"Col{g_session.col} | Trigger: {value:.2f}x"
             )
             await _send_signal(value, sig_type, strictness)
@@ -697,27 +697,17 @@ async def _broadcast_scoreboard():
 
     hora  = argentina_time()
 
-    # Barras visuales
-    sig_bar = '🟢' * g_daily_wins + '🔴' * g_daily_losses
-    sig_bar = sig_bar[:20] + ('…' if (g_daily_wins + g_daily_losses) > 20 else '')
-
-    cyc_bar = '🏆' * g_daily_cycles_won + '💥' * g_daily_cycles_lost
-
     txt = (
-        f"📊 *MARCADOR DEL DÍA*\n"
+        f"📆 *MARCADOR DEL DÍA* — 🕐 {hora}\n"
         f"┄┄┄┄┄┄┄┄┄┄┄┄┄┄┄┄┄┄┄┄┄┄┄\n"
-        f"✅ Ganadas:   `{g_daily_wins}`\n"
-        f"❌ Perdidas:  `{g_daily_losses}`\n"
-        f"📈 Acierto:   `{pct_sig:.1f}%`\n"
-        f"{sig_bar}\n"
+        f"✅ Ganadas:   {g_daily_wins}\n"
+        f"❌ Perdidas:  {g_daily_losses}\n"
+        f"📈 Acierto:   {pct_sig:.1f}%\n"
         f"┄┄┄┄┄┄┄┄┄┄┄┄┄┄┄┄┄┄┄┄┄┄┄\n"
-        f"🔄 *Ciclos*  `{MAX_COLS}` entradas · `{WINS_PER_CYCLE}` victorias\n"
-        f"🏆 Ganados:  `{g_daily_cycles_won}`\n"
-        f"💥 Perdidos: `{g_daily_cycles_lost}`\n"
-        f"📊 Efectivo: `{pct_cyc:.1f}%`\n"
-        f"{cyc_bar}\n"
-        f"┄┄┄┄┄┄┄┄┄┄┄┄┄┄┄┄┄┄┄┄┄┄┄\n"
-        f"🕐 {hora}"
+        f"🔄 Ciclos  {MAX_COLS} entradas · {WINS_PER_CYCLE} victorias\n"
+        f"✅ Ganados:  {g_daily_cycles_won}\n"
+        f"❌ Perdidos: {g_daily_cycles_lost}\n"
+        f"📈 Acierto: {pct_cyc:.1f}%"
     )
 
     # Borrar marcador anterior si existe
@@ -748,24 +738,20 @@ async def _send_signal(trigger: float, signal_name: str, strictness: int):
     ents  = g_session.entries_in_cycle
     col   = g_session.col
 
-    # Barra de progreso del ciclo (victorias)
-    wins_bar  = '🟢' * wins  + '⚪' * (WINS_PER_CYCLE - wins)
-    # Barra de entradas usadas
-    ents_bar  = '🔵' * ents  + '⚫' * (MAX_COLS - ents)
+    ents_bar = '⚫' * MAX_COLS
+    wins_bar = '⚪' * WINS_PER_CYCLE
 
     txt = (
-        f"🚀 *ENTRADA SPACEMAN*\n"
+        f"🆔 *ENTRADA SPACEMAN* — 🕐 {hora}\n"
         f"┄┄┄┄┄┄┄┄┄┄┄┄┄┄┄┄┄┄┄┄┄┄┄\n"
-        f"🎰 *{signal_name}*  `{prob}%` de acierto\n"
+        f"🎰 {signal_name}  {prob}% de acierto\n"
         f"⏱ Después de:  `{trigger:.2f}x`\n"
         f"🎯 Objetivo:    `2.00x`\n"
         f"┄┄┄┄┄┄┄┄┄┄┄┄┄┄┄┄┄┄┄┄┄┄┄\n"
-        f"📦 Col `{col}`  |  Entradas `{ents}/{MAX_COLS}`\n"
+        f"🔰 Col {col}  |  Entradas {ents}/{MAX_COLS}\n"
         f"{ents_bar}\n"
-        f"🏆 Ciclo `{wins}/{WINS_PER_CYCLE}` victorias\n"
-        f"{wins_bar}\n"
-        f"┄┄┄┄┄┄┄┄┄┄┄┄┄┄┄┄┄┄┄┄┄┄┄\n"
-        f"🕐 {hora}"
+        f"💎 Ciclo {wins}/{WINS_PER_CYCLE} victorias\n"
+        f"{wins_bar}"
     )
     await broadcast_signal(txt)
 
@@ -792,11 +778,10 @@ async def _dispatch_result(value: float, tipo: str, bet: float, attempt_num: int
         ents = g_session.entries_in_cycle
         wins_bar = '🟢' * wins + '⚪' * (WINS_PER_CYCLE - wins)
         txt = (
-            f"✅ *WIN*  `{value:.2f}x`\n"
+            f"✅ *GANAMOS*  `{value:.2f}x` — 🕐 {hora}\n"
             f"┄┄┄┄┄┄┄┄┄┄┄┄┄┄┄┄┄┄┄┄┄┄┄\n"
-            f"🏆 Ciclo  {wins_bar}  `{wins}/{WINS_PER_CYCLE}`\n"
-            f"📦 Entradas usadas: `{ents}/{MAX_COLS}`\n"
-            f"🕐 {hora}"
+            f"💎 Ciclo  {wins_bar}  {wins}/{WINS_PER_CYCLE}\n"
+            f"🔰 Entradas usadas: {ents}/{MAX_COLS}"
         )
         await broadcast(txt, parse_mode='Markdown')
         await _broadcast_scoreboard()
@@ -808,14 +793,14 @@ async def _dispatch_result(value: float, tipo: str, bet: float, attempt_num: int
         g_daily_cycles_won += 1
         total_cyc = g_daily_cycles_won + g_daily_cycles_lost
         pct_cyc   = (g_daily_cycles_won / total_cyc * 100) if total_cyc > 0 else 0.0
+        wins_bar  = '🟢' * WINS_PER_CYCLE
         txt = (
-            f"✅ *WIN*  `{value:.2f}x`\n"
+            f"✅ *GANAMOS*  `{value:.2f}x` — 🕐 {hora}\n"
             f"┄┄┄┄┄┄┄┄┄┄┄┄┄┄┄┄┄┄┄┄┄┄┄\n"
-            f"🏆 *¡CICLO COMPLETADO!*\n"
-            f"{'🟢' * WINS_PER_CYCLE}  `{WINS_PER_CYCLE}/{WINS_PER_CYCLE}` victorias\n"
-            f"📊 Ciclos ganados hoy: `{g_daily_cycles_won}` — `{pct_cyc:.0f}%`\n"
-            f"🔄 _Nueva sesión iniciada_\n"
-            f"🕐 {hora}"
+            f"❤️ *¡CICLO COMPLETADO!*\n"
+            f"{wins_bar}  {WINS_PER_CYCLE}/{WINS_PER_CYCLE} victorias\n"
+            f"💎 Ciclos ganados hoy: {g_daily_cycles_won} — {pct_cyc:.0f}%\n"
+            f"🔄 Nueva sesión iniciada"
         )
         await broadcast(txt, parse_mode='Markdown')
         await _broadcast_scoreboard()
@@ -829,15 +814,14 @@ async def _dispatch_result(value: float, tipo: str, bet: float, attempt_num: int
         wins = g_session.wins_in_cycle
         ents = g_session.entries_in_cycle
         col  = g_session.col
-        ents_bar = '🔵' * (ents - 1) + '🔴' + '⚫' * (MAX_COLS - ents)
+        ents_bar = '⚫' * (ents - 1) + '🔴' + '⚫' * (MAX_COLS - ents)
         wins_bar = '🟢' * wins + '⚪' * (WINS_PER_CYCLE - wins)
         txt = (
-            f"❌ *LOSS*  `{value:.2f}x`\n"
+            f"❌ *PERDIMOS*  `{value:.2f}x` — 🕐 {hora}\n"
             f"┄┄┄┄┄┄┄┄┄┄┄┄┄┄┄┄┄┄┄┄┄┄┄\n"
-            f"📦 {ents_bar}  `{ents}/{MAX_COLS}`\n"
-            f"🏆 Ciclo  {wins_bar}  `{wins}/{WINS_PER_CYCLE}`\n"
-            f"➡️ _Siguiente entrada: Col `{col}`_\n"
-            f"🕐 {hora}"
+            f"🔰 {ents_bar}  {ents}/{MAX_COLS}\n"
+            f"💎 Ciclo  {wins_bar}  {wins}/{WINS_PER_CYCLE}\n"
+            f"➡️ Siguiente entrada: Col {col}"
         )
         await broadcast(txt, parse_mode='Markdown')
         await _broadcast_scoreboard()
@@ -851,13 +835,12 @@ async def _dispatch_result(value: float, tipo: str, bet: float, attempt_num: int
         pct_cyc   = (g_daily_cycles_won / total_cyc * 100) if total_cyc > 0 else 0.0
         ents_bar  = '🔴' * MAX_COLS
         txt = (
-            f"❌ *LOSS*  `{value:.2f}x`\n"
+            f"❌ *PERDIMOS*  `{value:.2f}x` — 🕐 {hora}\n"
             f"┄┄┄┄┄┄┄┄┄┄┄┄┄┄┄┄┄┄┄┄┄┄┄\n"
-            f"💥 *CICLO PERDIDO*\n"
-            f"{ents_bar}  `{MAX_COLS}/{MAX_COLS}`\n"
-            f"📊 Ciclos ganados hoy: `{g_daily_cycles_won}` — `{pct_cyc:.0f}%`\n"
-            f"🔄 _Nueva sesión iniciada_\n"
-            f"🕐 {hora}"
+            f"😭 *¡CICLO PERDIDO!*\n"
+            f"{ents_bar}  {MAX_COLS}/{MAX_COLS} entradas\n"
+            f"💎 Ciclos ganados hoy: {g_daily_cycles_won} — {pct_cyc:.0f}%\n"
+            f"🔄 Nueva sesión iniciada"
         )
         await broadcast(txt, parse_mode='Markdown')
         await _broadcast_scoreboard()
