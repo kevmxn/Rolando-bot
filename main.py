@@ -44,19 +44,19 @@ GAME_ID   = 1301
 
 # ── Objetivos de apuesta ──────────────────────────────────────────────────────
 WIN_TARGET    = 2.00   # Multiplicador objetivo de la señal
-SEGURO_TARGET = 1.50   # Multiplicador de stop seguro
+# Sin seguro — solo se juega a 2.00x
 
 # ── Gestión de sesión ─────────────────────────────────────────────────────────
-MAX_COLS   = 3         # Columnas máximas antes de ciclo perdido
-MAX_ATTS   = 2         # Intentos por columna (intento 1 + seguro)
+MAX_COLS   = 12        # Columnas máximas antes de ciclo perdido
+MAX_ATTS   = 1         # 1 intento por columna (sin segundo intento)
 CYCLE_SIZE = 10        # Señales exitosas para completar un ciclo
 BASE_BET   = 0.10      # Apuesta base fija (USD)
 
 # ── Umbrales de tendencia (detección favorable/desfavorable) ──────────────────
 # Desfavorable si: cuotas 1.00-1.99x superan THRESH_LOW_MAX
 #              O si: cuotas 2.00-4.99x caen por debajo de THRESH_MID_MIN
-THRESH_LOW_MAX = 54.0  # % máximo permitido para cuotas 1.00-1.99x
-THRESH_MID_MIN = 28.0  # % mínimo requerido para cuotas 2.00-4.99x
+THRESH_LOW_MAX = 55.0  # % máximo permitido para cuotas 1.00-1.99x
+THRESH_MID_MIN = 27.0  # % mínimo requerido para cuotas 2.00-4.99x
 
 # ── Parámetros internos ───────────────────────────────────────────────────────
 MAX_MULTS  = 400
@@ -86,7 +86,7 @@ g_daily_wins:  int = 0
 g_daily_losses: int = 0
 g_daily_date:  str = ""        # "YYYY-MM-DD" en hora Argentina
 
-# ─── IDs DE MENSAJES DE SEÑAL (para borrar intento 1 si hay intento 2) ───────
+# ─── IDs DE MENSAJES DE SEÑAL ────────────────────────────────────────────────
 g_last_signal_msgs: dict = {}  # chat_id → message_id
 
 # Contador interno para guardar en disco cada N multiplicadores
@@ -293,6 +293,7 @@ def check_moderate_signal() -> Optional[Tuple[str, int]]:
       S1 → EMA8 cruza por encima de EMA20
       S2 → patrón V + precio sobre las 3 EMAs
       S3 → 2 consecutivos ≥2.00 + EMAs alineadas (4>8>20)
+      S4 → S3 + precio sobre EMA4 + EMA4 acelerando al alza (confluencia máxima)
     """
     pos  = g_positions
     e4   = g_ema4
@@ -310,18 +311,16 @@ def check_moderate_signal() -> Optional[Tuple[str, int]]:
     prv_e8  = e8[-2]  if len(e8)  > 1 else cur_e8
     prv_e20 = e20[-2] if len(e20) > 1 else cur_e20
 
-    # S1: EMA8 cruza por encima de EMA20
-    if len(e8) >= 2 and prv_e8 <= prv_e20 and cur_e8 > cur_e20:
-        return ('alert200', 1)
-
-    # S2: patrón V + precio sobre las 3 EMAs
-    if len(pos) >= 3:
-        a, b, c = pos[-3], pos[-2], pos[-1]
-        if (abs(a - c) <= 1 and b > a
-                and cur_pos > cur_e4
-                and cur_pos > cur_e8
-                and cur_pos > cur_e20):
-            return ('alert200', 2)
+    # S4: Confluencia máxima — S3 + precio sobre EMA4 + EMA4 acelerando al alza
+    if (len(data) >= 2
+            and data[-1]['value'] >= WIN_TARGET
+            and data[-2]['value'] >= WIN_TARGET
+            and cur_e4 > cur_e8 > cur_e20
+            and cur_pos > cur_e4
+            and len(e4) >= 2 and e4[-1] > e4[-2]):
+        before = data[-3] if len(data) >= 3 else None
+        if before is None or before['value'] < WIN_TARGET:
+            return ('alert200', 4)
 
     # S3: 2 consecutivos ≥2.00 + EMAs alineadas + anterior <2.00
     if (len(data) >= 2
@@ -332,6 +331,19 @@ def check_moderate_signal() -> Optional[Tuple[str, int]]:
         if before is None or before['value'] < WIN_TARGET:
             return ('alert200', 3)
 
+    # S2: patrón V + precio sobre las 3 EMAs
+    if len(pos) >= 3:
+        a, b, c = pos[-3], pos[-2], pos[-1]
+        if (abs(a - c) <= 1 and b > a
+                and cur_pos > cur_e4
+                and cur_pos > cur_e8
+                and cur_pos > cur_e20):
+            return ('alert200', 2)
+
+    # S1: EMA8 cruza por encima de EMA20
+    if len(e8) >= 2 and prv_e8 <= prv_e20 and cur_e8 > cur_e20:
+        return ('alert200', 1)
+
     return None
 
 
@@ -340,11 +352,11 @@ class GlobalSession:
     """
     Sesión única compartida por todos los usuarios.
     Apuesta base fija: BASE_BET ($0.10).
-    Rastrea fichas (C1+C2+C3) para estadísticas reales.
+    Rastrea fichas (C1…C12) para estadísticas reales.
+    1 intento por columna — si falla, pasa a la siguiente columna.
     """
     IDLE       = 'idle'
     EVALUATING = 'evaluating'
-    WAITING_SO = 'waiting_so'
     DONE       = 'done'
 
     def __init__(self, carry_fichas: list = None):
@@ -373,17 +385,16 @@ class GlobalSession:
         """Inicia una nueva ficha al recibir señal en columna 1."""
         self._cur_ficha = {
             'n':      len(self.fichas) + 1,
-            'c1':     0.0,   # Total apostado en columna 1 (intento 1 + SO si hubo)
-            'c2':     0.0,   # Total apostado en columna 2
-            'c3':     0.0,   # Total apostado en columna 3
-            'result': None,  # 'win' | 'loss'
+            **{f'c{i}': 0.0 for i in range(1, 13)},  # c1…c12
+            'result': None,
             'ts':     argentina_time(),
         }
 
     def on_result(self, win: bool) -> tuple:
         """
         Retorna (tipo, bet_amount).
-        Tipos: 'win' | 'cycle_win' | 'so' | 'new_col' | 'cycle_loss'
+        Tipos: 'win' | 'cycle_win' | 'new_col' | 'cycle_loss'
+        Con 1 intento por columna: si falla, avanza directamente a la siguiente columna.
         Actualiza la ficha activa con el gasto real de cada columna.
         """
         self.entries += 1
@@ -418,61 +429,38 @@ class GlobalSession:
             return ('win', prev_bet)
 
         else:
+            # Pérdida → avanzar directo a siguiente columna (1 intento por columna)
             self.losses  += 1
             self.lost    += prev_bet
             self.cur_bet  = self.lost + self.base_bet
-            self.attempt += 1
+            self.col     += 1
 
-            if self.attempt > MAX_ATTS:
-                self.attempt = 1
-                self.col    += 1
-                if self.col > MAX_COLS:
-                    # Ciclo perdido — cerrar ficha como pérdida
-                    if self._cur_ficha is not None:
-                        self._cur_ficha['result'] = 'loss'
-                        self.fichas.append(self._cur_ficha)
-                        self._cur_ficha = None
-                    if len(self.fichas) > 100:
-                        self.fichas = self.fichas[-100:]
-                    self.state = self.DONE
-                    return ('cycle_loss', prev_bet)
-                # Avanzar a siguiente columna — la ficha continúa abierta
-                self.state = self.IDLE
-                return ('new_col', prev_bet)
-            else:
-                self.state = self.WAITING_SO
-                return ('so', prev_bet)
+            if self.col > MAX_COLS:
+                # Ciclo perdido — cerrar ficha como pérdida
+                if self._cur_ficha is not None:
+                    self._cur_ficha['result'] = 'loss'
+                    self.fichas.append(self._cur_ficha)
+                    self._cur_ficha = None
+                if len(self.fichas) > 100:
+                    self.fichas = self.fichas[-100:]
+                self.state = self.DONE
+                return ('cycle_loss', prev_bet)
 
-    def on_seguro_win(self) -> tuple:
-        """
-        Ganamos con seguro (>= 1.50x, < 2.00x).
-        Se mantiene el nivel de columna; solo se resetea el intento.
-        Retorna ('win_seguro', cur_bet).
-        """
-        prev_bet = self.cur_bet
-        prev_col = self.col
-        # Acumular gasto en la columna activa
-        if self._cur_ficha is not None:
-            col_key = f'c{prev_col}'
-            self._cur_ficha[col_key] = self._cur_ficha.get(col_key, 0.0) + prev_bet
-        # Resetear intento pero mantener columna (y lost/cur_bet sin cambios)
-        self.attempt = 1
-        self.state   = self.IDLE
-        # La ficha queda abierta — se cerrará con el próximo win a 2x o loss
-        return ('win_seguro', prev_bet)
+            # Avanzar a siguiente columna — la ficha continúa abierta
+            self.state = self.IDLE
+            return ('new_col', prev_bet)
 
     def status_short(self) -> str:
         estado_txt = {
             self.IDLE:       "⏳ Esperando señal",
             self.EVALUATING: "⚡ Evaluando resultado",
-            self.WAITING_SO: "🔄 Esperando 2ª Oportunidad",
             self.DONE:       "✅ Ciclo finalizado",
         }.get(self.state, "—")
 
         return (
             f"📡 Estado: {estado_txt}\n"
             f"🎯 Señal: `{min(self.scale, CYCLE_SIZE)}/{CYCLE_SIZE}`\n"
-            f"📍 Col: `{self.col}/{MAX_COLS}` | Intento: `{self.attempt}/{MAX_ATTS}`\n"
+            f"📍 Col: `{self.col}/{MAX_COLS}`\n"
             f"💵 Próxima apuesta: `${self.cur_bet:.2f}`\n"
             f"📈 G/P: `{self.wins}/{self.losses}`"
         )
@@ -507,43 +495,17 @@ async def process_multiplier(value: float, round_id: str):
     # ── FASE 1: Procesar resultado principal ──────────────────────────────────
     if g_signal_state == 'evaluating':
         if g_session.state == GlobalSession.EVALUATING:
-            attempt_num = g_session.attempt   # 1 = GALE #0
+            attempt_num = g_session.attempt
             if value >= WIN_TARGET:
                 tipo, bet = g_session.on_result(True)
-            elif value >= SEGURO_TARGET:
-                tipo, bet = g_session.on_seguro_win()
             else:
                 tipo, bet = g_session.on_result(False)
 
-            await _dispatch_result(value, tipo, bet, is_so=False, attempt_num=attempt_num)
+            await _dispatch_result(value, tipo, bet, attempt_num=attempt_num)
 
-            # Si tipo=='so': _dispatch_result borró señal y regresa; aquí enviamos señal #2
-            if tipo == 'so':
-                g_signal_state = 'so'
-                await _send_signal(g_signal_trigger_mult, g_signal_strictness, attempt=2)
-            else:
-                g_signal_state      = 'idle'
-                g_signal_type       = None
-                g_signal_strictness = 0
-        else:
-            g_signal_state      = 'idle'
-            g_signal_type       = None
-            g_signal_strictness = 0
-
-    # ── FASE 2: Procesar resultado SO ─────────────────────────────────────────
-    elif g_signal_state == 'so':
         g_signal_state      = 'idle'
         g_signal_type       = None
         g_signal_strictness = 0
-        if g_session.state == GlobalSession.WAITING_SO:
-            attempt_num = g_session.attempt   # 2 = GALE #1
-            if value >= WIN_TARGET:
-                tipo, bet = g_session.on_result(True)
-            elif value >= SEGURO_TARGET:
-                tipo, bet = g_session.on_seguro_win()
-            else:
-                tipo, bet = g_session.on_result(False)
-            await _dispatch_result(value, tipo, bet, is_so=True, attempt_num=attempt_num)
 
     # ── FASE 3: Actualizar datos y EMAs ───────────────────────────────────────
     global _persist_counter
@@ -585,8 +547,10 @@ async def process_multiplier(value: float, round_id: str):
         sig_result = check_moderate_signal()
         if sig_result:
             sig_type, strictness = sig_result
-            # Restricción por columna: Col2 requiere S2+, Col3 requiere S3
-            if strictness >= g_session.col:
+            # Restricción escalonada cada 2 columnas:
+            # Col 1-2 → S1+ | Col 3-4 → S2+ | Col 5-6 → S3+ | Col 7-12 → S4+
+            required_strictness = min(4, (g_session.col + 1) // 2)
+            if strictness >= required_strictness:
                 # Col > 1 → ficha en curso, continuar SIEMPRE sin importar tendencia
                 # Col == 1 → nueva ficha, solo si tendencia favorable
                 if g_session.col > 1:
@@ -607,7 +571,7 @@ async def process_multiplier(value: float, round_id: str):
                     if g_session.col == 1:
                         g_session.start_ficha()
 
-                    logger.info(f"🚀 SEÑAL S{strictness} Col{g_session.col} | Trigger: {value:.2f}x")
+                    logger.info(f"🚀 SEÑAL S{strictness} (req≥S{required_strictness}) Col{g_session.col} | Trigger: {value:.2f}x")
                     await _send_signal(value, strictness)
 
 
@@ -638,18 +602,14 @@ async def _broadcast_scoreboard():
 
 
 # ─── MENSAJERÍA ───────────────────────────────────────────────────────────────
-async def _send_signal(trigger: float, strictness: int, attempt: int = 1):
-    """Broadcast de señal a todos los chats registrados."""
+async def _send_signal(trigger: float, strictness: int):
+    """Broadcast de señal al canal."""
     txt = (
         f"🚨 Entrar después de: `{trigger:.2f}x`\n"
         f"💎 Señal para `2.00x`\n"
-        f"⚪ Seguro en `1.50x`\n"
-        f"🆔 Intento `{attempt}/2`"
+        f"🎯 S{strictness} | Col `{g_session.col}/{MAX_COLS}`"
     )
-    if attempt == 1:
-        await broadcast_signal(txt)   # Guarda IDs para borrado posterior
-    else:
-        await broadcast(txt, parse_mode='Markdown')
+    await broadcast_signal(txt)   # Guarda ID para referencia
 
 
 async def _check_trend_after_cycle():
@@ -661,28 +621,17 @@ async def _check_trend_after_cycle():
         logger.info("✅ Post-ciclo: tendencia favorable — bot continúa analizando")
 
 
-async def _dispatch_result(value: float, tipo: str, bet: float,
-                           is_so: bool, attempt_num: int):
+async def _dispatch_result(value: float, tipo: str, bet: float, attempt_num: int):
     """
-    Broadcast del resultado a todos los chats.
-    attempt_num: 1 = GALE #0, 2 = GALE #1
+    Broadcast del resultado al canal.
+    Sistema de 12 columnas, 1 intento por columna.
     """
     global g_session, g_daily_wins, g_daily_losses
 
-    gale_tag   = f"#{ attempt_num - 1 }"  # #0 o #1
-    r1_stored  = getattr(g_session, 'attempt1_result_value', 0.0)
-
-    # ── PERDIDA INTENTO 1 → borrar señal y enviar intento 2 ──────────────────
-    if tipo == 'so':
-        g_session.attempt1_result_value = value
-        await delete_last_signal()
-        # El intento 2 se envía desde process_multiplier justo después
-        return
-
-    # ── WIN GALE ──────────────────────────────────────────────────────────────
+    # ── WIN ───────────────────────────────────────────────────────────────────
     if tipo in ('win', 'cycle_win'):
         g_daily_wins += 1
-        txt = f"✅ WIN GALE {gale_tag} — `{value:.2f}x`"
+        txt = f"✅ WIN — `{value:.2f}x`"
         await broadcast(txt, parse_mode='Markdown')
         await _broadcast_scoreboard()
         if tipo == 'cycle_win':
@@ -695,33 +644,23 @@ async def _dispatch_result(value: float, tipo: str, bet: float,
             await _check_trend_after_cycle()
         return
 
-    # ── WIN SEGURO ────────────────────────────────────────────────────────────
-    if tipo == 'win_seguro':
-        g_daily_wins += 1
-        txt = f"✅ WIN SEGURO {gale_tag} — `{value:.2f}x`"
-        await broadcast(txt, parse_mode='Markdown')
-        await _broadcast_scoreboard()
-        return
-
-    # ── LOSS: avanzar columna ────────────────────────────────────────────────
+    # ── LOSS: avanzar columna ─────────────────────────────────────────────────
     if tipo == 'new_col':
         g_daily_losses += 1
-        r1 = f"{r1_stored:.2f}x" if r1_stored else "—"
         txt = (
-            f"❌ LOSS SEÑAL — `{r1}` y `{value:.2f}x`\n"
+            f"❌ LOSS — `{value:.2f}x`\n"
             f"📍 _Avanzando a Columna `{g_session.col}/{MAX_COLS}`..._"
         )
         await broadcast(txt, parse_mode='Markdown')
         await _broadcast_scoreboard()
         return
 
-    # ── LOSS: ciclo completo perdido ─────────────────────────────────────────
+    # ── LOSS: ciclo completo perdido ──────────────────────────────────────────
     if tipo == 'cycle_loss':
         g_daily_losses += 1
-        r1 = f"{r1_stored:.2f}x" if r1_stored else "—"
         txt = (
-            f"❌ LOSS SEÑAL — `{r1}` y `{value:.2f}x`\n"
-            "⚠️ *CICLO TERMINADO — 3 Columnas Fallidas*\n"
+            f"❌ LOSS — `{value:.2f}x`\n"
+            f"⚠️ *CICLO TERMINADO — {MAX_COLS} Columnas Fallidas*\n"
             "🔄 _Sesión reiniciada automáticamente_"
         )
         await broadcast(txt, parse_mode='Markdown')
@@ -903,7 +842,7 @@ async def cmd_start(message):
         "━━━━━━━━━━━━━━━━━━━━━━━\n"
         "🤖 *Bot de Señales Spaceman*\n"
         "📊 Sistema Moderado | Objetivo: `2.00x`\n"
-        "🔄 Gestión: 3 Columnas × 2 Intentos\n"
+        "🔄 Gestión: 12 Columnas × 1 Intento\n"
         f"💵 Apuesta base fija: `${BASE_BET:.2f}`\n"
         "🏆 Ciclo: 10 señales exitosas\n"
         "━━━━━━━━━━━━━━━━━━━━━━━\n"
@@ -935,21 +874,19 @@ async def cmd_estadisticas(message):
     if fichas_recientes:
         lineas = []
         for f in fichas_recientes:
-            c1    = f['c1']
-            c2    = f['c2']
-            c3    = f['c3']
-            total = c1 + c2 + c3
+            # Sumar todas las columnas (c1..c12) dinámicamente
+            total = sum(f.get(f'c{i}', 0.0) for i in range(1, 13))
             net   = BASE_BET if f['result'] == 'win' else -total
             res   = "✅" if f['result'] == 'win' else "❌"
             hora  = f.get('ts', '--:--')
 
             # Solo mostrar columnas con gasto real
-            partes = [f"C1:${c1:.2f}"]
-            if c2 > 0:
-                partes.append(f"C2:${c2:.2f}")
-            if c3 > 0:
-                partes.append(f"C3:${c3:.2f}")
-            cols_txt = " ".join(partes)
+            partes = []
+            for i in range(1, 13):
+                v = f.get(f'c{i}', 0.0)
+                if v > 0:
+                    partes.append(f"C{i}:${v:.2f}")
+            cols_txt = " ".join(partes) if partes else "—"
 
             net_txt = f"+${net:.2f}" if net >= 0 else f"-${abs(net):.2f}"
             lineas.append(f"{res} #{f['n']} {hora} | {cols_txt} | {net_txt}")
@@ -969,7 +906,7 @@ async def cmd_estadisticas(message):
         "━━━━━━━━━━━━━━━━━━━━━━━\n"
         f"{s.status_short()}\n"
         "━━━━━━━━━━━━━━━━━━━━━━━\n"
-        f"*Últimas fichas (C1 + C2 + C3):*\n"
+        f"*Últimas fichas (C1 a C12):*\n"
         f"{fichas_txt}\n"
         "━━━━━━━━━━━━━━━━━━━━━━━\n"
         f"{resumen}\n"
