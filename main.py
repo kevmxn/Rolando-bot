@@ -74,21 +74,33 @@ g_ema4:  list     = []
 g_ema8:  list     = []
 g_ema20: list     = []
 
-# ── Sistema de señales HTML (Aviamex) ────────────────────────────────────────
-# Señales portadas del HTML aviamex_pro_v17:
-#   S3 → EMA3↑EMA4  : EMA(3) cruza EMA(4) al alza + valor ≥ 2.00x  (prob 78%)
-#   S2 → Doble Piso : patrón W en posiciones, confirmado si siguiente < 2x (prob 72%)
-#   S1 → Wabe ↑     : 3 velas alcistas consecutivas en posiciones    (prob 62%)
-SIGNAL_COOLDOWN  = 6   # min ticks entre señales del mismo tipo
-g_cooldown_ema   = 0   # cooldown para EMA3↑EMA4
-g_cooldown_doble = 0   # cooldown para detección de Doble Piso
-g_cooldown_wabe  = 0   # cooldown para Wabe ↑
-g_pending_doble_piso: bool = False  # esperando confirmación (next tick < 2x)
+# ── Sistema de señales — Gráfica Moderada AMX 2x ─────────────────────────────
+# Tres niveles según la columna activa (estrategia dinero real):
+#   S1 (C1,C2)   → condiciones alerta150: rebote EMA4↑EMA8, patrón [-1,-1,-1,+1], soporte
+#   S2 (C3,C4)   → condiciones alerta200: EMA8↑EMA20, consolidación, 2× consecutivos
+#   S3 (C5,C6,C7)→ condición más selectiva: solo cruce EMA8↑EMA20
+SIGNAL_COOLDOWN = 6   # ticks mínimos entre señales para evitar spam
+g_cooldown_mod  = 0   # cooldown único para el sistema moderado
 
 g_signal_state        = 'idle'     # 'idle' | 'evaluating' | 'so'
 g_signal_type: Optional[str] = None
 g_signal_strictness: int     = 0
 g_signal_trigger_mult: float = 0.0
+
+
+# ─── RESTRICCIÓN DE SEÑALES POR COLUMNA (Estrategia Dinero Real) ──────────────
+# Gráfica moderada AMX 2x → posición: +1 si valor ≥ 2.00x, -1 si valor < 2.00x
+#   C1, C2      → nivel 1 (S1): señales alerta150 del HTML moderado
+#   C3, C4      → nivel 2 (S2): señales alerta200 del HTML moderado
+#   C5, C6, C7  → nivel 3 (S3): señal más selectiva (solo cruce EMA8↑EMA20)
+def signal_level_for_col(col: int) -> int:
+    """Retorna el nivel de señal requerido para la columna activa (1, 2 o 3)."""
+    if col <= 2:
+        return 1
+    elif col <= 4:
+        return 2
+    else:
+        return 3
 
 g_all_chats: set              = set()   # Todos los chats que alguna vez enviaron /start
 g_trend_favorable: Optional[bool] = None
@@ -133,12 +145,12 @@ async def broadcast_trend_change(favorable: bool):
     logger.info(f"Tendencia cambió → {'FAVORABLE' if favorable else 'DESFAVORABLE'} (sin broadcast)")
 
 
-async def broadcast_signal(msg: str):
+async def broadcast_signal(msg: str, parse_mode: str = None):
     """Envía señal al canal y guarda el message_id para borrado posterior."""
     global g_last_signal_msgs
     g_last_signal_msgs = {}
     try:
-        sent = await bot.send_message(CHANNEL_ID, msg, parse_mode='Markdown')
+        sent = await bot.send_message(CHANNEL_ID, msg, parse_mode=parse_mode)
         g_last_signal_msgs[CHANNEL_ID] = sent.message_id
         logger.info(f"✅ Señal enviada al canal — msg_id: {sent.message_id}")
     except Exception as e:
@@ -334,31 +346,80 @@ def quota_stats_text(stats: dict) -> str:
     )
 
 
-# ─── HELPERS DE SEÑALES HTML ──────────────────────────────────────────────────
-def detect_double_bottom(positions: list) -> bool:
+# ─── DETECCIÓN DE SEÑALES — GRÁFICA MODERADA AMX 2x ─────────────────────────
+def check_moderate_signal(
+    positions: list,
+    ema4: list, ema8: list, ema20: list,
+    data: list,
+    level: int
+) -> bool:
     """
-    Doble Piso: patrón W en los últimos 5 puntos de posición.
-    Equivalente a detectDoubleBottom(arr) del HTML.
-    last[0]>last[1] < last[2] > last[3] < last[4]  → forma de W
-    """
-    if len(positions) < 5:
-        return False
-    last = positions[-5:]
-    return (last[0] > last[1] and last[1] < last[2] and
-            last[2] > last[3] and last[3] < last[4])
+    Detecta señales del gráfico moderado AMX con umbral 2.00x.
+    Equivalente a checkModerateAlerts() del HTML AMX_V20.
+    Posiciones: +1 si value >= 2.00x | -1 si value < 2.00x.
 
-
-def is_consistent_uptrend(positions: list, n: int) -> bool:
+    level 1 (S1, C1-C2) → condiciones alerta150: más frecuentes.
+    level 2 (S2, C3-C4) → condiciones alerta200: moderadas.
+    level 3 (S3, C5-C7) → solo cruce EMA8↑EMA20: más selectivo.
     """
-    Wabe ↑: n velas alcistas consecutivas en el array de posiciones.
-    Equivalente a isConsistentUptrend(datos, n) del HTML.
-    """
-    if len(positions) < n + 1:
+    if len(data) < 4 or not positions:
         return False
-    for i in range(len(positions) - n, len(positions)):
-        if positions[i] <= positions[i - 1]:
-            return False
-    return True
+
+    cur_pos  = positions[-1]
+    cur_e4   = ema4[-1]  if ema4  else cur_pos
+    cur_e8   = ema8[-1]  if ema8  else cur_pos
+    cur_e20  = ema20[-1] if ema20 else cur_pos
+    prev_e4  = ema4[-2]  if len(ema4)  >= 2 else cur_e4
+    prev_e8  = ema8[-2]  if len(ema8)  >= 2 else cur_e8
+    prev_e20 = ema20[-2] if len(ema20) >= 2 else cur_e20
+
+    soporte = min(positions[-20:]) if len(positions) >= 20 else min(positions)
+
+    if level == 1:
+        # ── S1: condiciones alerta150 (HTML moderado) ─────────────────────────
+        # Cond 1: patrón [-1,-1,-1,+1] con posición por debajo de EMA4 y EMA8
+        cambios = [1 if d['value'] >= 2.00 else -1 for d in data[-4:]]
+        c1, c2, c3, c4 = cambios
+        if c1 == -1 and c2 == -1 and c3 == -1 and c4 == 1:
+            if cur_pos <= cur_e4 and cur_pos <= cur_e8:
+                return True
+        # Cond 2: EMA4 cruza EMA8 al alza
+        if len(ema4) >= 2 and prev_e4 <= prev_e8 and cur_e4 > cur_e8:
+            return True
+        # Cond 3: rebote desde soporte, posición sobre las 3 EMAs
+        if (cur_pos <= soporte * 1.01
+                and cur_pos > cur_e4
+                and cur_pos > cur_e8
+                and cur_pos > cur_e20):
+            return True
+
+    elif level == 2:
+        # ── S2: condiciones alerta200 (HTML moderado) ─────────────────────────
+        # Cond 1: EMA8 cruza EMA20 al alza
+        if len(ema8) >= 2 and prev_e8 <= prev_e20 and cur_e8 > cur_e20:
+            return True
+        # Cond 2: consolidación → |a-c| ≤ 1, b > a, posición sobre las 3 EMAs
+        if len(positions) >= 3:
+            a, b, c = positions[-3], positions[-2], positions[-1]
+            if (abs(a - c) <= 1 and b > a
+                    and cur_pos > cur_e4
+                    and cur_pos > cur_e8
+                    and cur_pos > cur_e20):
+                return True
+        # Cond 3: 2 valores >= 2.00x consecutivos + alineación alcista EMAs
+        #         y el valor previo a ellos fue < 2.00x
+        if (data[-1]['value'] >= 2.00 and data[-2]['value'] >= 2.00
+                and cur_e4 > cur_e8 > cur_e20):
+            before = data[-3] if len(data) >= 3 else None
+            if before is None or before['value'] < 2.00:
+                return True
+
+    elif level == 3:
+        # ── S3: solo cruce EMA8↑EMA20 — condición más selectiva ──────────────
+        if len(ema8) >= 2 and prev_e8 <= prev_e20 and cur_e8 > cur_e20:
+            return True
+
+    return False
 
 
 # ─── SESIÓN GLOBAL ────────────────────────────────────────────────────────────
@@ -510,7 +571,7 @@ async def process_multiplier(value: float, round_id: str):
     global g_signal_state, g_signal_type, g_signal_strictness, g_signal_trigger_mult
     global g_positions, g_ema3, g_ema4, g_ema8, g_ema20, g_mults, g_seen_ids
     global g_trend_favorable, g_session
-    global g_cooldown_ema, g_cooldown_doble, g_cooldown_wabe, g_pending_doble_piso
+    global g_cooldown_mod
 
     logger.info(
         f"🎲 {value:.2f}x | ID: {round_id} | "
@@ -535,29 +596,8 @@ async def process_multiplier(value: float, round_id: str):
         g_signal_type       = None
         g_signal_strictness = 0
 
-    # ── FASE 2: Confirmación de Doble Piso (antes de actualizar posiciones) ──
-    # Si el tick anterior detectó un Doble Piso, este valor < 2x lo confirma
-    # y dispara la señal de entrada (el SIGUIENTE tick será el resultado).
-    _doble_confirmed = False
-    if g_pending_doble_piso:
-        g_pending_doble_piso = False   # consumir flag siempre
-        if value < 2.00 and g_signal_state == 'idle' and g_session.state == GlobalSession.IDLE:
-            g_signal_state        = 'evaluating'
-            g_signal_type         = 'Doble Piso'
-            g_signal_strictness   = 2
-            g_signal_trigger_mult = value
-            g_session.signal_trigger_mult = value
-            g_session.state = GlobalSession.EVALUATING
-            if g_session.col == 1:
-                g_session.start_ficha()
-            logger.info(f"✅ Doble Piso confirmado ({value:.2f}x < 2x) — señal S2 Col{g_session.col}")
-            await _send_signal(value, 'Doble Piso', 2)
-            _doble_confirmed = True
-
-    # ── FASE 2.5: Decrementar cooldowns (igual que el HTML) ──────────────────
-    g_cooldown_ema   = max(0, g_cooldown_ema   - 1)
-    g_cooldown_doble = max(0, g_cooldown_doble - 1)
-    g_cooldown_wabe  = max(0, g_cooldown_wabe  - 1)
+    # ── FASE 2: Decrementar cooldown único del sistema moderado ──────────────
+    g_cooldown_mod = max(0, g_cooldown_mod - 1)
 
     # ── FASE 3: Actualizar datos y EMAs ───────────────────────────────────────
     global _persist_counter
@@ -596,63 +636,29 @@ async def process_multiplier(value: float, round_id: str):
             g_trend_favorable = new_fav
             asyncio.create_task(broadcast_trend_change(new_fav))
 
-    # ── FASE 4: Detectar nueva señal (sistema HTML Aviamex) ──────────────────
-    # Solo detecta si no se disparó Doble Piso en FASE 2 y el bot está en reposo
-    if not _doble_confirmed and g_signal_state == 'idle' and g_session.state == GlobalSession.IDLE:
+    # ── FASE 4: Detectar nueva señal — Gráfica Moderada AMX 2x ──────────────
+    if g_signal_state == 'idle' and g_session.state == GlobalSession.IDLE and g_cooldown_mod == 0:
 
-        sig_type: Optional[str] = None
-        strictness: int = 0
+        level = signal_level_for_col(g_session.col)
+        sig_names = {1: 'Mod_S1', 2: 'Mod_S2', 3: 'Mod_S3'}
 
-        # ── Snapshots EMA3 / EMA4 (iguales a snap del HTML) ──────────────────
-        e3_cross_up = e3_cross_down = False
-        if len(g_ema3) >= 2 and len(g_ema4) >= 2:
-            e3_prev, e3_last = g_ema3[-2], g_ema3[-1]
-            e4_prev, e4_last = g_ema4[-2], g_ema4[-1]
-            e3_cross_up   = (e3_prev - e4_prev) <= 0 and (e3_last - e4_last) > 0
-            e3_cross_down = (e3_prev - e4_prev) >= 0 and (e3_last - e4_last) < 0
+        if check_moderate_signal(g_positions, g_ema4, g_ema8, g_ema20, g_mults, level):
+            sig_type   = sig_names[level]
+            strictness = level
 
-        # ── S3 — EMA3↑EMA4: cruce alcista + valor ≥ 2.00x + cooldown agotado ─
-        if e3_cross_up and value >= 2.00 and g_cooldown_ema == 0:
-            sig_type       = 'EMA3↑EMA4'
-            strictness     = 3
-            g_cooldown_ema = SIGNAL_COOLDOWN
-
-        # ── EMA cross-down: cancela Doble Piso pendiente (requiere cooldown=0) ─
-        # Igual que HTML: `if(crossDown && _emaCooldown===0){ pendingDoblesPiso=false }`
-        if e3_cross_down and g_cooldown_ema == 0 and g_pending_doble_piso:
-            g_pending_doble_piso = False
-            logger.debug("EMA3↓EMA4 — Doble Piso pendiente cancelado")
-
-        # ── Detectar patrón Doble Piso → flag para SIGUIENTE tick ────────────
-        # Sin chequear sig_type — independiente de EMA, igual que HTML
-        if g_cooldown_doble == 0 and not g_pending_doble_piso:
-            if detect_double_bottom(g_positions):
-                g_pending_doble_piso = True
-                g_cooldown_doble     = SIGNAL_COOLDOWN
-                logger.debug("Doble Piso detectado — esperando confirmación (next tick < 2x)")
-
-        # ── S1 — Wabe ↑: 3 velas alcistas + cooldown agotado ─────────────────
-        # Solo si EMA no disparó en este tick (igual que HTML _signalFiredThisTick)
-        if sig_type is None and g_cooldown_wabe == 0:
-            if is_consistent_uptrend(g_positions, 3):
-                sig_type        = 'Wabe ↑'
-                strictness      = 1
-                g_cooldown_wabe = SIGNAL_COOLDOWN
-
-        # ── Disparar señal ────────────────────────────────────────────────────
-        if sig_type is not None:
             g_signal_state        = 'evaluating'
             g_signal_type         = sig_type
             g_signal_strictness   = strictness
             g_signal_trigger_mult = value
             g_session.signal_trigger_mult = value
-            g_session.state = GlobalSession.EVALUATING
+            g_session.state       = GlobalSession.EVALUATING
+            g_cooldown_mod        = SIGNAL_COOLDOWN
 
             if g_session.col == 1:
                 g_session.start_ficha()
 
             logger.info(
-                f"🎯 SEÑAL {sig_type} (S{strictness}) "
+                f"🎯 SEÑAL {sig_type} (nivel {level}) "
                 f"Col{g_session.col} | Trigger: {value:.2f}x"
             )
             await _send_signal(value, sig_type, strictness)
@@ -730,30 +736,31 @@ async def _broadcast_scoreboard():
 
 # ─── MENSAJERÍA ───────────────────────────────────────────────────────────────
 async def _send_signal(trigger: float, signal_name: str, strictness: int):
-    """Broadcast de señal al canal."""
-    prob_map = {'EMA3↑EMA4': 78, 'Doble Piso': 72, 'Wabe ↑': 62}
-    prob  = prob_map.get(signal_name, 60)
-    hora  = argentina_time()
-    wins  = g_session.wins_in_cycle
-    ents  = g_session.entries_in_cycle
-    col   = g_session.col
+    """Broadcast de señal al canal — formato Estrategia Dinero Real."""
+    hora = argentina_time()
+    col  = g_session.col
+    ents = g_session.entries_in_cycle + 1   # número de entrada que se va a jugar
+    wins = g_session.wins_in_cycle
 
-    ents_bar = '⚫' * MAX_COLS
-    wins_bar = '⚪' * WINS_PER_CYCLE
+    ents_bar = '⚫' * MAX_COLS           # 7 círculos negros (slots del ciclo)
+    wins_bar = '⚪' * WINS_PER_CYCLE     # 2 círculos blancos (victorias meta)
+
+    # Etiqueta de señal para log interno
+    sig_label = {1: 'S1 Wabe↑', 2: 'S2 Doble Piso', 3: 'S3 EMA3↑EMA4'}.get(strictness, f'S{strictness}')
+    logger.info(f"📤 Señal {sig_label} | Col{col} | Entrada {ents}/{MAX_COLS} | Ciclo {wins}/{WINS_PER_CYCLE}")
 
     txt = (
-        f"🆔 *ENTRADA SPACEMAN* — 🕐 {hora}\n"
+        f"🆔 ENTRADA SPACEMAN — 🕐 {hora}\n"
         f"┄┄┄┄┄┄┄┄┄┄┄┄┄┄┄┄┄┄┄┄┄┄┄\n"
-        f"🎰 {signal_name}  {prob}% de acierto\n"
-        f"⏱ Después de:  `{trigger:.2f}x`\n"
-        f"🎯 Objetivo:    `2.00x`\n"
+        f"🧨 Después de: {trigger:.2f}x\n"
+        f"🎯 Objetivo: 2.00x\n"
         f"┄┄┄┄┄┄┄┄┄┄┄┄┄┄┄┄┄┄┄┄┄┄┄\n"
         f"🔰 Col {col}  |  Entradas {ents}/{MAX_COLS}\n"
         f"{ents_bar}\n"
         f"💎 Ciclo {wins}/{WINS_PER_CYCLE} victorias\n"
         f"{wins_bar}"
     )
-    await broadcast_signal(txt)
+    await broadcast_signal(txt)   # sin parse_mode — texto plano con emojis
 
 
 async def _check_trend_after_cycle():
