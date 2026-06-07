@@ -706,12 +706,12 @@ async def _broadcast_scoreboard():
     txt = (
         f"📆 *MARCADOR DEL DÍA* — 🕐 {hora}\n"
         f"┄┄┄┄┄┄┄┄┄┄┄┄┄┄┄┄┄┄┄┄┄┄┄\n"
-        f"✅ Ganadas:   {g_daily_wins}\n"
-        f"❌ Perdidas:  {g_daily_losses}\n"
-        f"📈 Acierto:   {pct_sig:.1f}%\n"
+        f"✅ Ganadas: {g_daily_wins}\n"
+        f"❌ Perdidas: {g_daily_losses}\n"
+        f"📈 Acierto: {pct_sig:.1f}%\n"
         f"┄┄┄┄┄┄┄┄┄┄┄┄┄┄┄┄┄┄┄┄┄┄┄\n"
-        f"🔄 Ciclos  {MAX_COLS} entradas · {WINS_PER_CYCLE} victorias\n"
-        f"✅ Ganados:  {g_daily_cycles_won}\n"
+        f"🔄 Ciclos {MAX_COLS} entradas · {WINS_PER_CYCLE} victorias\n"
+        f"✅ Ganados: {g_daily_cycles_won}\n"
         f"❌ Perdidos: {g_daily_cycles_lost}\n"
         f"📈 Acierto: {pct_cyc:.1f}%"
     )
