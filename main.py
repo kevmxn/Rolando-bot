@@ -47,9 +47,9 @@ WIN_TARGET    = 2.00   # Multiplicador objetivo de la señal
 # Sin seguro — solo se juega a 2.00x
 
 # ── Gestión de sesión ─────────────────────────────────────────────────────────
-MAX_COLS       = 12    # Entradas máximas por ciclo (12 entradas = 1 ciclo)
+MAX_COLS       = 7     # Entradas máximas por ciclo (7 entradas = 1 ciclo)
 MAX_ATTS       = 1     # 1 intento por columna (sin segundo intento)
-WINS_PER_CYCLE = 4     # Victorias necesarias dentro de MAX_COLS entradas para ganar el ciclo
+WINS_PER_CYCLE = 2     # Victorias necesarias dentro de MAX_COLS entradas para ganar el ciclo
 BASE_BET       = 0.10  # Apuesta base fija (USD)
 
 # ── Umbrales de tendencia (detección favorable/desfavorable) ──────────────────
@@ -542,25 +542,17 @@ async def process_multiplier(value: float, round_id: str):
     if g_pending_doble_piso:
         g_pending_doble_piso = False   # consumir flag siempre
         if value < 2.00 and g_signal_state == 'idle' and g_session.state == GlobalSession.IDLE:
-            required_s = min(3, (g_session.col + 1) // 2)
-            if 2 >= required_s:   # Doble Piso es S2
-                if g_session.col > 1:
-                    proceed = True
-                else:
-                    stats_now = get_quota_stats(200)
-                    proceed   = (stats_now['total'] == 0) or (stats_now['favorable'] is not False)
-                if proceed:
-                    g_signal_state        = 'evaluating'
-                    g_signal_type         = 'Doble Piso'
-                    g_signal_strictness   = 2
-                    g_signal_trigger_mult = value
-                    g_session.signal_trigger_mult = value
-                    g_session.state = GlobalSession.EVALUATING
-                    if g_session.col == 1:
-                        g_session.start_ficha()
-                    logger.info(f"✅ Doble Piso confirmado ({value:.2f}x < 2x) — señal S2 Col{g_session.col}")
-                    await _send_signal(value, 'Doble Piso', 2)
-                    _doble_confirmed = True
+            g_signal_state        = 'evaluating'
+            g_signal_type         = 'Doble Piso'
+            g_signal_strictness   = 2
+            g_signal_trigger_mult = value
+            g_session.signal_trigger_mult = value
+            g_session.state = GlobalSession.EVALUATING
+            if g_session.col == 1:
+                g_session.start_ficha()
+            logger.info(f"✅ Doble Piso confirmado ({value:.2f}x < 2x) — señal S2 Col{g_session.col}")
+            await _send_signal(value, 'Doble Piso', 2)
+            _doble_confirmed = True
 
     # ── FASE 2.5: Decrementar cooldowns (igual que el HTML) ──────────────────
     g_cooldown_ema   = max(0, g_cooldown_ema   - 1)
@@ -619,62 +611,51 @@ async def process_multiplier(value: float, round_id: str):
             e3_cross_up   = (e3_prev - e4_prev) <= 0 and (e3_last - e4_last) > 0
             e3_cross_down = (e3_prev - e4_prev) >= 0 and (e3_last - e4_last) < 0
 
-        # ── Señal S3 — EMA3↑EMA4 ─────────────────────────────────────────────
-        # Cruce alcista + valor actual ≥ 2.00x + cooldown agotado
+        # ── S3 — EMA3↑EMA4: cruce alcista + valor ≥ 2.00x + cooldown agotado ─
         if e3_cross_up and value >= 2.00 and g_cooldown_ema == 0:
-            sig_type  = 'EMA3↑EMA4'
-            strictness = 3
+            sig_type       = 'EMA3↑EMA4'
+            strictness     = 3
             g_cooldown_ema = SIGNAL_COOLDOWN
 
-        # ── EMA crossdown: invalida Doble Piso pendiente ──────────────────────
-        # (si en el tick anterior se detectó el patrón W pero EMA confirma bajada)
-        if e3_cross_down and g_pending_doble_piso:
+        # ── EMA cross-down: cancela Doble Piso pendiente (requiere cooldown=0) ─
+        # Igual que HTML: `if(crossDown && _emaCooldown===0){ pendingDoblesPiso=false }`
+        if e3_cross_down and g_cooldown_ema == 0 and g_pending_doble_piso:
             g_pending_doble_piso = False
             logger.debug("EMA3↓EMA4 — Doble Piso pendiente cancelado")
 
-        # ── Detectar patrón Doble Piso (W) → flag para SIGUIENTE tick ────────
-        if sig_type is None and g_cooldown_doble == 0 and not g_pending_doble_piso:
+        # ── Detectar patrón Doble Piso → flag para SIGUIENTE tick ────────────
+        # Sin chequear sig_type — independiente de EMA, igual que HTML
+        if g_cooldown_doble == 0 and not g_pending_doble_piso:
             if detect_double_bottom(g_positions):
                 g_pending_doble_piso = True
-                g_cooldown_doble = SIGNAL_COOLDOWN
+                g_cooldown_doble     = SIGNAL_COOLDOWN
                 logger.debug("Doble Piso detectado — esperando confirmación (next tick < 2x)")
 
-        # ── Señal S1 — Wabe ↑ ────────────────────────────────────────────────
-        # 3 velas alcistas consecutivas en posiciones + cooldown agotado
+        # ── S1 — Wabe ↑: 3 velas alcistas + cooldown agotado ─────────────────
+        # Solo si EMA no disparó en este tick (igual que HTML _signalFiredThisTick)
         if sig_type is None and g_cooldown_wabe == 0:
             if is_consistent_uptrend(g_positions, 3):
-                sig_type   = 'Wabe ↑'
-                strictness = 1
+                sig_type        = 'Wabe ↑'
+                strictness      = 1
                 g_cooldown_wabe = SIGNAL_COOLDOWN
 
-        # ── Disparar señal si aplica ──────────────────────────────────────────
+        # ── Disparar señal ────────────────────────────────────────────────────
         if sig_type is not None:
-            # Restricción escalonada (capped a S3 porque solo hay 3 tipos):
-            # Col 1-2 → S1+ | Col 3-4 → S2+ | Col 5+ → S3+
-            required_strictness = min(3, (g_session.col + 1) // 2)
-            if strictness >= required_strictness:
-                if g_session.col > 1:
-                    proceed = True
-                else:
-                    stats_now = get_quota_stats(200)
-                    proceed   = (stats_now['total'] == 0) or (stats_now['favorable'] is not False)
+            g_signal_state        = 'evaluating'
+            g_signal_type         = sig_type
+            g_signal_strictness   = strictness
+            g_signal_trigger_mult = value
+            g_session.signal_trigger_mult = value
+            g_session.state = GlobalSession.EVALUATING
 
-                if proceed:
-                    g_signal_state        = 'evaluating'
-                    g_signal_type         = sig_type
-                    g_signal_strictness   = strictness
-                    g_signal_trigger_mult = value
-                    g_session.signal_trigger_mult = value
-                    g_session.state = GlobalSession.EVALUATING
+            if g_session.col == 1:
+                g_session.start_ficha()
 
-                    if g_session.col == 1:
-                        g_session.start_ficha()
-
-                    logger.info(
-                        f"🚀 SEÑAL {sig_type} (S{strictness}, req≥S{required_strictness}) "
-                        f"Col{g_session.col} | Trigger: {value:.2f}x"
-                    )
-                    await _send_signal(value, sig_type, strictness)
+            logger.info(
+                f"🚀 SEÑAL {sig_type} (S{strictness}) "
+                f"Col{g_session.col} | Trigger: {value:.2f}x"
+            )
+            await _send_signal(value, sig_type, strictness)
 
 
 
