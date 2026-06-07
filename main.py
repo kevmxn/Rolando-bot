@@ -47,10 +47,10 @@ WIN_TARGET    = 2.00   # Multiplicador objetivo de la señal
 # Sin seguro — solo se juega a 2.00x
 
 # ── Gestión de sesión ─────────────────────────────────────────────────────────
-MAX_COLS   = 12        # Columnas máximas antes de ciclo perdido
-MAX_ATTS   = 1         # 1 intento por columna (sin segundo intento)
-CYCLE_SIZE = 10        # Señales exitosas para completar un ciclo
-BASE_BET   = 0.10      # Apuesta base fija (USD)
+MAX_COLS       = 12    # Entradas máximas por ciclo (12 entradas = 1 ciclo)
+MAX_ATTS       = 1     # 1 intento por columna (sin segundo intento)
+WINS_PER_CYCLE = 4     # Victorias necesarias dentro de MAX_COLS entradas para ganar el ciclo
+BASE_BET       = 0.10  # Apuesta base fija (USD)
 
 # ── Umbrales de tendencia (detección favorable/desfavorable) ──────────────────
 # Desfavorable si: cuotas 1.00-1.99x superan THRESH_LOW_MAX
@@ -69,9 +69,21 @@ PERSIST_FILE = "spaceman_history.json"
 g_mults:    list  = []
 g_seen_ids: set   = set()
 g_positions: list = []
+g_ema3:  list     = []
 g_ema4:  list     = []
 g_ema8:  list     = []
 g_ema20: list     = []
+
+# ── Sistema de señales HTML (Aviamex) ────────────────────────────────────────
+# Señales portadas del HTML aviamex_pro_v17:
+#   S3 → EMA3↑EMA4  : EMA(3) cruza EMA(4) al alza + valor ≥ 2.00x  (prob 78%)
+#   S2 → Doble Piso : patrón W en posiciones, confirmado si siguiente < 2x (prob 72%)
+#   S1 → Wabe ↑     : 3 velas alcistas consecutivas en posiciones    (prob 62%)
+SIGNAL_COOLDOWN  = 6   # min ticks entre señales del mismo tipo
+g_cooldown_ema   = 0   # cooldown para EMA3↑EMA4
+g_cooldown_doble = 0   # cooldown para detección de Doble Piso
+g_cooldown_wabe  = 0   # cooldown para Wabe ↑
+g_pending_doble_piso: bool = False  # esperando confirmación (next tick < 2x)
 
 g_signal_state        = 'idle'     # 'idle' | 'evaluating' | 'so'
 g_signal_type: Optional[str] = None
@@ -82,9 +94,12 @@ g_all_chats: set              = set()   # Todos los chats que alguna vez enviaro
 g_trend_favorable: Optional[bool] = None
 
 # ─── MARCADOR DIARIO ──────────────────────────────────────────────────────────
-g_daily_wins:  int = 0
-g_daily_losses: int = 0
-g_daily_date:  str = ""        # "YYYY-MM-DD" en hora Argentina
+g_daily_wins:        int          = 0
+g_daily_losses:      int          = 0
+g_daily_cycles_won:  int          = 0    # Ciclos ganados hoy
+g_daily_cycles_lost: int          = 0    # Ciclos perdidos hoy
+g_daily_date:        str          = ""   # "YYYY-MM-DD" en hora Argentina
+g_scoreboard_msg_id: Optional[int] = None  # ID del último mensaje de marcador diario
 
 # ─── IDs DE MENSAJES DE SEÑAL ────────────────────────────────────────────────
 g_last_signal_msgs: dict = {}  # chat_id → message_id
@@ -156,7 +171,7 @@ def calc_ema(data: list, period: int) -> list:
 # ─── PERSISTENCIA EN DISCO ────────────────────────────────────────────────────
 def save_mults_to_disk():
     """
-    Guarda el historial de multiplicadores y posiciones en disco.
+    Guarda el historial de multiplicadores, posiciones y marcador diario en disco.
     Llamado cada 10 nuevos multiplicadores para no perder datos en reinicios.
     """
     try:
@@ -164,6 +179,12 @@ def save_mults_to_disk():
             'mults':     [{'id': m['id'], 'value': m['value'], 'ts': m['ts']}
                           for m in g_mults],
             'positions': g_positions,
+            # ── Marcador diario (sobrevive reinicios) ──
+            'daily_wins':        g_daily_wins,
+            'daily_losses':      g_daily_losses,
+            'daily_cycles_won':  g_daily_cycles_won,
+            'daily_cycles_lost': g_daily_cycles_lost,
+            'daily_date':        g_daily_date,
         }
         tmp = PERSIST_FILE + ".tmp"
         with open(tmp, 'w') as f:
@@ -178,8 +199,11 @@ def load_mults_from_disk():
     """
     Carga el historial desde disco al arrancar.
     Restaura g_mults, g_positions, g_ema* y g_seen_ids.
+    El marcador diario se restaura solo si corresponde al día de hoy (hora Argentina);
+    si el archivo es de otro día, los contadores arrancan en 0.
     """
-    global g_mults, g_positions, g_ema4, g_ema8, g_ema20
+    global g_mults, g_positions, g_ema3, g_ema4, g_ema8, g_ema20
+    global g_daily_wins, g_daily_losses, g_daily_date
     if not os.path.exists(PERSIST_FILE):
         logger.info("📂 Sin historial previo en disco — comenzando desde cero")
         return
@@ -199,6 +223,7 @@ def load_mults_from_disk():
         g_positions[:] = loaded_pos
 
         # Recalcular EMAs con los datos cargados
+        g_ema3[:]  = calc_ema(g_positions, 3)
         g_ema4[:]  = calc_ema(g_positions, 4)
         g_ema8[:]  = calc_ema(g_positions, 8)
         g_ema20[:] = calc_ema(g_positions, 20)
@@ -206,6 +231,29 @@ def load_mults_from_disk():
         # Restaurar IDs vistos para evitar duplicados tras reconexión WS
         for m in g_mults:
             g_seen_ids.add(str(m['id']))
+
+        # ── Marcador diario: restaurar solo si es el mismo día ────────────────
+        saved_date = data.get('daily_date', '')
+        today_arg  = (datetime.utcnow() - timedelta(hours=3)).strftime("%Y-%m-%d")
+        if saved_date == today_arg:
+            g_daily_wins        = data.get('daily_wins',        0)
+            g_daily_losses      = data.get('daily_losses',      0)
+            g_daily_cycles_won  = data.get('daily_cycles_won',  0)
+            g_daily_cycles_lost = data.get('daily_cycles_lost', 0)
+            g_daily_date        = saved_date
+            logger.info(
+                f"📊 Marcador diario restaurado: "
+                f"✅ {g_daily_wins} | ❌ {g_daily_losses} | "
+                f"🏆 Ciclos: {g_daily_cycles_won}W/{g_daily_cycles_lost}L ({today_arg})"
+            )
+        else:
+            # Archivo de otro día → marcador arranca en 0, fecha actualizada
+            g_daily_wins        = 0
+            g_daily_losses      = 0
+            g_daily_cycles_won  = 0
+            g_daily_cycles_lost = 0
+            g_daily_date        = today_arg
+            logger.info(f"📅 Nuevo día detectado al cargar ({today_arg}) — marcador en 0")
 
         logger.info(
             f"✅ Historial cargado desde disco: "
@@ -286,65 +334,31 @@ def quota_stats_text(stats: dict) -> str:
     )
 
 
-# ─── DETECCIÓN DE SEÑAL ───────────────────────────────────────────────────────
-def check_moderate_signal() -> Optional[Tuple[str, int]]:
+# ─── HELPERS DE SEÑALES HTML ──────────────────────────────────────────────────
+def detect_double_bottom(positions: list) -> bool:
     """
-    Retorna ('alert200', strictness) o None.
-      S1 → EMA8 cruza por encima de EMA20
-      S2 → patrón V + precio sobre las 3 EMAs
-      S3 → 2 consecutivos ≥2.00 + EMAs alineadas (4>8>20)
-      S4 → S3 + precio sobre EMA4 + EMA4 acelerando al alza (confluencia máxima)
+    Doble Piso: patrón W en los últimos 5 puntos de posición.
+    Equivalente a detectDoubleBottom(arr) del HTML.
+    last[0]>last[1] < last[2] > last[3] < last[4]  → forma de W
     """
-    pos  = g_positions
-    e4   = g_ema4
-    e8   = g_ema8
-    e20  = g_ema20
-    data = g_mults
+    if len(positions) < 5:
+        return False
+    last = positions[-5:]
+    return (last[0] > last[1] and last[1] < last[2] and
+            last[2] > last[3] and last[3] < last[4])
 
-    if len(data) < 4 or len(pos) < 4:
-        return None
 
-    cur_pos = pos[-1]
-    cur_e4  = e4[-1]  if e4           else cur_pos
-    cur_e8  = e8[-1]  if e8           else cur_pos
-    cur_e20 = e20[-1] if e20          else cur_pos
-    prv_e8  = e8[-2]  if len(e8)  > 1 else cur_e8
-    prv_e20 = e20[-2] if len(e20) > 1 else cur_e20
-
-    # S4: Confluencia máxima — S3 + precio sobre EMA4 + EMA4 acelerando al alza
-    if (len(data) >= 2
-            and data[-1]['value'] >= WIN_TARGET
-            and data[-2]['value'] >= WIN_TARGET
-            and cur_e4 > cur_e8 > cur_e20
-            and cur_pos > cur_e4
-            and len(e4) >= 2 and e4[-1] > e4[-2]):
-        before = data[-3] if len(data) >= 3 else None
-        if before is None or before['value'] < WIN_TARGET:
-            return ('alert200', 4)
-
-    # S3: 2 consecutivos ≥2.00 + EMAs alineadas + anterior <2.00
-    if (len(data) >= 2
-            and data[-1]['value'] >= WIN_TARGET
-            and data[-2]['value'] >= WIN_TARGET
-            and cur_e4 > cur_e8 > cur_e20):
-        before = data[-3] if len(data) >= 3 else None
-        if before is None or before['value'] < WIN_TARGET:
-            return ('alert200', 3)
-
-    # S2: patrón V + precio sobre las 3 EMAs
-    if len(pos) >= 3:
-        a, b, c = pos[-3], pos[-2], pos[-1]
-        if (abs(a - c) <= 1 and b > a
-                and cur_pos > cur_e4
-                and cur_pos > cur_e8
-                and cur_pos > cur_e20):
-            return ('alert200', 2)
-
-    # S1: EMA8 cruza por encima de EMA20
-    if len(e8) >= 2 and prv_e8 <= prv_e20 and cur_e8 > cur_e20:
-        return ('alert200', 1)
-
-    return None
+def is_consistent_uptrend(positions: list, n: int) -> bool:
+    """
+    Wabe ↑: n velas alcistas consecutivas en el array de posiciones.
+    Equivalente a isConsistentUptrend(datos, n) del HTML.
+    """
+    if len(positions) < n + 1:
+        return False
+    for i in range(len(positions) - n, len(positions)):
+        if positions[i] <= positions[i - 1]:
+            return False
+    return True
 
 
 # ─── SESIÓN GLOBAL ────────────────────────────────────────────────────────────
@@ -363,12 +377,16 @@ class GlobalSession:
         self.base_bet = BASE_BET
         self.state    = self.IDLE
 
-        self.scale   = 1
         self.col     = 1
         self.attempt = 1
         self.lost    = 0.0
         self.cur_bet = BASE_BET
 
+        # ── Contadores de ciclo actual ─────────────────────────────────────────
+        self.entries_in_cycle = 0   # entradas jugadas en el ciclo actual (máx MAX_COLS)
+        self.wins_in_cycle    = 0   # victorias acumuladas en el ciclo actual (meta WINS_PER_CYCLE)
+
+        # ── Contadores globales de sesión ──────────────────────────────────────
         self.entries = 0
         self.wins    = 0
         self.losses  = 0
@@ -379,7 +397,7 @@ class GlobalSession:
 
         # Historial de fichas completas (se preserva entre ciclos via carry_fichas)
         self.fichas: list = carry_fichas if carry_fichas is not None else []
-        self._cur_ficha: dict = None   # ficha en curso (abarca C1→C2→C3 si fuera necesario)
+        self._cur_ficha: dict = None   # ficha en curso (abarca C1→C2→... si hubiera pérdidas)
 
     def start_ficha(self):
         """Inicia una nueva ficha al recibir señal en columna 1."""
@@ -394,12 +412,18 @@ class GlobalSession:
         """
         Retorna (tipo, bet_amount).
         Tipos: 'win' | 'cycle_win' | 'new_col' | 'cycle_loss'
-        Con 1 intento por columna: si falla, avanza directamente a la siguiente columna.
-        Actualiza la ficha activa con el gasto real de cada columna.
+
+        Lógica de ciclo:
+          - Un ciclo tiene MAX_COLS (12) entradas en total.
+          - Se necesitan WINS_PER_CYCLE (4) victorias dentro de esas 12 entradas.
+          - Un win resetea col a 1 y la apuesta a base_bet, pero el ciclo continúa.
+          - Al alcanzar 4 victorias → cycle_win.
+          - Al agotar las 12 entradas sin 4 victorias → cycle_loss.
         """
-        self.entries += 1
+        self.entries          += 1
+        self.entries_in_cycle += 1
         prev_bet = self.cur_bet
-        prev_col = self.col   # columna activa ANTES de que on_result la cambie
+        prev_col = self.col
 
         # Acumular gasto en la columna correspondiente de la ficha activa
         if self._cur_ficha is not None:
@@ -407,12 +431,12 @@ class GlobalSession:
             self._cur_ficha[col_key] = self._cur_ficha.get(col_key, 0.0) + prev_bet
 
         if win:
-            self.wins   += 1
+            self.wins         += 1
+            self.wins_in_cycle += 1
             self.lost    = 0.0
             self.cur_bet = self.base_bet
             self.col     = 1
             self.attempt = 1
-            self.scale  += 1
 
             # Cerrar ficha como ganada
             if self._cur_ficha is not None:
@@ -422,9 +446,12 @@ class GlobalSession:
             if len(self.fichas) > 100:
                 self.fichas = self.fichas[-100:]
 
-            if self.scale > CYCLE_SIZE:
+            # ¿Ciclo ganado? (4 victorias dentro de las 12 entradas)
+            if self.wins_in_cycle >= WINS_PER_CYCLE:
                 self.state = self.DONE
                 return ('cycle_win', prev_bet)
+
+            # Victoria parcial — el ciclo continúa
             self.state = self.IDLE
             return ('win', prev_bet)
 
@@ -435,8 +462,8 @@ class GlobalSession:
             self.cur_bet  = self.lost + self.base_bet
             self.col     += 1
 
-            if self.col > MAX_COLS:
-                # Ciclo perdido — cerrar ficha como pérdida
+            # ¿Ciclo agotado? (12 entradas sin llegar a 4 victorias)
+            if self.entries_in_cycle >= MAX_COLS:
                 if self._cur_ficha is not None:
                     self._cur_ficha['result'] = 'loss'
                     self.fichas.append(self._cur_ficha)
@@ -446,7 +473,7 @@ class GlobalSession:
                 self.state = self.DONE
                 return ('cycle_loss', prev_bet)
 
-            # Avanzar a siguiente columna — la ficha continúa abierta
+            # Avanzar a siguiente columna — el ciclo continúa
             self.state = self.IDLE
             return ('new_col', prev_bet)
 
@@ -459,10 +486,10 @@ class GlobalSession:
 
         return (
             f"📡 Estado: {estado_txt}\n"
-            f"🎯 Señal: `{min(self.scale, CYCLE_SIZE)}/{CYCLE_SIZE}`\n"
+            f"🎯 Ciclo: `{self.wins_in_cycle}/{WINS_PER_CYCLE}` victorias | `{self.entries_in_cycle}/{MAX_COLS}` entradas\n"
             f"📍 Col: `{self.col}/{MAX_COLS}`\n"
             f"💵 Próxima apuesta: `${self.cur_bet:.2f}`\n"
-            f"📈 G/P: `{self.wins}/{self.losses}`"
+            f"📈 G/P sesión: `{self.wins}/{self.losses}`"
         )
 
 
@@ -475,14 +502,15 @@ def reset_global_session():
     global g_session
     old_fichas = list(g_session.fichas)   # preservar historial completo
     g_session  = GlobalSession(carry_fichas=old_fichas)
-    logger.info("🔄 Sesión global reiniciada — fichas preservadas")
+    logger.info("🔄 Sesión global reiniciada — fichas preservadas, ciclo en 0")
 
 
 # ─── PROCESADOR DE MULTIPLICADORES ───────────────────────────────────────────
 async def process_multiplier(value: float, round_id: str):
     global g_signal_state, g_signal_type, g_signal_strictness, g_signal_trigger_mult
-    global g_positions, g_ema4, g_ema8, g_ema20, g_mults, g_seen_ids
+    global g_positions, g_ema3, g_ema4, g_ema8, g_ema20, g_mults, g_seen_ids
     global g_trend_favorable, g_session
+    global g_cooldown_ema, g_cooldown_doble, g_cooldown_wabe, g_pending_doble_piso
 
     logger.info(
         f"🎲 {value:.2f}x | ID: {round_id} | "
@@ -507,6 +535,38 @@ async def process_multiplier(value: float, round_id: str):
         g_signal_type       = None
         g_signal_strictness = 0
 
+    # ── FASE 2: Confirmación de Doble Piso (antes de actualizar posiciones) ──
+    # Si el tick anterior detectó un Doble Piso, este valor < 2x lo confirma
+    # y dispara la señal de entrada (el SIGUIENTE tick será el resultado).
+    _doble_confirmed = False
+    if g_pending_doble_piso:
+        g_pending_doble_piso = False   # consumir flag siempre
+        if value < 2.00 and g_signal_state == 'idle' and g_session.state == GlobalSession.IDLE:
+            required_s = min(3, (g_session.col + 1) // 2)
+            if 2 >= required_s:   # Doble Piso es S2
+                if g_session.col > 1:
+                    proceed = True
+                else:
+                    stats_now = get_quota_stats(200)
+                    proceed   = (stats_now['total'] == 0) or (stats_now['favorable'] is not False)
+                if proceed:
+                    g_signal_state        = 'evaluating'
+                    g_signal_type         = 'Doble Piso'
+                    g_signal_strictness   = 2
+                    g_signal_trigger_mult = value
+                    g_session.signal_trigger_mult = value
+                    g_session.state = GlobalSession.EVALUATING
+                    if g_session.col == 1:
+                        g_session.start_ficha()
+                    logger.info(f"✅ Doble Piso confirmado ({value:.2f}x < 2x) — señal S2 Col{g_session.col}")
+                    await _send_signal(value, 'Doble Piso', 2)
+                    _doble_confirmed = True
+
+    # ── FASE 2.5: Decrementar cooldowns (igual que el HTML) ──────────────────
+    g_cooldown_ema   = max(0, g_cooldown_ema   - 1)
+    g_cooldown_doble = max(0, g_cooldown_doble - 1)
+    g_cooldown_wabe  = max(0, g_cooldown_wabe  - 1)
+
     # ── FASE 3: Actualizar datos y EMAs ───────────────────────────────────────
     global _persist_counter
     increment = 1 if value >= WIN_TARGET else -1
@@ -518,13 +578,15 @@ async def process_multiplier(value: float, round_id: str):
         g_mults[:]     = g_mults[-TRIM_MULTS:]
         g_positions[:] = g_positions[-TRIM_MULTS:]
         logger.info(f"✂️ Datos recortados a {TRIM_MULTS} registros")
-        save_mults_to_disk()   # Guardar siempre que se recorta
+        save_mults_to_disk()
     else:
         _persist_counter += 1
         if _persist_counter >= 10:
             _persist_counter = 0
-            save_mults_to_disk()   # Guardar cada 10 multiplicadores nuevos
+            save_mults_to_disk()
 
+    # EMAs actualizadas (incluyen el valor actual, igual que el HTML)
+    g_ema3  = calc_ema(g_positions, 3)
     g_ema4  = calc_ema(g_positions, 4)
     g_ema8  = calc_ema(g_positions, 8)
     g_ema20 = calc_ema(g_positions, 20)
@@ -542,17 +604,55 @@ async def process_multiplier(value: float, round_id: str):
             g_trend_favorable = new_fav
             asyncio.create_task(broadcast_trend_change(new_fav))
 
-    # ── FASE 4: Detectar nueva señal ─────────────────────────────────────────
-    if g_signal_state == 'idle' and g_session.state == GlobalSession.IDLE:
-        sig_result = check_moderate_signal()
-        if sig_result:
-            sig_type, strictness = sig_result
-            # Restricción escalonada cada 2 columnas:
-            # Col 1-2 → S1+ | Col 3-4 → S2+ | Col 5-6 → S3+ | Col 7-12 → S4+
-            required_strictness = min(4, (g_session.col + 1) // 2)
+    # ── FASE 4: Detectar nueva señal (sistema HTML Aviamex) ──────────────────
+    # Solo detecta si no se disparó Doble Piso en FASE 2 y el bot está en reposo
+    if not _doble_confirmed and g_signal_state == 'idle' and g_session.state == GlobalSession.IDLE:
+
+        sig_type: Optional[str] = None
+        strictness: int = 0
+
+        # ── Snapshots EMA3 / EMA4 (iguales a snap del HTML) ──────────────────
+        e3_cross_up = e3_cross_down = False
+        if len(g_ema3) >= 2 and len(g_ema4) >= 2:
+            e3_prev, e3_last = g_ema3[-2], g_ema3[-1]
+            e4_prev, e4_last = g_ema4[-2], g_ema4[-1]
+            e3_cross_up   = (e3_prev - e4_prev) <= 0 and (e3_last - e4_last) > 0
+            e3_cross_down = (e3_prev - e4_prev) >= 0 and (e3_last - e4_last) < 0
+
+        # ── Señal S3 — EMA3↑EMA4 ─────────────────────────────────────────────
+        # Cruce alcista + valor actual ≥ 2.00x + cooldown agotado
+        if e3_cross_up and value >= 2.00 and g_cooldown_ema == 0:
+            sig_type  = 'EMA3↑EMA4'
+            strictness = 3
+            g_cooldown_ema = SIGNAL_COOLDOWN
+
+        # ── EMA crossdown: invalida Doble Piso pendiente ──────────────────────
+        # (si en el tick anterior se detectó el patrón W pero EMA confirma bajada)
+        if e3_cross_down and g_pending_doble_piso:
+            g_pending_doble_piso = False
+            logger.debug("EMA3↓EMA4 — Doble Piso pendiente cancelado")
+
+        # ── Detectar patrón Doble Piso (W) → flag para SIGUIENTE tick ────────
+        if sig_type is None and g_cooldown_doble == 0 and not g_pending_doble_piso:
+            if detect_double_bottom(g_positions):
+                g_pending_doble_piso = True
+                g_cooldown_doble = SIGNAL_COOLDOWN
+                logger.debug("Doble Piso detectado — esperando confirmación (next tick < 2x)")
+
+        # ── Señal S1 — Wabe ↑ ────────────────────────────────────────────────
+        # 3 velas alcistas consecutivas en posiciones + cooldown agotado
+        if sig_type is None and g_cooldown_wabe == 0:
+            if is_consistent_uptrend(g_positions, 3):
+                sig_type   = 'Wabe ↑'
+                strictness = 1
+                g_cooldown_wabe = SIGNAL_COOLDOWN
+
+        # ── Disparar señal si aplica ──────────────────────────────────────────
+        if sig_type is not None:
+            # Restricción escalonada (capped a S3 porque solo hay 3 tipos):
+            # Col 1-2 → S1+ | Col 3-4 → S2+ | Col 5+ → S3+
+            required_strictness = min(3, (g_session.col + 1) // 2)
             if strictness >= required_strictness:
-                # Col > 1 → ficha en curso, continuar SIEMPRE sin importar tendencia
-                # Col == 1 → nueva ficha, solo si tendencia favorable
                 if g_session.col > 1:
                     proceed = True
                 else:
@@ -567,49 +667,101 @@ async def process_multiplier(value: float, round_id: str):
                     g_session.signal_trigger_mult = value
                     g_session.state = GlobalSession.EVALUATING
 
-                    # Iniciar nueva ficha solo al arrancar desde columna 1
                     if g_session.col == 1:
                         g_session.start_ficha()
 
-                    logger.info(f"🚀 SEÑAL S{strictness} (req≥S{required_strictness}) Col{g_session.col} | Trigger: {value:.2f}x")
-                    await _send_signal(value, strictness)
+                    logger.info(
+                        f"🚀 SEÑAL {sig_type} (S{strictness}, req≥S{required_strictness}) "
+                        f"Col{g_session.col} | Trigger: {value:.2f}x"
+                    )
+                    await _send_signal(value, sig_type, strictness)
+
 
 
 # ─── MARCADOR DIARIO ──────────────────────────────────────────────────────────
 def _check_daily_reset():
-    """Resetea el marcador diario a las 00:00 hora Argentina."""
+    """
+    Resetea el marcador diario a las 00:00 hora Argentina.
+    El último mensaje de marcador del día anterior se DEJA publicado (no se borra).
+    Se anula el ID guardado para que el próximo resultado envíe un mensaje nuevo.
+    """
     global g_daily_wins, g_daily_losses, g_daily_date
+    global g_daily_cycles_won, g_daily_cycles_lost, g_scoreboard_msg_id
     now_arg  = datetime.utcnow() - timedelta(hours=3)
     today    = now_arg.strftime("%Y-%m-%d")
     if today != g_daily_date:
-        g_daily_wins   = 0
-        g_daily_losses = 0
-        g_daily_date   = today
+        g_daily_wins        = 0
+        g_daily_losses      = 0
+        g_daily_cycles_won  = 0
+        g_daily_cycles_lost = 0
+        g_daily_date        = today
+        g_scoreboard_msg_id = None   # Próximo marcador será un mensaje nuevo
         logger.info(f"📅 Marcador diario reseteado para {today}")
 
 
 async def _broadcast_scoreboard():
-    """Envía el marcador diario a todos los chats."""
-    total = g_daily_wins + g_daily_losses
-    pct   = (g_daily_wins / total * 100) if total > 0 else 0.0
-    txt   = (
-        f"📊 *MARCADOR DIARIO:*\n"
-        f"✅ GANADAS: `{g_daily_wins}`\n"
+    """
+    Borra el marcador diario anterior y envía uno nuevo actualizado.
+    Muestra señales ganadas/perdidas Y ciclos exitosos/fallidos.
+    """
+    global g_scoreboard_msg_id
+
+    # ── Estadísticas de señales ────────────────────────────────────────────────
+    total_sig = g_daily_wins + g_daily_losses
+    pct_sig   = (g_daily_wins / total_sig * 100) if total_sig > 0 else 0.0
+
+    # ── Estadísticas de ciclos ─────────────────────────────────────────────────
+    total_cyc = g_daily_cycles_won + g_daily_cycles_lost
+    pct_cyc   = (g_daily_cycles_won / total_cyc * 100) if total_cyc > 0 else 0.0
+
+    hora = argentina_time()
+    txt  = (
+        f"📊 *MARCADOR DIARIO* — {hora}\n"
+        f"━━━━━━━━━━━━━━━━━━━━━━━\n"
+        f"✅ GANADAS:  `{g_daily_wins}`\n"
         f"❌ PERDIDAS: `{g_daily_losses}`\n"
-        f"📈 ACIERTOS = `{pct:.2f}%`"
+        f"📈 ACIERTOS: `{pct_sig:.1f}%`\n"
+        f"━━━━━━━━━━━━━━━━━━━━━━━\n"
+        f"🔄 *CICLOS DEL DÍA* — Necesitan 4 victorias en 12 entradas\n"
+        f"🏆 Exitosos: `{g_daily_cycles_won}`\n"
+        f"💥 Fallidos: `{g_daily_cycles_lost}`\n"
+        f"📊 Efectividad: `{pct_cyc:.1f}%`"
     )
-    await broadcast(txt, parse_mode='Markdown')
+
+    # Borrar marcador anterior si existe
+    if g_scoreboard_msg_id:
+        try:
+            await bot.delete_message(CHANNEL_ID, g_scoreboard_msg_id)
+            logger.info(f"🗑️ Marcador anterior borrado (msg_id: {g_scoreboard_msg_id})")
+        except Exception as e:
+            logger.warning(f"No se pudo borrar marcador anterior: {e}")
+        g_scoreboard_msg_id = None
+
+    # Enviar marcador actualizado
+    try:
+        sent = await bot.send_message(CHANNEL_ID, txt, parse_mode='Markdown')
+        g_scoreboard_msg_id = sent.message_id
+        logger.info(f"📊 Marcador diario enviado (msg_id: {sent.message_id})")
+    except Exception as e:
+        logger.warning(f"Error enviando marcador diario: {e}")
 
 
 # ─── MENSAJERÍA ───────────────────────────────────────────────────────────────
-async def _send_signal(trigger: float, strictness: int):
-    """Broadcast de señal al canal."""
+async def _send_signal(trigger: float, signal_name: str, strictness: int):
+    """Broadcast de señal al canal con nombre y probabilidad del sistema HTML."""
+    prob_map = {'EMA3↑EMA4': 78, 'Doble Piso': 72, 'Wabe ↑': 62}
+    prob = prob_map.get(signal_name, 60)
     txt = (
+        f"🎯 *SEÑAL 2x DETECTADA*\n"
+        f"━━━━━━━━━━━━━━━━━━━━━━━\n"
+        f"📊 Tipo: `{signal_name}` — {prob}%\n"
         f"🚨 Entrar después de: `{trigger:.2f}x`\n"
-        f"💎 Señal para `2.00x`\n"
-        f"🎯 S{strictness} | Col `{g_session.col}/{MAX_COLS}`"
+        f"💎 Objetivo: `2.00x`\n"
+        f"📍 S{strictness} | Col `{g_session.col}/{MAX_COLS}` | "
+        f"Ciclo `{g_session.wins_in_cycle}/{WINS_PER_CYCLE}` victorias | "
+        f"`{g_session.entries_in_cycle}/{MAX_COLS}` entradas"
     )
-    await broadcast_signal(txt)   # Guarda ID para referencia
+    await broadcast_signal(txt)   # Guarda ID para borrado al resolverse
 
 
 async def _check_trend_after_cycle():
@@ -624,43 +776,62 @@ async def _check_trend_after_cycle():
 async def _dispatch_result(value: float, tipo: str, bet: float, attempt_num: int):
     """
     Broadcast del resultado al canal.
-    Sistema de 12 columnas, 1 intento por columna.
+    Borra el mensaje de señal antes de publicar el resultado.
+    Sistema de 12 entradas por ciclo, 4 victorias = ciclo ganado.
     """
-    global g_session, g_daily_wins, g_daily_losses
+    global g_session, g_daily_wins, g_daily_losses, g_daily_cycles_won, g_daily_cycles_lost
 
-    # ── WIN ───────────────────────────────────────────────────────────────────
-    if tipo in ('win', 'cycle_win'):
+    # Borrar el mensaje de señal (ya fue resuelta)
+    await delete_last_signal()
+
+    # ── WIN (victoria parcial dentro del ciclo) ───────────────────────────────
+    if tipo == 'win':
         g_daily_wins += 1
-        txt = f"✅ WIN — `{value:.2f}x`"
-        await broadcast(txt, parse_mode='Markdown')
-        await _broadcast_scoreboard()
-        if tipo == 'cycle_win':
-            await broadcast(
-                "🏆 *¡CICLO COMPLETO — 10 señales exitosas!*\n"
-                "🔄 _Sesión reiniciada automáticamente_",
-                parse_mode='Markdown'
-            )
-            reset_global_session()
-            await _check_trend_after_cycle()
-        return
-
-    # ── LOSS: avanzar columna ─────────────────────────────────────────────────
-    if tipo == 'new_col':
-        g_daily_losses += 1
         txt = (
-            f"❌ LOSS — `{value:.2f}x`\n"
-            f"📍 _Avanzando a Columna `{g_session.col}/{MAX_COLS}`..._"
+            f"✅ *WIN* — `{value:.2f}x`\n"
+            f"🎯 Ciclo: `{g_session.wins_in_cycle}/{WINS_PER_CYCLE}` victorias | "
+            f"`{g_session.entries_in_cycle}/{MAX_COLS}` entradas"
         )
         await broadcast(txt, parse_mode='Markdown')
         await _broadcast_scoreboard()
         return
 
-    # ── LOSS: ciclo completo perdido ──────────────────────────────────────────
-    if tipo == 'cycle_loss':
+    # ── CYCLE WIN (4 victorias completadas) ───────────────────────────────────
+    if tipo == 'cycle_win':
+        g_daily_wins       += 1
+        g_daily_cycles_won += 1
+        txt = f"✅ *WIN* — `{value:.2f}x`"
+        await broadcast(txt, parse_mode='Markdown')
+        await _broadcast_scoreboard()
+        await broadcast(
+            f"🏆 *¡CICLO GANADO — {WINS_PER_CYCLE} victorias en {MAX_COLS} entradas!*\n"
+            "🔄 _Sesión reiniciada automáticamente_",
+            parse_mode='Markdown'
+        )
+        reset_global_session()
+        await _check_trend_after_cycle()
+        return
+
+    # ── LOSS: avanzar columna (ciclo continúa) ────────────────────────────────
+    if tipo == 'new_col':
         g_daily_losses += 1
         txt = (
-            f"❌ LOSS — `{value:.2f}x`\n"
-            f"⚠️ *CICLO TERMINADO — {MAX_COLS} Columnas Fallidas*\n"
+            f"❌ *LOSS* — `{value:.2f}x`\n"
+            f"📍 _Columna `{g_session.col}/{MAX_COLS}` | "
+            f"Ciclo `{g_session.wins_in_cycle}/{WINS_PER_CYCLE}` victorias | "
+            f"`{g_session.entries_in_cycle}/{MAX_COLS}` entradas_"
+        )
+        await broadcast(txt, parse_mode='Markdown')
+        await _broadcast_scoreboard()
+        return
+
+    # ── CYCLE LOSS (12 entradas agotadas sin 4 victorias) ─────────────────────
+    if tipo == 'cycle_loss':
+        g_daily_losses      += 1
+        g_daily_cycles_lost += 1
+        txt = (
+            f"❌ *LOSS* — `{value:.2f}x`\n"
+            f"⚠️ *CICLO PERDIDO — {MAX_COLS} entradas sin {WINS_PER_CYCLE} victorias*\n"
             "🔄 _Sesión reiniciada automáticamente_"
         )
         await broadcast(txt, parse_mode='Markdown')
@@ -842,9 +1013,9 @@ async def cmd_start(message):
         "━━━━━━━━━━━━━━━━━━━━━━━\n"
         "🤖 *Bot de Señales Spaceman*\n"
         "📊 Sistema Moderado | Objetivo: `2.00x`\n"
-        "🔄 Gestión: 12 Columnas × 1 Intento\n"
+        f"🔄 Gestión: `{MAX_COLS}` Entradas × `{WINS_PER_CYCLE}` Victorias/Ciclo\n"
         f"💵 Apuesta base fija: `${BASE_BET:.2f}`\n"
-        "🏆 Ciclo: 10 señales exitosas\n"
+        f"🏆 Ciclo: `{WINS_PER_CYCLE}` victorias en `{MAX_COLS}` entradas\n"
         "━━━━━━━━━━━━━━━━━━━━━━━\n"
         f"{data_info}\n\n"
         "━━━━━━━━━━━━━━━━━━━━━━━\n"
