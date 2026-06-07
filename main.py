@@ -706,12 +706,12 @@ async def _broadcast_scoreboard():
     txt = (
         f"📆 *MARCADOR DEL DÍA* — 🕐 {hora}\n"
         f"┄┄┄┄┄┄┄┄┄┄┄┄┄┄┄┄┄┄┄┄┄┄┄\n"
-        f"✅ Ganadas: {g_daily_wins}\n"
-        f"❌ Perdidas: {g_daily_losses}\n"
-        f"📈 Acierto: {pct_sig:.1f}%\n"
+        f"✅ Ganadas:   {g_daily_wins}\n"
+        f"❌ Perdidas:  {g_daily_losses}\n"
+        f"📈 Acierto:   {pct_sig:.1f}%\n"
         f"┄┄┄┄┄┄┄┄┄┄┄┄┄┄┄┄┄┄┄┄┄┄┄\n"
-        f"🔄 Ciclos {MAX_COLS} entradas · {WINS_PER_CYCLE} victorias\n"
-        f"✅ Ganados: {g_daily_cycles_won}\n"
+        f"🔄 Ciclos  {MAX_COLS} entradas · {WINS_PER_CYCLE} victorias\n"
+        f"✅ Ganados:  {g_daily_cycles_won}\n"
         f"❌ Perdidos: {g_daily_cycles_lost}\n"
         f"📈 Acierto: {pct_cyc:.1f}%"
     )
@@ -742,7 +742,7 @@ async def _send_signal(trigger: float, signal_name: str, strictness: int):
     ents = g_session.entries_in_cycle + 1   # número de entrada que se va a jugar
     wins = g_session.wins_in_cycle
 
-    ents_bar = '⚫' * MAX_COLS           # 7 círculos negros (slots del ciclo)
+    ents_bar = '⚫' * (ents - 1) + '🔵' + '⚫' * (MAX_COLS - ents)
     wins_bar = '⚪' * WINS_PER_CYCLE     # 2 círculos blancos (victorias meta)
 
     # Etiqueta de señal para log interno
