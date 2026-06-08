@@ -56,8 +56,8 @@ BASE_BET       = 0.10  # Apuesta base fija (USD)
 # ── Umbrales de tendencia (detección favorable/desfavorable) ──────────────────
 # Desfavorable si: cuotas 1.00-1.99x superan THRESH_LOW_MAX
 #              O si: cuotas 2.00-4.99x caen por debajo de THRESH_MID_MIN
-THRESH_LOW_MAX = 52.0  # % máximo permitido para cuotas 1.00-1.99x
-THRESH_MID_MIN = 29.0  # % mínimo requerido para cuotas 2.00-4.99x
+THRESH_LOW_MAX = 54.0  # % máximo permitido para cuotas 1.00-1.99x
+THRESH_MID_MIN = 28.0  # % mínimo requerido para cuotas 2.00-4.99x
 
 # ── Parámetros internos ───────────────────────────────────────────────────────
 MAX_MULTS  = 400
@@ -81,28 +81,12 @@ g_ema20: list     = []
 #   S2 (C3,C4)   → rojo anterior + última verde     ("Posible zona de entrada")
 #   S3 (C5,C6,C7)→ última verde + promedio últimas 3 > promedio 10 ("Tendencia alcista activa")
 SIGNAL_COOLDOWN = 6   # ticks mínimos entre señales para evitar spam
-                      # (mínimo 1 multiplicador adicional de espera post-señal — ver FASE 2)
 g_cooldown_mod  = 0   # cooldown único para el sistema moderado
 
 g_signal_state        = 'idle'     # 'idle' | 'evaluating' | 'so'
 g_signal_type: Optional[str] = None
 g_signal_strictness: int     = 0
 g_signal_trigger_mult: float = 0.0
-
-
-# ─── RESTRICCIÓN DE SEÑALES POR COLUMNA (Estrategia Dinero Real) ──────────────
-# Maestro HTML (analyzeTrend) → verde: valor ≥ 2.00x, rojo: valor < 2.00x
-#   C1, C2      → nivel 1 (S1): "Zona de entrada detectada" (streak>=3 rojas + verde)
-#   C3, C4      → nivel 2 (S2): "Posible zona de entrada"   (rojo anterior + verde)
-#   C5, C6, C7  → nivel 3 (S3): "Tendencia alcista activa"  (verde + avg3 > avg10)
-def signal_level_for_col(col: int) -> int:
-    """Retorna el nivel de señal requerido para la columna activa (1, 2 o 3)."""
-    if col <= 2:
-        return 1
-    elif col <= 4:
-        return 2
-    else:
-        return 3
 
 g_all_chats: set              = set()   # Todos los chats que alguna vez enviaron /start
 g_trend_favorable: Optional[bool] = None
@@ -349,65 +333,44 @@ def quota_stats_text(stats: dict) -> str:
 
 
 # ─── DETECCIÓN DE SEÑALES — MAESTRO HTML (analyzeTrend risk:'low') ───────────
-def check_moderate_signal(
-    positions: list,
-    ema4: list, ema8: list, ema20: list,
-    data: list,
-    level: int
-) -> bool:
+def check_html_signal(data: list) -> Tuple[bool, Optional[str], Optional[int]]:
     """
-    Detecta señales de entrada basadas en la lógica del HTML Maestro
-    (función analyzeTrend, condiciones con risk:'low').
-    Trabaja con los últimos 10 multiplicadores de 'data'.
-    Umbral verde: value >= 2.00x.
+    Detecta señales de entrada basadas estrictamente en la función analyzeTrend
+    del archivo Maestro.html (incluyendo el comportamiento actual donde la condición
+    S1 nunca se activa debido a cómo se calcula 'streak').
 
-    level 1 (S1, C1-C2) → "Zona de entrada detectada":
-        streak >= 3 valores < 2x seguidos, y el último >= 2x.
-    level 2 (S2, C3-C4) → "Posible zona de entrada":
-        penúltimo < 2x y último >= 2x (reversión detectada).
-    level 3 (S3, C5-C7) → "Tendencia alcista activa":
-        último >= 2x y promedio últimas 3 > promedio últimas 10.
+    Retorna (señal_detectada, tipo_señal, nivel)
     """
     if len(data) < 3:
-        return False
+        return False, None, None
 
+    # Tomar los últimos 10 multiplicadores (o todos si son menos)
     recent = data[-10:] if len(data) >= 10 else data[:]
-    vals   = [d['value'] for d in recent]
+    vals = [d['value'] for d in recent]   # índice 0 = más reciente
 
-    # 'vals' ordenado del más reciente al más antiguo (igual que HTML results[])
-    vals_rev = list(reversed(vals))   # vals_rev[0] = último recibido
+    total = len(vals)
+    avg = sum(vals) / total
+    last3avg = sum(vals[:3]) / 3 if total >= 3 else avg
+    last_is_green = vals[0] >= 2.0
+    second_last = vals[1] if total > 1 else vals[0]
 
-    last_val    = vals_rev[0]
-    second_last = vals_rev[1] if len(vals_rev) > 1 else last_val
-    last_is_green = last_val >= 2.0
-
-    # Racha de valores < 2x antes del último
+    # Cálculo de racha (streak) IDÉNTICO al HTML: cuenta cuántos valores <2.0
+    # consecutivos desde el más reciente, incluyendo el último (si es rojo).
     streak = 0
-    for v in vals_rev[1:]:
+    for v in vals:
         if v >= 2.0:
             break
         streak += 1
 
-    if level == 1:
-        # ── S1: streak >= 3 rojas + última verde ("Zona de entrada detectada") ─
-        if streak >= 3 and last_is_green:
-            return True
+    # Condiciones de riesgo bajo en el orden del HTML
+    if streak >= 3 and last_is_green:
+        return True, 'Mod_S1', 1
+    if second_last < 2.0 and last_is_green:
+        return True, 'Mod_S2', 2
+    if last_is_green and last3avg > avg:
+        return True, 'Mod_S3', 3
 
-    elif level == 2:
-        # ── S2: penúltimo rojo + última verde ("Posible zona de entrada") ──────
-        if second_last < 2.0 and last_is_green:
-            return True
-
-    elif level == 3:
-        # ── S3: última verde + promedio últimas 3 > promedio últimas 10 ─────────
-        # ("Tendencia alcista activa")
-        if last_is_green and len(vals_rev) >= 3:
-            avg_all  = sum(vals_rev) / len(vals_rev)
-            avg_last3 = sum(vals_rev[:3]) / 3
-            if avg_last3 > avg_all:
-                return True
-
-    return False
+    return False, None, None
 
 
 # ─── SESIÓN GLOBAL ────────────────────────────────────────────────────────────
@@ -630,53 +593,32 @@ async def process_multiplier(value: float, round_id: str):
     # ── FASE 4: Detectar nueva señal — Maestro HTML (analyzeTrend risk:'low') ─
     # Las señales se bloquean cuando la tendencia es desfavorable y se
     # desbloquean automáticamente cuando vuelve a ser favorable.
-    # g_trend_favorable = None  → aún sin datos suficientes (no emitir)
-    # g_trend_favorable = False → tendencia desfavorable (bloqueado)
-    # g_trend_favorable = True  → tendencia favorable (activo)
     if (g_signal_state == 'idle'
             and g_session.state == GlobalSession.IDLE
             and g_cooldown_mod == 0
             and g_trend_favorable is True):
 
-        level     = signal_level_for_col(g_session.col)
-        sig_type  = None
-        strictness = 0
+        # Detectar señal usando la lógica exacta del HTML
+        signal_detected, sig_type, strictness = check_html_signal(g_mults)
 
-        # Gráfica Moderada AMX 2x (checkModerateAlerts del HTML)
-        if check_moderate_signal(g_positions, g_ema4, g_ema8, g_ema20, g_mults, level):
-            sig_names  = {1: 'Mod_S1', 2: 'Mod_S2', 3: 'Mod_S3'}
-            sig_type   = sig_names[level]
-            strictness = level
+        if signal_detected:
+            # No hay filtro decimal: se emite la señal inmediatamente
+            g_signal_state        = 'evaluating'
+            g_signal_type         = sig_type
+            g_signal_strictness   = strictness
+            g_signal_trigger_mult = value
+            g_session.signal_trigger_mult = value
+            g_session.state       = GlobalSession.EVALUATING
+            g_cooldown_mod        = SIGNAL_COOLDOWN
 
-        if sig_type is not None:
-            # ── Filtro decimal: solo se emite señal si el decimal del
-            #    multiplicador activador es >= 0.51.
-            #    Ejemplos válidos:   1.54x, 3.79x, 10.57x  (decimal >= 0.51)
-            #    Ejemplos descartados: 1.15x, 2.49x, 5.32x  (decimal < 0.51)
-            decimal_part = round(value % 1, 2)
-            if decimal_part < 0.51:
-                logger.info(
-                    f"🚫 Señal {sig_type} DESCARTADA — decimal {decimal_part:.2f} < 0.51 "
-                    f"(Trigger: {value:.2f}x) — sin cooldown, sigue buscando"
-                )
-            else:
-                g_signal_state        = 'evaluating'
-                g_signal_type         = sig_type
-                g_signal_strictness   = strictness
-                g_signal_trigger_mult = value
-                g_session.signal_trigger_mult = value
-                g_session.state       = GlobalSession.EVALUATING
-                g_cooldown_mod        = SIGNAL_COOLDOWN
+            if g_session.col == 1:
+                g_session.start_ficha()
 
-                if g_session.col == 1:
-                    g_session.start_ficha()
-
-                logger.info(
-                    f"🎯 SEÑAL {sig_type} "
-                    f"Col{g_session.col} | Trigger: {value:.2f}x | Decimal: {decimal_part:.2f} ✅"
-                )
-                await _send_signal(value, sig_type, strictness)
-
+            logger.info(
+                f"🎯 SEÑAL {sig_type} "
+                f"Col{g_session.col} | Trigger: {value:.2f}x"
+            )
+            await _send_signal(value, sig_type, strictness)
 
 
 # ─── MARCADOR DIARIO ──────────────────────────────────────────────────────────
