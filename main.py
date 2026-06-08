@@ -2,6 +2,7 @@
 """
 ╔══════════════════════════════════════════════════╗
 ║   SPACEMAN BOT — Sistema Moderado 2.00x         ║
+║   Señales: Maestro HTML (analyzeTrend)          ║
 ║   WebSocket en tiempo real | Sesión Global      ║
 ╚══════════════════════════════════════════════════╝
 """
@@ -55,8 +56,8 @@ BASE_BET       = 0.10  # Apuesta base fija (USD)
 # ── Umbrales de tendencia (detección favorable/desfavorable) ──────────────────
 # Desfavorable si: cuotas 1.00-1.99x superan THRESH_LOW_MAX
 #              O si: cuotas 2.00-4.99x caen por debajo de THRESH_MID_MIN
-THRESH_LOW_MAX = 51.0  # % máximo permitido para cuotas 1.00-1.99x
-THRESH_MID_MIN = 29.0  # % mínimo requerido para cuotas 2.00-4.99x
+THRESH_LOW_MAX = 54.0  # % máximo permitido para cuotas 1.00-1.99x
+THRESH_MID_MIN = 28.0  # % mínimo requerido para cuotas 2.00-4.99x
 
 # ── Parámetros internos ───────────────────────────────────────────────────────
 MAX_MULTS  = 400
@@ -74,12 +75,13 @@ g_ema4:  list     = []
 g_ema8:  list     = []
 g_ema20: list     = []
 
-# ── Sistema de señales — Gráfica Moderada AMX 2x ─────────────────────────────
-# Tres niveles según la columna activa (estrategia dinero real):
-#   S1 (C1,C2)   → condiciones alerta150: rebote EMA4↑EMA8, patrón [-1,-1,-1,+1], soporte
-#   S2 (C3,C4)   → condiciones alerta200: EMA8↑EMA20, consolidación, 2× consecutivos
-#   S3 (C5,C6,C7)→ condición más selectiva: solo cruce EMA8↑EMA20
+# ── Sistema de señales — Maestro HTML (analyzeTrend risk:'low') ──────────────
+# Las señales se basan en la lógica del HTML Maestro:
+#   S1 (C1,C2)   → streak>=3 rojas + última verde  ("Zona de entrada detectada")
+#   S2 (C3,C4)   → rojo anterior + última verde     ("Posible zona de entrada")
+#   S3 (C5,C6,C7)→ última verde + promedio últimas 3 > promedio 10 ("Tendencia alcista activa")
 SIGNAL_COOLDOWN = 6   # ticks mínimos entre señales para evitar spam
+                      # (mínimo 1 multiplicador adicional de espera post-señal — ver FASE 2)
 g_cooldown_mod  = 0   # cooldown único para el sistema moderado
 
 g_signal_state        = 'idle'     # 'idle' | 'evaluating' | 'so'
@@ -89,10 +91,10 @@ g_signal_trigger_mult: float = 0.0
 
 
 # ─── RESTRICCIÓN DE SEÑALES POR COLUMNA (Estrategia Dinero Real) ──────────────
-# Gráfica moderada AMX 2x → posición: +1 si valor ≥ 2.00x, -1 si valor < 2.00x
-#   C1, C2      → nivel 1 (S1): señales alerta150 del HTML moderado
-#   C3, C4      → nivel 2 (S2): señales alerta200 del HTML moderado
-#   C5, C6, C7  → nivel 3 (S3): señal más selectiva (solo cruce EMA8↑EMA20)
+# Maestro HTML (analyzeTrend) → verde: valor ≥ 2.00x, rojo: valor < 2.00x
+#   C1, C2      → nivel 1 (S1): "Zona de entrada detectada" (streak>=3 rojas + verde)
+#   C3, C4      → nivel 2 (S2): "Posible zona de entrada"   (rojo anterior + verde)
+#   C5, C6, C7  → nivel 3 (S3): "Tendencia alcista activa"  (verde + avg3 > avg10)
 def signal_level_for_col(col: int) -> int:
     """Retorna el nivel de señal requerido para la columna activa (1, 2 o 3)."""
     if col <= 2:
@@ -323,30 +325,30 @@ def get_quota_stats(n: int = 200) -> dict:
 def quota_stats_text(stats: dict) -> str:
     """Formatea el bloque de estadísticas de cuotas para Telegram."""
     if stats['total'] == 0:
-        return "<b>📡 Sin datos suficientes para analizar cuotas.</b>\n"
+        return "📡 _Sin datos suficientes para analizar cuotas._\n"
 
     n_label = "200" if stats['has_enough'] else str(stats['total']) + " (acumulando...)"
     r1_flag = " ✅" if stats['pct_100_199'] <= THRESH_LOW_MAX else " ❌"
     r2_flag = " ✅" if stats['pct_200_499'] >= THRESH_MID_MIN else " ❌"
     fav_line = (
-        "<b>✅ ¡TENDENCIA FAVORABLE!</b>\n<b>      Se recomienda operar</b>"
+        "✅ *¡TENDENCIA FAVORABLE!*\n      _Se recomienda operar_"
         if stats['favorable'] else
-        "<b>⚠️ TENDENCIA DESFAVORABLE</b>\n<b>      Se recomienda esperar</b>"
+        "⚠️ *TENDENCIA DESFAVORABLE*\n      _Se recomienda esperar_"
     )
 
     return (
-        f"<b>📈 Análisis de la Tendencia últimos</b>\n"
-        f"<b>      {n_label} multiplicadores</b>\n"
-        f"<b>🔵 Cuotas (1.00-1.99x): {stats['count_100_199']} — {stats['pct_100_199']:.2f}%{r1_flag}</b>\n"
-        f"<b>🟣 Cuotas (2.00-4.99x): {stats['count_200_499']} — {stats['pct_200_499']:.2f}%{r2_flag}</b>\n"
-        f"<b>🟡 Cuotas (5.00-9.99x): {stats['count_500_999']} — {stats['pct_500_999']:.2f}%</b>\n"
-        f"<b>🔴 Cuotas (+10.00x):     {stats['count_1000_plus']} — {stats['pct_1000_plus']:.2f}%</b>\n"
-        "<b> </b>\n"
+        f"📈 *Análisis de la Tendencia últimos*\n"
+        f"      *{n_label} multiplicadores*\n"
+        f"🔵 Cuotas (1.00-1.99x): `{stats['count_100_199']}` — {stats['pct_100_199']:.2f}%{r1_flag}\n"
+        f"🟣 Cuotas (2.00-4.99x): `{stats['count_200_499']}` — {stats['pct_200_499']:.2f}%{r2_flag}\n"
+        f"🟡 Cuotas (5.00-9.99x): `{stats['count_500_999']}` — {stats['pct_500_999']:.2f}%\n"
+        f"🔴 Cuotas (+10.00x):     `{stats['count_1000_plus']}` — {stats['pct_1000_plus']:.2f}%\n"
+        " \n"
         f"{fav_line}\n"
     )
 
 
-# ─── DETECCIÓN DE SEÑALES — GRÁFICA MODERADA AMX 2x ─────────────────────────
+# ─── DETECCIÓN DE SEÑALES — MAESTRO HTML (analyzeTrend risk:'low') ───────────
 def check_moderate_signal(
     positions: list,
     ema4: list, ema8: list, ema20: list,
@@ -354,169 +356,59 @@ def check_moderate_signal(
     level: int
 ) -> bool:
     """
-    Detecta señales del gráfico moderado AMX con umbral 2.00x.
-    Equivalente a checkModerateAlerts() del HTML AMX_V20.
-    Posiciones: +1 si value >= 2.00x | -1 si value < 2.00x.
+    Detecta señales de entrada basadas en la lógica del HTML Maestro
+    (función analyzeTrend, condiciones con risk:'low').
+    Trabaja con los últimos 10 multiplicadores de 'data'.
+    Umbral verde: value >= 2.00x.
 
-    level 1 (S1, C1-C2) → condiciones alerta150: más frecuentes.
-    level 2 (S2, C3-C4) → condiciones alerta200: moderadas.
-    level 3 (S3, C5-C7) → solo cruce EMA8↑EMA20: más selectivo.
+    level 1 (S1, C1-C2) → "Zona de entrada detectada":
+        streak >= 3 valores < 2x seguidos, y el último >= 2x.
+    level 2 (S2, C3-C4) → "Posible zona de entrada":
+        penúltimo < 2x y último >= 2x (reversión detectada).
+    level 3 (S3, C5-C7) → "Tendencia alcista activa":
+        último >= 2x y promedio últimas 3 > promedio últimas 10.
     """
-    if len(data) < 4 or not positions:
+    if len(data) < 3:
         return False
 
-    cur_pos  = positions[-1]
-    cur_e4   = ema4[-1]  if ema4  else cur_pos
-    cur_e8   = ema8[-1]  if ema8  else cur_pos
-    cur_e20  = ema20[-1] if ema20 else cur_pos
-    prev_e4  = ema4[-2]  if len(ema4)  >= 2 else cur_e4
-    prev_e8  = ema8[-2]  if len(ema8)  >= 2 else cur_e8
-    prev_e20 = ema20[-2] if len(ema20) >= 2 else cur_e20
+    recent = data[-10:] if len(data) >= 10 else data[:]
+    vals   = [d['value'] for d in recent]
 
-    soporte = min(positions[-20:]) if len(positions) >= 20 else min(positions)
+    # 'vals' ordenado del más reciente al más antiguo (igual que HTML results[])
+    vals_rev = list(reversed(vals))   # vals_rev[0] = último recibido
+
+    last_val    = vals_rev[0]
+    second_last = vals_rev[1] if len(vals_rev) > 1 else last_val
+    last_is_green = last_val >= 2.0
+
+    # Racha de valores < 2x antes del último
+    streak = 0
+    for v in vals_rev[1:]:
+        if v >= 2.0:
+            break
+        streak += 1
 
     if level == 1:
-        # ── S1: condiciones alerta150 (HTML moderado) ─────────────────────────
-        # Cond 1: patrón [-1,-1,-1,+1] con posición por debajo de EMA4 y EMA8
-        cambios = [1 if d['value'] >= 2.00 else -1 for d in data[-4:]]
-        c1, c2, c3, c4 = cambios
-        if c1 == -1 and c2 == -1 and c3 == -1 and c4 == 1:
-            if cur_pos <= cur_e4 and cur_pos <= cur_e8:
-                return True
-        # Cond 2: EMA4 cruza EMA8 al alza
-        if len(ema4) >= 2 and prev_e4 <= prev_e8 and cur_e4 > cur_e8:
-            return True
-        # Cond 3: rebote desde soporte, posición sobre las 3 EMAs
-        if (cur_pos <= soporte * 1.01
-                and cur_pos > cur_e4
-                and cur_pos > cur_e8
-                and cur_pos > cur_e20):
+        # ── S1: streak >= 3 rojas + última verde ("Zona de entrada detectada") ─
+        if streak >= 3 and last_is_green:
             return True
 
     elif level == 2:
-        # ── S2: condiciones alerta200 (HTML moderado) ─────────────────────────
-        # Cond 1: EMA8 cruza EMA20 al alza
-        if len(ema8) >= 2 and prev_e8 <= prev_e20 and cur_e8 > cur_e20:
+        # ── S2: penúltimo rojo + última verde ("Posible zona de entrada") ──────
+        if second_last < 2.0 and last_is_green:
             return True
-        # Cond 2: consolidación → |a-c| ≤ 1, b > a, posición sobre las 3 EMAs
-        if len(positions) >= 3:
-            a, b, c = positions[-3], positions[-2], positions[-1]
-            if (abs(a - c) <= 1 and b > a
-                    and cur_pos > cur_e4
-                    and cur_pos > cur_e8
-                    and cur_pos > cur_e20):
-                return True
-        # Cond 3: 2 valores >= 2.00x consecutivos + alineación alcista EMAs
-        #         y el valor previo a ellos fue < 2.00x
-        if (data[-1]['value'] >= 2.00 and data[-2]['value'] >= 2.00
-                and cur_e4 > cur_e8 > cur_e20):
-            before = data[-3] if len(data) >= 3 else None
-            if before is None or before['value'] < 2.00:
-                return True
 
     elif level == 3:
-        # ── S3: solo cruce EMA8↑EMA20 — condición más selectiva ──────────────
-        if len(ema8) >= 2 and prev_e8 <= prev_e20 and cur_e8 > cur_e20:
-            return True
-
-    return False
-
-
-
-    cur_pos  = positions[-1]
-    cur_e4   = ema4[-1]  if ema4  else cur_pos
-    cur_e8   = ema8[-1]  if ema8  else cur_pos
-    cur_e20  = ema20[-1] if ema20 else cur_pos
-    prev_e4  = ema4[-2]  if len(ema4)  >= 2 else cur_e4
-    prev_e8  = ema8[-2]  if len(ema8)  >= 2 else cur_e8
-    prev_e20 = ema20[-2] if len(ema20) >= 2 else cur_e20
-
-    precio_sobre_emas = (
-        cur_pos > cur_e4 and
-        cur_pos > cur_e8 and
-        cur_pos > cur_e20
-    )
-
-    # Cond 1: EMA4 cruza EMA20 al alza
-    if len(ema4) >= 2 and prev_e4 <= prev_e20 and cur_e4 > cur_e20:
-        return True
-
-    # Cond 2: 2 consecutivos >= 2.00 + precio sobre EMAs + anterior < 2.00
-    if precio_sobre_emas and len(data) >= 2:
-        if data[-1]['value'] >= 2.00 and data[-2]['value'] >= 2.00:
-            before = data[-3] if len(data) >= 3 else None
-            if before is None or before['value'] < 2.00:
+        # ── S3: última verde + promedio últimas 3 > promedio últimas 10 ─────────
+        # ("Tendencia alcista activa")
+        if last_is_green and len(vals_rev) >= 3:
+            avg_all  = sum(vals_rev) / len(vals_rev)
+            avg_last3 = sum(vals_rev[:3]) / 3
+            if avg_last3 > avg_all:
                 return True
 
-    # Cond 3: EMA8 cruza EMA20 al alza + precio sobre EMAs
-    if precio_sobre_emas and len(ema8) >= 2 and prev_e8 <= prev_e20 and cur_e8 > cur_e20:
-        return True
-
-    # Cond 4: precio cerca de EMA4 (tolerancia 0.5) + precio sobre EMAs
-    if precio_sobre_emas and abs(cur_pos - cur_e4) <= 0.5:
-        return True
-
     return False
 
-
-
-# ─── DETECCIÓN DE SEÑALES — PATRONES DE POSICIÓN ─────────────────────────────
-def check_pattern_signal(data: list) -> str | None:
-    """
-    Detecta patrones basados en la secuencia de multiplicadores (>= 2x / < 2x).
-
-    Patrón A — "4-1-2":
-      Últimos 7 valores: >=2, >=2, >=2, >=2, <2, >=2, >=2
-      Ej: 2.34x 4.56x 7.90x 3.42x | 1.22x | 5.22x 4.56x ← señal aquí
-
-    Patrón B — "5 consecutivos":
-      Últimos 5 valores: todos >= 2x
-      Ej: 10.66x 4.67x 3.90x 5.67x 3.78x ← señal aquí
-    """
-    if len(data) < 7:
-        return None
-
-    vals = [d['value'] for d in data]
-
-    # ── Patrón A: 4 mayores, 1 menor, 2 mayores ──────────────────────────────
-    v = vals[-7:]   # últimos 7
-    patron_a = (
-        v[0] >= 2.00 and
-        v[1] >= 2.00 and
-        v[2] >= 2.00 and
-        v[3] >= 2.00 and
-        v[4] <  2.00 and
-        v[5] >= 2.00 and
-        v[6] >= 2.00
-    )
-    if patron_a:
-        return 'Pat_4_1_2'
-
-    # ── Patrón B: 5 consecutivos >= 2x ───────────────────────────────────────
-    v5 = vals[-5:]  # últimos 5
-    patron_b = all(x >= 2.00 for x in v5)
-    if patron_b:
-        return 'Pat_5x'
-
-    # ── Patrón C: 4 mayores, alternando menor-mayor tres veces ───────────────
-    #   >=2, >=2, >=2, >=2, <2, >=2, <2, >=2, <2
-    if len(data) >= 9:
-        v9 = vals[-9:]
-        patron_c = (
-            v9[0] >= 2.00 and
-            v9[1] >= 2.00 and
-            v9[2] >= 2.00 and
-            v9[3] >= 2.00 and
-            v9[4] <  2.00 and
-            v9[5] >= 2.00 and
-            v9[6] <  2.00 and
-            v9[7] >= 2.00 and
-            v9[8] <  2.00
-        )
-        if patron_c:
-            return 'Pat_4_alt'
-
-    return None
 
 # ─── SESIÓN GLOBAL ────────────────────────────────────────────────────────────
 class GlobalSession:
@@ -691,6 +583,9 @@ async def process_multiplier(value: float, round_id: str):
         g_signal_state      = 'idle'
         g_signal_type       = None
         g_signal_strictness = 0
+        # Garantizar mínimo 1 multiplicador de espera tras evaluar resultado
+        # antes de poder emitir otra señal (independiente del SIGNAL_COOLDOWN)
+        g_cooldown_mod = max(g_cooldown_mod, 2)
 
     # ── FASE 2: Decrementar cooldown único del sistema moderado ──────────────
     g_cooldown_mod = max(0, g_cooldown_mod - 1)
@@ -732,7 +627,7 @@ async def process_multiplier(value: float, round_id: str):
             g_trend_favorable = new_fav
             asyncio.create_task(broadcast_trend_change(new_fav))
 
-    # ── FASE 4: Detectar nueva señal — Gráfica Moderada AMX 2x ─────────────
+    # ── FASE 4: Detectar nueva señal — Maestro HTML (analyzeTrend risk:'low') ─
     # Las señales se bloquean cuando la tendencia es desfavorable y se
     # desbloquean automáticamente cuando vuelve a ser favorable.
     # g_trend_favorable = None  → aún sin datos suficientes (no emitir)
@@ -747,47 +642,40 @@ async def process_multiplier(value: float, round_id: str):
         sig_type  = None
         strictness = 0
 
-        # Prioridad 1: Patrones de posición — SIN filtro decimal, se emiten siempre
-        pat = check_pattern_signal(g_mults)
-        if pat is not None:
-            g_signal_state        = 'evaluating'
-            g_signal_type         = pat
-            g_signal_strictness   = 0
-            g_signal_trigger_mult = value
-            g_session.signal_trigger_mult = value
-            g_session.state       = GlobalSession.EVALUATING
-            g_cooldown_mod        = SIGNAL_COOLDOWN
-
-            if g_session.col == 1:
-                g_session.start_ficha()
-
-            logger.info(
-                f"🎯 PATRÓN {pat} "
-                f"Col{g_session.col} | Trigger: {value:.2f}x (sin filtro decimal)"
-            )
-            await _send_signal(value, pat, 0)
-
-        # Prioridad 2: Gráfica Moderada AMX 2x
-        elif check_moderate_signal(g_positions, g_ema4, g_ema8, g_ema20, g_mults, level):
+        # Gráfica Moderada AMX 2x (checkModerateAlerts del HTML)
+        if check_moderate_signal(g_positions, g_ema4, g_ema8, g_ema20, g_mults, level):
             sig_names  = {1: 'Mod_S1', 2: 'Mod_S2', 3: 'Mod_S3'}
             sig_type   = sig_names[level]
+            strictness = level
 
-            g_signal_state        = 'evaluating'
-            g_signal_type         = sig_type
-            g_signal_strictness   = level
-            g_signal_trigger_mult = value
-            g_session.signal_trigger_mult = value
-            g_session.state       = GlobalSession.EVALUATING
-            g_cooldown_mod        = SIGNAL_COOLDOWN
+        if sig_type is not None:
+            # ── Filtro decimal: solo se emite señal si el decimal del
+            #    multiplicador activador es >= 0.51.
+            #    Ejemplos válidos:   1.54x, 3.79x, 10.57x  (decimal >= 0.51)
+            #    Ejemplos descartados: 1.15x, 2.49x, 5.32x  (decimal < 0.51)
+            decimal_part = round(value % 1, 2)
+            if decimal_part < 0.51:
+                logger.info(
+                    f"🚫 Señal {sig_type} DESCARTADA — decimal {decimal_part:.2f} < 0.51 "
+                    f"(Trigger: {value:.2f}x) — sin cooldown, sigue buscando"
+                )
+            else:
+                g_signal_state        = 'evaluating'
+                g_signal_type         = sig_type
+                g_signal_strictness   = strictness
+                g_signal_trigger_mult = value
+                g_session.signal_trigger_mult = value
+                g_session.state       = GlobalSession.EVALUATING
+                g_cooldown_mod        = SIGNAL_COOLDOWN
 
-            if g_session.col == 1:
-                g_session.start_ficha()
+                if g_session.col == 1:
+                    g_session.start_ficha()
 
-            logger.info(
-                f"🎯 SEÑAL {sig_type} "
-                f"Col{g_session.col} | Trigger: {value:.2f}x"
-            )
-            await _send_signal(value, sig_type, level)
+                logger.info(
+                    f"🎯 SEÑAL {sig_type} "
+                    f"Col{g_session.col} | Trigger: {value:.2f}x | Decimal: {decimal_part:.2f} ✅"
+                )
+                await _send_signal(value, sig_type, strictness)
 
 
 
@@ -830,16 +718,16 @@ async def _broadcast_scoreboard():
     hora  = argentina_time()
 
     txt = (
-        f"<b>📆 MARCADOR DEL DÍA — 🕐 {hora}</b>\n"
-        f"<b>┄┄┄┄┄┄┄┄┄┄┄┄┄┄┄┄┄┄┄┄┄┄┄</b>\n"
-        f"<b>✅ Ganadas: {g_daily_wins}</b>\n"
-        f"<b>❌ Perdidas: {g_daily_losses}</b>\n"
-        f"<b>📈 Acierto: {pct_sig:.1f}%</b>\n"
-        f"<b>┄┄┄┄┄┄┄┄┄┄┄┄┄┄┄┄┄┄┄┄┄┄┄</b>\n"
-        f"<b>🔄 Ciclos {MAX_COLS} entradas · {WINS_PER_CYCLE} victorias</b>\n"
-        f"<b>✅ Ganados: {g_daily_cycles_won}</b>\n"
-        f"<b>❌ Perdidos: {g_daily_cycles_lost}</b>\n"
-        f"<b>📈 Acierto: {pct_cyc:.1f}%</b>"
+        f"📆 *MARCADOR DEL DÍA* — 🕐 *{hora}*\n"
+        f"┄┄┄┄┄┄┄┄┄┄┄┄┄┄┄┄┄┄┄┄┄┄┄\n"
+        f"✅ Ganadas: {g_daily_wins}\n"
+        f"❌ Perdidas: {g_daily_losses}\n"
+        f"📈 Acierto: {pct_sig:.1f}%\n"
+        f"┄┄┄┄┄┄┄┄┄┄┄┄┄┄┄┄┄┄┄┄┄┄┄\n"
+        f"🔄 Ciclos {MAX_COLS} entradas · {WINS_PER_CYCLE} victorias\n"
+        f"✅ Ganados: {g_daily_cycles_won}\n"
+        f"❌ Perdidos: {g_daily_cycles_lost}\n"
+        f"📈 Acierto: {pct_cyc:.1f}%"
     )
 
     # Borrar marcador anterior si existe
@@ -853,7 +741,7 @@ async def _broadcast_scoreboard():
 
     # Enviar marcador actualizado
     try:
-        sent = await bot.send_message(CHANNEL_ID, txt, parse_mode='HTML')
+        sent = await bot.send_message(CHANNEL_ID, txt, parse_mode='Markdown')
         g_scoreboard_msg_id = sent.message_id
         logger.info(f"📊 Marcador diario enviado (msg_id: {sent.message_id})")
     except Exception as e:
@@ -873,25 +761,25 @@ async def _send_signal(trigger: float, signal_name: str, strictness: int):
 
     # Etiqueta de señal para log interno
     sig_label_map = {
-        1: 'S1 Wabe↑',
-        2: 'S2 Doble Piso',
-        3: 'S3 EMA8↑EMA20',
+        1: 'S1 Zona Entrada',
+        2: 'S2 Posible Entrada',
+        3: 'S3 Tendencia Alcista',
     }
     sig_label = sig_label_map.get(strictness, f'S{strictness}')
     logger.info(f"📤 Señal {sig_label} | Col{col} | Entrada {ents}/{MAX_COLS} | Ciclo {wins}/{WINS_PER_CYCLE}")
 
     txt = (
-        f"<b>🆔 ENTRADA SPACEMAN — 🕐 {hora}</b>\n"
-        f"<b>┄┄┄┄┄┄┄┄┄┄┄┄┄┄┄┄┄┄┄┄┄┄┄</b>\n"
-        f"<b>🧨 Después de: {trigger:.2f}x</b>\n"
-        f"<b>🎯 Objetivo: 2.00x</b>\n"
-        f"<b>┄┄┄┄┄┄┄┄┄┄┄┄┄┄┄┄┄┄┄┄┄┄┄</b>\n"
-        f"<b>🔰 Col {col}  |  Entradas {ents}/{MAX_COLS}</b>\n"
-        f"<b>{ents_bar}</b>\n"
-        f"<b>💎 Ciclo {wins}/{WINS_PER_CYCLE} victorias</b>\n"
-        f"<b>{wins_bar}</b>"
+        f"🆔 *ENTRADA SPACEMAN* — 🕐 *{hora}*\n"
+        f"┄┄┄┄┄┄┄┄┄┄┄┄┄┄┄┄┄┄┄┄┄┄┄\n"
+        f"🧨 Después de: {trigger:.2f}x\n"
+        f"🎯 Objetivo: 2.00x\n"
+        f"┄┄┄┄┄┄┄┄┄┄┄┄┄┄┄┄┄┄┄┄┄┄┄\n"
+        f"🔰 Col {col}  |  Entradas {ents}/{MAX_COLS}\n"
+        f"{ents_bar}\n"
+        f"💎 Ciclo {wins}/{WINS_PER_CYCLE} victorias\n"
+        f"{wins_bar}"
     )
-    await broadcast_signal(txt, parse_mode='HTML')
+    await broadcast_signal(txt)   # sin parse_mode — texto plano con emojis
 
 
 async def _check_trend_after_cycle():
@@ -916,12 +804,12 @@ async def _dispatch_result(value: float, tipo: str, bet: float, attempt_num: int
         ents = g_session.entries_in_cycle
         wins_bar = '🟢' * wins + '⚪' * (WINS_PER_CYCLE - wins)
         txt = (
-            f"<b>✅ GANAMOS {value:.2f}x — 🕐 {hora}</b>\n"
-            f"<b>┄┄┄┄┄┄┄┄┄┄┄┄┄┄┄┄┄┄┄┄┄┄┄</b>\n"
-            f"<b>💎 Ciclo  {wins_bar}  {wins}/{WINS_PER_CYCLE}</b>\n"
-            f"<b>🔰 Entradas usadas: {ents}/{MAX_COLS}</b>"
+            f"✅ *GANAMOS* `*{value:.2f}x*` — 🕐 *{hora}*\n"
+            f"┄┄┄┄┄┄┄┄┄┄┄┄┄┄┄┄┄┄┄┄┄┄┄\n"
+            f"💎 Ciclo  {wins_bar}  {wins}/{WINS_PER_CYCLE}\n"
+            f"🔰 Entradas usadas: {ents}/{MAX_COLS}"
         )
-        await broadcast(txt, parse_mode='HTML')
+        await broadcast(txt, parse_mode='Markdown')
         await _broadcast_scoreboard()
         return
 
@@ -933,14 +821,14 @@ async def _dispatch_result(value: float, tipo: str, bet: float, attempt_num: int
         pct_cyc   = (g_daily_cycles_won / total_cyc * 100) if total_cyc > 0 else 0.0
         wins_bar  = '🟢' * WINS_PER_CYCLE
         txt = (
-            f"<b>✅ GANAMOS {value:.2f}x — 🕐 {hora}</b>\n"
-            f"<b>┄┄┄┄┄┄┄┄┄┄┄┄┄┄┄┄┄┄┄┄┄┄┄</b>\n"
-            f"<b>❤️ ¡CICLO COMPLETADO!</b>\n"
-            f"<b>{wins_bar}  {WINS_PER_CYCLE}/{WINS_PER_CYCLE} victorias</b>\n"
-            f"<b>💎 Ciclos ganados hoy: {g_daily_cycles_won} — {pct_cyc:.0f}%</b>\n"
-            f"<b>🔄 Nueva sesión iniciada</b>"
+            f"✅ *GANAMOS* `*{value:.2f}x*` — 🕐 *{hora}*\n"
+            f"┄┄┄┄┄┄┄┄┄┄┄┄┄┄┄┄┄┄┄┄┄┄┄\n"
+            f"❤️ *¡CICLO COMPLETADO!*\n"
+            f"{wins_bar}  {WINS_PER_CYCLE}/{WINS_PER_CYCLE} victorias\n"
+            f"💎 Ciclos ganados hoy: {g_daily_cycles_won} — {pct_cyc:.0f}%\n"
+            f"🔄 Nueva sesión iniciada"
         )
-        await broadcast(txt, parse_mode='HTML')
+        await broadcast(txt, parse_mode='Markdown')
         await _broadcast_scoreboard()
         reset_global_session()
         await _check_trend_after_cycle()
@@ -955,13 +843,13 @@ async def _dispatch_result(value: float, tipo: str, bet: float, attempt_num: int
         ents_bar = '⚫' * (ents - 1) + '🔴' + '⚫' * (MAX_COLS - ents)
         wins_bar = '🟢' * wins + '⚪' * (WINS_PER_CYCLE - wins)
         txt = (
-            f"<b>❌ PERDIMOS {value:.2f}x — 🕐 {hora}</b>\n"
-            f"<b>┄┄┄┄┄┄┄┄┄┄┄┄┄┄┄┄┄┄┄┄┄┄┄</b>\n"
-            f"<b>🔰 {ents_bar}  {ents}/{MAX_COLS}</b>\n"
-            f"<b>💎 Ciclo  {wins_bar}  {wins}/{WINS_PER_CYCLE}</b>\n"
-            f"<b>➡️ Siguiente entrada: Col {col}</b>"
+            f"❌ *PERDIMOS* `*{value:.2f}x*` — 🕐 {hora}\n"
+            f"┄┄┄┄┄┄┄┄┄┄┄┄┄┄┄┄┄┄┄┄┄┄┄\n"
+            f"🔰 {ents_bar}  {ents}/{MAX_COLS}\n"
+            f"💎 Ciclo  {wins_bar}  {wins}/{WINS_PER_CYCLE}\n"
+            f"➡️ Siguiente entrada: Col {col}"
         )
-        await broadcast(txt, parse_mode='HTML')
+        await broadcast(txt, parse_mode='Markdown')
         await _broadcast_scoreboard()
         return
 
@@ -973,14 +861,14 @@ async def _dispatch_result(value: float, tipo: str, bet: float, attempt_num: int
         pct_cyc   = (g_daily_cycles_won / total_cyc * 100) if total_cyc > 0 else 0.0
         ents_bar  = '🔴' * MAX_COLS
         txt = (
-            f"<b>❌ PERDIMOS {value:.2f}x — 🕐 {hora}</b>\n"
-            f"<b>┄┄┄┄┄┄┄┄┄┄┄┄┄┄┄┄┄┄┄┄┄┄┄</b>\n"
-            f"<b>😭 ¡CICLO PERDIDO!</b>\n"
-            f"<b>{ents_bar}  {MAX_COLS}/{MAX_COLS} entradas</b>\n"
-            f"<b>💎 Ciclos ganados hoy: {g_daily_cycles_won} — {pct_cyc:.0f}%</b>\n"
-            f"<b>🔄 Nueva sesión iniciada</b>"
+            f"❌ *PERDIMOS* `*{value:.2f}x*` — 🕐 *{hora}*\n"
+            f"┄┄┄┄┄┄┄┄┄┄┄┄┄┄┄┄┄┄┄┄┄┄┄\n"
+            f"😭 *¡CICLO PERDIDO!*\n"
+            f"{ents_bar}  {MAX_COLS}/{MAX_COLS} entradas\n"
+            f"💎 Ciclos ganados hoy: {g_daily_cycles_won} — {pct_cyc:.0f}%\n"
+            f"🔄 Nueva sesión iniciada"
         )
-        await broadcast(txt, parse_mode='HTML')
+        await broadcast(txt, parse_mode='Markdown')
         await _broadcast_scoreboard()
         reset_global_session()
         await _check_trend_after_cycle()
@@ -1155,22 +1043,22 @@ async def cmd_start(message):
 
     await bot.reply_to(
         message,
-        f"<b>🚀 ¡Bienvenido {name}!</b>\n\n"
-        "<b>━━━━━━━━━━━━━━━━━━━━━━━</b>\n"
-        "<b>🤖 Bot de Señales Spaceman</b>\n"
-        "<b>📊 Sistema Moderado | Objetivo: 2.00x</b>\n"
-        f"<b>🔄 Gestión: {MAX_COLS} Entradas × {WINS_PER_CYCLE} Victorias/Ciclo</b>\n"
-        f"<b>💵 Apuesta base fija: ${BASE_BET:.2f}</b>\n"
-        f"<b>🏆 Ciclo: {WINS_PER_CYCLE} victorias en {MAX_COLS} entradas</b>\n"
-        "<b>━━━━━━━━━━━━━━━━━━━━━━━</b>\n"
-        f"<b>{data_info}</b>\n\n"
-        "<b>━━━━━━━━━━━━━━━━━━━━━━━</b>\n"
+        f"🚀 *¡Bienvenido {name}!*\n\n"
+        "━━━━━━━━━━━━━━━━━━━━━━━\n"
+        "🤖 *Bot de Señales Spaceman*\n"
+        "📊 Sistema Moderado | Objetivo: `2.00x`\n"
+        f"🔄 Gestión: `{MAX_COLS}` Entradas × `{WINS_PER_CYCLE}` Victorias/Ciclo\n"
+        f"💵 Apuesta base fija: `${BASE_BET:.2f}`\n"
+        f"🏆 Ciclo: `{WINS_PER_CYCLE}` victorias en `{MAX_COLS}` entradas\n"
+        "━━━━━━━━━━━━━━━━━━━━━━━\n"
+        f"{data_info}\n\n"
+        "━━━━━━━━━━━━━━━━━━━━━━━\n"
         f"{stats_blk}"
-        "<b>━━━━━━━━━━━━━━━━━━━━━━━</b>\n"
-        "<b>✅ ¡Registrado!</b>\n"
-        "<b>Recibirás señales automáticamente</b>\n"
-        "<b>cuando la tendencia sea favorable.</b>",
-        parse_mode='HTML'
+        "━━━━━━━━━━━━━━━━━━━━━━━\n"
+        "✅ *¡Registrado!*\n"
+        "_Recibirás señales automáticamente_\n"
+        "_cuando la tendencia sea favorable._",
+        parse_mode='Markdown'
     )
 
 
@@ -1212,24 +1100,24 @@ async def cmd_estadisticas(message):
         total_fichas = len(s.fichas)
         wins_f  = sum(1 for f in s.fichas if f['result'] == 'win')
         loss_f  = sum(1 for f in s.fichas if f['result'] == 'loss')
-        resumen = f"<b>Total fichas: {total_fichas} | ✅ {wins_f} | ❌ {loss_f}</b>"
+        resumen = f"Total fichas: `{total_fichas}` | ✅ `{wins_f}` | ❌ `{loss_f}`"
     else:
         fichas_txt = "_Sin fichas registradas aún._"
-        resumen    = "<b>Total fichas: 0</b>"
+        resumen    = "Total fichas: `0`"
 
     await bot.reply_to(
         message,
-        "<b>📊 ESTADÍSTICAS DEL BOT</b>\n"
-        "<b>━━━━━━━━━━━━━━━━━━━━━━━</b>\n"
-        f"<b>{s.status_short()}</b>\n"
-        "<b>━━━━━━━━━━━━━━━━━━━━━━━</b>\n"
-        "<b>Últimas fichas (C1 a C12):</b>\n"
-        f"<b>{fichas_txt}</b>\n"
-        "<b>━━━━━━━━━━━━━━━━━━━━━━━</b>\n"
-        f"<b>{resumen}</b>\n"
-        "<b>━━━━━━━━━━━━━━━━━━━━━━━</b>\n"
-        f"<b>{trend}</b>",
-        parse_mode='HTML'
+        "📊 *ESTADÍSTICAS DEL BOT*\n"
+        "━━━━━━━━━━━━━━━━━━━━━━━\n"
+        f"{s.status_short()}\n"
+        "━━━━━━━━━━━━━━━━━━━━━━━\n"
+        f"*Últimas fichas (C1 a C12):*\n"
+        f"{fichas_txt}\n"
+        "━━━━━━━━━━━━━━━━━━━━━━━\n"
+        f"{resumen}\n"
+        "━━━━━━━━━━━━━━━━━━━━━━━\n"
+        f"{trend}",
+        parse_mode='Markdown'
     )
 
 
@@ -1242,8 +1130,8 @@ async def cmd_tendencia(message):
 
     if stats['total'] == 0:
         await bot.reply_to(message,
-            "<b>📡 Sin datos suficientes para analizar la tendencia.</b>",
-            parse_mode='HTML')
+            "📡 _Sin datos suficientes para analizar la tendencia._",
+            parse_mode='Markdown')
         return
 
     n_label = "200" if stats['has_enough'] else str(stats['total'])
@@ -1258,18 +1146,18 @@ async def cmd_tendencia(message):
         footer   = "⚠️ TENDENCIA DESFAVORABLE\n      Se recomienda esperar"
 
     txt = (
-        f"<b>{header}</b>\n"
-        "<b>━━━━━━━━━━━━━━━━━━━━━━━</b>\n"
-        f"<b>📈 Análisis de la Tendencia últimos</b>\n"
-        f"<b>      {n_label} multiplicadores</b>\n"
-        f"<b>🔵 Cuotas (1.00-1.99x): {stats['count_100_199']} — {stats['pct_100_199']:.2f}%{r1_flag}</b>\n"
-        f"<b>🟣 Cuotas (2.00-4.99x): {stats['count_200_499']} — {stats['pct_200_499']:.2f}%{r2_flag}</b>\n"
-        f"<b>🟡 Cuotas (5.00-9.99x): {stats['count_500_999']} — {stats['pct_500_999']:.2f}%</b>\n"
-        f"<b>🔴 Cuotas (+10.00x):    {stats['count_1000_plus']} — {stats['pct_1000_plus']:.2f}%</b>\n"
-        "<b> </b>\n"
-        f"<b>{footer}</b>"
+        f"*{header}*\n"
+        "━━━━━━━━━━━━━━━━━━━━━━━\n"
+        f"📈 Análisis de la Tendencia últimos\n"
+        f"      {n_label} multiplicadores\n"
+        f"🔵 Cuotas (1.00-1.99x): `{stats['count_100_199']}` — {stats['pct_100_199']:.2f}%{r1_flag}\n"
+        f"🟣 Cuotas (2.00-4.99x): `{stats['count_200_499']}` — {stats['pct_200_499']:.2f}%{r2_flag}\n"
+        f"🟡 Cuotas (5.00-9.99x): `{stats['count_500_999']}` — {stats['pct_500_999']:.2f}%\n"
+        f"🔴 Cuotas (+10.00x):    `{stats['count_1000_plus']}` — {stats['pct_1000_plus']:.2f}%\n"
+        " \n"
+        f"*{footer}*"
     )
-    await bot.reply_to(message, txt, parse_mode='HTML')
+    await bot.reply_to(message, txt, parse_mode='Markdown')
 
 
 # ─── MAIN ──────────────────────────────────────────────────────────────────────
