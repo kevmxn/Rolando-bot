@@ -55,8 +55,8 @@ BASE_BET       = 0.10  # Apuesta base fija (USD)
 # ── Umbrales de tendencia (detección favorable/desfavorable) ──────────────────
 # Desfavorable si: cuotas 1.00-1.99x superan THRESH_LOW_MAX
 #              O si: cuotas 2.00-4.99x caen por debajo de THRESH_MID_MIN
-THRESH_LOW_MAX = 54.0  # % máximo permitido para cuotas 1.00-1.99x
-THRESH_MID_MIN = 28.0  # % mínimo requerido para cuotas 2.00-4.99x
+THRESH_LOW_MAX = 51.0  # % máximo permitido para cuotas 1.00-1.99x
+THRESH_MID_MIN = 29.0  # % mínimo requerido para cuotas 2.00-4.99x
 
 # ── Parámetros internos ───────────────────────────────────────────────────────
 MAX_MULTS  = 400
