@@ -105,7 +105,7 @@ g_last_signal_msgs: dict = {}  # chat_id → message_id
 # Contador interno para guardar en disco cada N multiplicadores
 _persist_counter: int = 0
 
-bot = AsyncTeleBot(BOT_TOKEN)
+bot = AsyncTeleBot(BOT_TOKEN, parse_mode='HTML')  # Configurar parse_mode global HTML
 
 # Referencia al loop principal de asyncio (necesaria para el webhook)
 _main_loop: asyncio.AbstractEventLoop = None
@@ -118,7 +118,7 @@ def argentina_time() -> str:
 
 
 # ─── BROADCAST AL CANAL ───────────────────────────────────────────────────────
-async def broadcast(msg: str, parse_mode: str = None):
+async def broadcast(msg: str, parse_mode: str = 'HTML'):
     """Publica un mensaje en el canal de Telegram configurado."""
     try:
         await bot.send_message(CHANNEL_ID, msg, parse_mode=parse_mode)
@@ -131,7 +131,7 @@ async def broadcast_trend_change(favorable: bool):
     logger.info(f"Tendencia cambió → {'FAVORABLE' if favorable else 'DESFAVORABLE'} (sin broadcast)")
 
 
-async def broadcast_signal(msg: str, parse_mode: str = None):
+async def broadcast_signal(msg: str, parse_mode: str = 'HTML'):
     """Envía señal al canal y guarda el message_id para borrado posterior."""
     global g_last_signal_msgs
     g_last_signal_msgs = {}
@@ -307,26 +307,26 @@ def get_quota_stats(n: int = 200) -> dict:
 
 
 def quota_stats_text(stats: dict) -> str:
-    """Formatea el bloque de estadísticas de cuotas para Telegram."""
+    """Formatea el bloque de estadísticas de cuotas para Telegram (HTML)."""
     if stats['total'] == 0:
-        return "📡 _Sin datos suficientes para analizar cuotas._\n"
+        return "📡 <i>Sin datos suficientes para analizar cuotas.</i>\n"
 
     n_label = "200" if stats['has_enough'] else str(stats['total']) + " (acumulando...)"
     r1_flag = " ✅" if stats['pct_100_199'] <= THRESH_LOW_MAX else " ❌"
     r2_flag = " ✅" if stats['pct_200_499'] >= THRESH_MID_MIN else " ❌"
     fav_line = (
-        "✅ *¡TENDENCIA FAVORABLE!*\n      _Se recomienda operar_"
+        "✅ <b>¡TENDENCIA FAVORABLE!</b>\n      <i>Se recomienda operar</i>"
         if stats['favorable'] else
-        "⚠️ *TENDENCIA DESFAVORABLE*\n      _Se recomienda esperar_"
+        "⚠️ <b>TENDENCIA DESFAVORABLE</b>\n      <i>Se recomienda esperar</i>"
     )
 
     return (
-        f"📈 *Análisis de la Tendencia últimos*\n"
-        f"      *{n_label} multiplicadores*\n"
-        f"🔵 Cuotas (1.00-1.99x): `{stats['count_100_199']}` — {stats['pct_100_199']:.2f}%{r1_flag}\n"
-        f"🟣 Cuotas (2.00-4.99x): `{stats['count_200_499']}` — {stats['pct_200_499']:.2f}%{r2_flag}\n"
-        f"🟡 Cuotas (5.00-9.99x): `{stats['count_500_999']}` — {stats['pct_500_999']:.2f}%\n"
-        f"🔴 Cuotas (+10.00x):     `{stats['count_1000_plus']}` — {stats['pct_1000_plus']:.2f}%\n"
+        f"📈 <b>Análisis de la Tendencia últimos</b>\n"
+        f"      <b>{n_label} multiplicadores</b>\n"
+        f"🔵 Cuotas (1.00-1.99x): <code>{stats['count_100_199']}</code> — {stats['pct_100_199']:.2f}%{r1_flag}\n"
+        f"🟣 Cuotas (2.00-4.99x): <code>{stats['count_200_499']}</code> — {stats['pct_200_499']:.2f}%{r2_flag}\n"
+        f"🟡 Cuotas (5.00-9.99x): <code>{stats['count_500_999']}</code> — {stats['pct_500_999']:.2f}%\n"
+        f"🔴 Cuotas (+10.00x):     <code>{stats['count_1000_plus']}</code> — {stats['pct_1000_plus']:.2f}%\n"
         " \n"
         f"{fav_line}\n"
     )
@@ -498,10 +498,10 @@ class GlobalSession:
 
         return (
             f"📡 Estado: {estado_txt}\n"
-            f"🎯 Ciclo: `{self.wins_in_cycle}/{WINS_PER_CYCLE}` victorias | `{self.entries_in_cycle}/{MAX_COLS}` entradas\n"
-            f"📍 Col: `{self.col}/{MAX_COLS}`\n"
-            f"💵 Próxima apuesta: `${self.cur_bet:.2f}`\n"
-            f"📈 G/P sesión: `{self.wins}/{self.losses}`"
+            f"🎯 Ciclo: <code>{self.wins_in_cycle}/{WINS_PER_CYCLE}</code> victorias | <code>{self.entries_in_cycle}/{MAX_COLS}</code> entradas\n"
+            f"📍 Col: <code>{self.col}/{MAX_COLS}</code>\n"
+            f"💵 Próxima apuesta: <code>${self.cur_bet:.2f}</code>\n"
+            f"📈 G/P sesión: <code>{self.wins}/{self.losses}</code>"
         )
 
 
@@ -660,7 +660,7 @@ async def _broadcast_scoreboard():
     hora  = argentina_time()
 
     txt = (
-        f"📆 *MARCADOR DEL DÍA* — 🕐 *{hora}*\n"
+        f"📆 <b>MARCADOR DEL DÍA</b> — 🕐 <b>{hora}</b>\n"
         f"┄┄┄┄┄┄┄┄┄┄┄┄┄┄┄┄┄┄┄┄┄┄┄\n"
         f"✅ Ganadas: {g_daily_wins}\n"
         f"❌ Perdidas: {g_daily_losses}\n"
@@ -683,7 +683,7 @@ async def _broadcast_scoreboard():
 
     # Enviar marcador actualizado
     try:
-        sent = await bot.send_message(CHANNEL_ID, txt, parse_mode='Markdown')
+        sent = await bot.send_message(CHANNEL_ID, txt, parse_mode='HTML')
         g_scoreboard_msg_id = sent.message_id
         logger.info(f"📊 Marcador diario enviado (msg_id: {sent.message_id})")
     except Exception as e:
@@ -711,7 +711,7 @@ async def _send_signal(trigger: float, signal_name: str, strictness: int):
     logger.info(f"📤 Señal {sig_label} | Col{col} | Entrada {ents}/{MAX_COLS} | Ciclo {wins}/{WINS_PER_CYCLE}")
 
     txt = (
-        f"🆔 *ENTRADA SPACEMAN* — 🕐 *{hora}*\n"
+        f"🆔 <b>ENTRADA SPACEMAN</b> — 🕐 <b>{hora}</b>\n"
         f"┄┄┄┄┄┄┄┄┄┄┄┄┄┄┄┄┄┄┄┄┄┄┄\n"
         f"🧨 Después de: {trigger:.2f}x\n"
         f"🎯 Objetivo: 2.00x\n"
@@ -746,12 +746,12 @@ async def _dispatch_result(value: float, tipo: str, bet: float, attempt_num: int
         ents = g_session.entries_in_cycle
         wins_bar = '🟢' * wins + '⚪' * (WINS_PER_CYCLE - wins)
         txt = (
-            f"✅ *GANAMOS* `*{value:.2f}x*` — 🕐 *{hora}*\n"
+            f"✅ <b>GANAMOS</b> <code>{value:.2f}x</code> — 🕐 <b>{hora}</b>\n"
             f"┄┄┄┄┄┄┄┄┄┄┄┄┄┄┄┄┄┄┄┄┄┄┄\n"
             f"💎 Ciclo  {wins_bar}  {wins}/{WINS_PER_CYCLE}\n"
             f"🔰 Entradas usadas: {ents}/{MAX_COLS}"
         )
-        await broadcast(txt, parse_mode='Markdown')
+        await broadcast(txt, parse_mode='HTML')
         await _broadcast_scoreboard()
         return
 
@@ -763,14 +763,14 @@ async def _dispatch_result(value: float, tipo: str, bet: float, attempt_num: int
         pct_cyc   = (g_daily_cycles_won / total_cyc * 100) if total_cyc > 0 else 0.0
         wins_bar  = '🟢' * WINS_PER_CYCLE
         txt = (
-            f"✅ *GANAMOS* `*{value:.2f}x*` — 🕐 *{hora}*\n"
+            f"✅ <b>GANAMOS</b> <code>{value:.2f}x</code> — 🕐 <b>{hora}</b>\n"
             f"┄┄┄┄┄┄┄┄┄┄┄┄┄┄┄┄┄┄┄┄┄┄┄\n"
-            f"❤️ *¡CICLO COMPLETADO!*\n"
+            f"❤️ <b>¡CICLO COMPLETADO!</b>\n"
             f"{wins_bar}  {WINS_PER_CYCLE}/{WINS_PER_CYCLE} victorias\n"
             f"💎 Ciclos ganados hoy: {g_daily_cycles_won} — {pct_cyc:.0f}%\n"
             f"🔄 Nueva sesión iniciada"
         )
-        await broadcast(txt, parse_mode='Markdown')
+        await broadcast(txt, parse_mode='HTML')
         await _broadcast_scoreboard()
         reset_global_session()
         await _check_trend_after_cycle()
@@ -785,13 +785,13 @@ async def _dispatch_result(value: float, tipo: str, bet: float, attempt_num: int
         ents_bar = '⚫' * (ents - 1) + '🔴' + '⚫' * (MAX_COLS - ents)
         wins_bar = '🟢' * wins + '⚪' * (WINS_PER_CYCLE - wins)
         txt = (
-            f"❌ *PERDIMOS* `*{value:.2f}x*` — 🕐 {hora}\n"
+            f"❌ <b>PERDIMOS</b> <code>{value:.2f}x</code> — 🕐 {hora}\n"
             f"┄┄┄┄┄┄┄┄┄┄┄┄┄┄┄┄┄┄┄┄┄┄┄\n"
             f"🔰 {ents_bar}  {ents}/{MAX_COLS}\n"
             f"💎 Ciclo  {wins_bar}  {wins}/{WINS_PER_CYCLE}\n"
             f"➡️ Siguiente entrada: Col {col}"
         )
-        await broadcast(txt, parse_mode='Markdown')
+        await broadcast(txt, parse_mode='HTML')
         await _broadcast_scoreboard()
         return
 
@@ -803,14 +803,14 @@ async def _dispatch_result(value: float, tipo: str, bet: float, attempt_num: int
         pct_cyc   = (g_daily_cycles_won / total_cyc * 100) if total_cyc > 0 else 0.0
         ents_bar  = '🔴' * MAX_COLS
         txt = (
-            f"❌ *PERDIMOS* `*{value:.2f}x*` — 🕐 *{hora}*\n"
+            f"❌ <b>PERDIMOS</b> <code>{value:.2f}x</code> — 🕐 <b>{hora}</b>\n"
             f"┄┄┄┄┄┄┄┄┄┄┄┄┄┄┄┄┄┄┄┄┄┄┄\n"
-            f"😭 *¡CICLO PERDIDO!*\n"
+            f"😭 <b>¡CICLO PERDIDO!</b>\n"
             f"{ents_bar}  {MAX_COLS}/{MAX_COLS} entradas\n"
             f"💎 Ciclos ganados hoy: {g_daily_cycles_won} — {pct_cyc:.0f}%\n"
             f"🔄 Nueva sesión iniciada"
         )
-        await broadcast(txt, parse_mode='Markdown')
+        await broadcast(txt, parse_mode='HTML')
         await _broadcast_scoreboard()
         reset_global_session()
         await _check_trend_after_cycle()
@@ -978,29 +978,29 @@ async def cmd_start(message):
     stats     = get_quota_stats(200)
     stats_blk = quota_stats_text(stats)
     data_info = (
-        f"📡 `{len(g_mults)}/400` multiplicadores recopilados"
+        f"📡 <code>{len(g_mults)}/400</code> multiplicadores recopilados"
         if g_mults else
         "📡 Recopilando datos en tiempo real..."
     )
 
     await bot.reply_to(
         message,
-        f"🚀 *¡Bienvenido {name}!*\n\n"
+        f"🚀 <b>¡Bienvenido {name}!</b>\n\n"
         "━━━━━━━━━━━━━━━━━━━━━━━\n"
-        "🤖 *Bot de Señales Spaceman*\n"
-        "📊 Sistema Moderado | Objetivo: `2.00x`\n"
-        f"🔄 Gestión: `{MAX_COLS}` Entradas × `{WINS_PER_CYCLE}` Victorias/Ciclo\n"
-        f"💵 Apuesta base fija: `${BASE_BET:.2f}`\n"
-        f"🏆 Ciclo: `{WINS_PER_CYCLE}` victorias en `{MAX_COLS}` entradas\n"
+        "🤖 <b>Bot de Señales Spaceman</b>\n"
+        "📊 Sistema Moderado | Objetivo: <code>2.00x</code>\n"
+        f"🔄 Gestión: <code>{MAX_COLS}</code> Entradas × <code>{WINS_PER_CYCLE}</code> Victorias/Ciclo\n"
+        f"💵 Apuesta base fija: <code>${BASE_BET:.2f}</code>\n"
+        f"🏆 Ciclo: <code>{WINS_PER_CYCLE}</code> victorias en <code>{MAX_COLS}</code> entradas\n"
         "━━━━━━━━━━━━━━━━━━━━━━━\n"
         f"{data_info}\n\n"
         "━━━━━━━━━━━━━━━━━━━━━━━\n"
         f"{stats_blk}"
         "━━━━━━━━━━━━━━━━━━━━━━━\n"
-        "✅ *¡Registrado!*\n"
-        "_Recibirás señales automáticamente_\n"
-        "_cuando la tendencia sea favorable._",
-        parse_mode='Markdown'
+        "✅ <b>¡Registrado!</b>\n"
+        "<i>Recibirás señales automáticamente</i>\n"
+        "<i>cuando la tendencia sea favorable.</i>",
+        parse_mode='HTML'
     )
 
 
@@ -1042,24 +1042,24 @@ async def cmd_estadisticas(message):
         total_fichas = len(s.fichas)
         wins_f  = sum(1 for f in s.fichas if f['result'] == 'win')
         loss_f  = sum(1 for f in s.fichas if f['result'] == 'loss')
-        resumen = f"Total fichas: `{total_fichas}` | ✅ `{wins_f}` | ❌ `{loss_f}`"
+        resumen = f"Total fichas: <code>{total_fichas}</code> | ✅ <code>{wins_f}</code> | ❌ <code>{loss_f}</code>"
     else:
-        fichas_txt = "_Sin fichas registradas aún._"
-        resumen    = "Total fichas: `0`"
+        fichas_txt = "<i>Sin fichas registradas aún.</i>"
+        resumen    = "Total fichas: <code>0</code>"
 
     await bot.reply_to(
         message,
-        "📊 *ESTADÍSTICAS DEL BOT*\n"
+        "📊 <b>ESTADÍSTICAS DEL BOT</b>\n"
         "━━━━━━━━━━━━━━━━━━━━━━━\n"
         f"{s.status_short()}\n"
         "━━━━━━━━━━━━━━━━━━━━━━━\n"
-        f"*Últimas fichas (C1 a C12):*\n"
+        f"<b>Últimas fichas (C1 a C12):</b>\n"
         f"{fichas_txt}\n"
         "━━━━━━━━━━━━━━━━━━━━━━━\n"
         f"{resumen}\n"
         "━━━━━━━━━━━━━━━━━━━━━━━\n"
         f"{trend}",
-        parse_mode='Markdown'
+        parse_mode='HTML'
     )
 
 
@@ -1072,8 +1072,8 @@ async def cmd_tendencia(message):
 
     if stats['total'] == 0:
         await bot.reply_to(message,
-            "📡 _Sin datos suficientes para analizar la tendencia._",
-            parse_mode='Markdown')
+            "📡 <i>Sin datos suficientes para analizar la tendencia.</i>",
+            parse_mode='HTML')
         return
 
     n_label = "200" if stats['has_enough'] else str(stats['total'])
@@ -1082,24 +1082,24 @@ async def cmd_tendencia(message):
 
     if stats['favorable']:
         header   = f"🟢 TENDENCIA FAVORABLE — {hora}"
-        footer   = "✅ ¡TENDENCIA FAVORABLE!\n      Se recomienda operar"
+        footer   = "✅ <b>¡TENDENCIA FAVORABLE!</b>\n      <i>Se recomienda operar</i>"
     else:
         header   = f"🔴 TENDENCIA DESFAVORABLE — {hora}"
-        footer   = "⚠️ TENDENCIA DESFAVORABLE\n      Se recomienda esperar"
+        footer   = "⚠️ <b>TENDENCIA DESFAVORABLE</b>\n      <i>Se recomienda esperar</i>"
 
     txt = (
-        f"*{header}*\n"
+        f"<b>{header}</b>\n"
         "━━━━━━━━━━━━━━━━━━━━━━━\n"
         f"📈 Análisis de la Tendencia últimos\n"
         f"      {n_label} multiplicadores\n"
-        f"🔵 Cuotas (1.00-1.99x): `{stats['count_100_199']}` — {stats['pct_100_199']:.2f}%{r1_flag}\n"
-        f"🟣 Cuotas (2.00-4.99x): `{stats['count_200_499']}` — {stats['pct_200_499']:.2f}%{r2_flag}\n"
-        f"🟡 Cuotas (5.00-9.99x): `{stats['count_500_999']}` — {stats['pct_500_999']:.2f}%\n"
-        f"🔴 Cuotas (+10.00x):    `{stats['count_1000_plus']}` — {stats['pct_1000_plus']:.2f}%\n"
+        f"🔵 Cuotas (1.00-1.99x): <code>{stats['count_100_199']}</code> — {stats['pct_100_199']:.2f}%{r1_flag}\n"
+        f"🟣 Cuotas (2.00-4.99x): <code>{stats['count_200_499']}</code> — {stats['pct_200_499']:.2f}%{r2_flag}\n"
+        f"🟡 Cuotas (5.00-9.99x): <code>{stats['count_500_999']}</code> — {stats['pct_500_999']:.2f}%\n"
+        f"🔴 Cuotas (+10.00x):    <code>{stats['count_1000_plus']}</code> — {stats['pct_1000_plus']:.2f}%\n"
         " \n"
-        f"*{footer}*"
+        f"{footer}"
     )
-    await bot.reply_to(message, txt, parse_mode='Markdown')
+    await bot.reply_to(message, txt, parse_mode='HTML')
 
 
 # ─── MAIN ──────────────────────────────────────────────────────────────────────
