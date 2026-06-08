@@ -340,7 +340,7 @@ def quota_stats_text(stats: dict) -> str:
         f"🔵 Cuotas (1.00-1.99x): `{stats['count_100_199']}` — {stats['pct_100_199']:.2f}%{r1_flag}\n"
         f"🟣 Cuotas (2.00-4.99x): `{stats['count_200_499']}` — {stats['pct_200_499']:.2f}%{r2_flag}\n"
         f"🟡 Cuotas (5.00-9.99x): `{stats['count_500_999']}` — {stats['pct_500_999']:.2f}%\n"
-        f"🔴 Cuotas (+10.00x):    `{stats['count_1000_plus']}` — {stats['pct_1000_plus']:.2f}%\n"
+        f"🔴 Cuotas (+10.00x):     `{stats['count_1000_plus']}` — {stats['pct_1000_plus']:.2f}%\n"
         " \n"
         f"{fav_line}\n"
     )
@@ -422,25 +422,6 @@ def check_moderate_signal(
     return False
 
 
-# ─── DETECCIÓN DE SEÑALES — GRÁFICA DE TENDENCIA AMX 2x (checkAlerts) ────────
-def check_trend_signal(
-    positions: list,
-    ema4: list, ema8: list, ema20: list,
-    data: list
-) -> bool:
-    """
-    Detecta señales del gráfico de TENDENCIA AMX con umbral 2.00x.
-    Equivalente a checkAlerts() → alert200 (Skrill 2.0) del HTML AMX_V20.
-    Posiciones: +1 si value >= 2.00x | -1 si value < 2.00x.
-
-    Cond 1: EMA4 cruza EMA20 al alza (sin condición de precio adicional).
-    Cond 2: 2 valores consecutivos >= 2.00 + precio sobre las 3 EMAs
-            + el valor anterior a ellos fue < 2.00.
-    Cond 3: EMA8 cruza EMA20 al alza + precio sobre las 3 EMAs.
-    Cond 4: precio cerca de EMA4 (tolerancia 0.5) + precio sobre las 3 EMAs.
-    """
-    if len(data) < 4 or not positions:
-        return False
 
     cur_pos  = positions[-1]
     cur_e4   = ema4[-1]  if ema4  else cur_pos
@@ -692,7 +673,7 @@ async def process_multiplier(value: float, round_id: str):
             g_trend_favorable = new_fav
             asyncio.create_task(broadcast_trend_change(new_fav))
 
-    # ── FASE 4: Detectar nueva señal — Tendencia 2x + Moderada AMX 2x ──────
+    # ── FASE 4: Detectar nueva señal — Gráfica Moderada AMX 2x ─────────────
     # Las señales se bloquean cuando la tendencia es desfavorable y se
     # desbloquean automáticamente cuando vuelve a ser favorable.
     # g_trend_favorable = None  → aún sin datos suficientes (no emitir)
@@ -707,13 +688,8 @@ async def process_multiplier(value: float, round_id: str):
         sig_type  = None
         strictness = 0
 
-        # Prioridad 1: Gráfica de Tendencia AMX 2x (checkAlerts del HTML)
-        if check_trend_signal(g_positions, g_ema4, g_ema8, g_ema20, g_mults):
-            sig_type   = 'Trend_2x'
-            strictness = 0   # señal de tendencia: sin nivel de columna
-
-        # Prioridad 2: Gráfica Moderada AMX 2x (checkModerateAlerts del HTML)
-        elif check_moderate_signal(g_positions, g_ema4, g_ema8, g_ema20, g_mults, level):
+        # Gráfica Moderada AMX 2x (checkModerateAlerts del HTML)
+        if check_moderate_signal(g_positions, g_ema4, g_ema8, g_ema20, g_mults, level):
             sig_names  = {1: 'Mod_S1', 2: 'Mod_S2', 3: 'Mod_S3'}
             sig_type   = sig_names[level]
             strictness = level
@@ -788,7 +764,7 @@ async def _broadcast_scoreboard():
     hora  = argentina_time()
 
     txt = (
-        f"📆 *MARCADOR DEL DÍA* — 🕐 {hora}\n"
+        f"📆 *MARCADOR DEL DÍA* — 🕐 *{hora}*\n"
         f"┄┄┄┄┄┄┄┄┄┄┄┄┄┄┄┄┄┄┄┄┄┄┄\n"
         f"✅ Ganadas: {g_daily_wins}\n"
         f"❌ Perdidas: {g_daily_losses}\n"
@@ -831,16 +807,15 @@ async def _send_signal(trigger: float, signal_name: str, strictness: int):
 
     # Etiqueta de señal para log interno
     sig_label_map = {
-        'Trend_2x': 'Tendencia 2x (Skrill)',
         1: 'S1 Wabe↑',
         2: 'S2 Doble Piso',
         3: 'S3 EMA8↑EMA20',
     }
-    sig_label = sig_label_map.get(signal_name) or sig_label_map.get(strictness, f'S{strictness}')
+    sig_label = sig_label_map.get(strictness, f'S{strictness}')
     logger.info(f"📤 Señal {sig_label} | Col{col} | Entrada {ents}/{MAX_COLS} | Ciclo {wins}/{WINS_PER_CYCLE}")
 
     txt = (
-        f"🆔 ENTRADA SPACEMAN — 🕐 {hora}\n"
+        f"🆔 *ENTRADA SPACEMAN* — 🕐 *{hora}*\n"
         f"┄┄┄┄┄┄┄┄┄┄┄┄┄┄┄┄┄┄┄┄┄┄┄\n"
         f"🧨 Después de: {trigger:.2f}x\n"
         f"🎯 Objetivo: 2.00x\n"
@@ -875,7 +850,7 @@ async def _dispatch_result(value: float, tipo: str, bet: float, attempt_num: int
         ents = g_session.entries_in_cycle
         wins_bar = '🟢' * wins + '⚪' * (WINS_PER_CYCLE - wins)
         txt = (
-            f"✅ *GANAMOS*  `{value:.2f}x` — 🕐 {hora}\n"
+            f"✅ *GANAMOS* `*{value:.2f}x*` — 🕐 *{hora}*\n"
             f"┄┄┄┄┄┄┄┄┄┄┄┄┄┄┄┄┄┄┄┄┄┄┄\n"
             f"💎 Ciclo  {wins_bar}  {wins}/{WINS_PER_CYCLE}\n"
             f"🔰 Entradas usadas: {ents}/{MAX_COLS}"
@@ -892,7 +867,7 @@ async def _dispatch_result(value: float, tipo: str, bet: float, attempt_num: int
         pct_cyc   = (g_daily_cycles_won / total_cyc * 100) if total_cyc > 0 else 0.0
         wins_bar  = '🟢' * WINS_PER_CYCLE
         txt = (
-            f"✅ *GANAMOS*  `{value:.2f}x` — 🕐 {hora}\n"
+            f"✅ *GANAMOS* `*{value:.2f}x*` — 🕐 *{hora}*\n"
             f"┄┄┄┄┄┄┄┄┄┄┄┄┄┄┄┄┄┄┄┄┄┄┄\n"
             f"❤️ *¡CICLO COMPLETADO!*\n"
             f"{wins_bar}  {WINS_PER_CYCLE}/{WINS_PER_CYCLE} victorias\n"
@@ -914,7 +889,7 @@ async def _dispatch_result(value: float, tipo: str, bet: float, attempt_num: int
         ents_bar = '⚫' * (ents - 1) + '🔴' + '⚫' * (MAX_COLS - ents)
         wins_bar = '🟢' * wins + '⚪' * (WINS_PER_CYCLE - wins)
         txt = (
-            f"❌ *PERDIMOS*  `{value:.2f}x` — 🕐 {hora}\n"
+            f"❌ *PERDIMOS* `*{value:.2f}x*` — 🕐 {hora}\n"
             f"┄┄┄┄┄┄┄┄┄┄┄┄┄┄┄┄┄┄┄┄┄┄┄\n"
             f"🔰 {ents_bar}  {ents}/{MAX_COLS}\n"
             f"💎 Ciclo  {wins_bar}  {wins}/{WINS_PER_CYCLE}\n"
@@ -932,7 +907,7 @@ async def _dispatch_result(value: float, tipo: str, bet: float, attempt_num: int
         pct_cyc   = (g_daily_cycles_won / total_cyc * 100) if total_cyc > 0 else 0.0
         ents_bar  = '🔴' * MAX_COLS
         txt = (
-            f"❌ *PERDIMOS*  `{value:.2f}x` — 🕐 {hora}\n"
+            f"❌ *PERDIMOS* `*{value:.2f}x*` — 🕐 *{hora}*\n"
             f"┄┄┄┄┄┄┄┄┄┄┄┄┄┄┄┄┄┄┄┄┄┄┄\n"
             f"😭 *¡CICLO PERDIDO!*\n"
             f"{ents_bar}  {MAX_COLS}/{MAX_COLS} entradas\n"
