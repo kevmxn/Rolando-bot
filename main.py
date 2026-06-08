@@ -693,7 +693,15 @@ async def process_multiplier(value: float, round_id: str):
             asyncio.create_task(broadcast_trend_change(new_fav))
 
     # ── FASE 4: Detectar nueva señal — Tendencia 2x + Moderada AMX 2x ──────
-    if g_signal_state == 'idle' and g_session.state == GlobalSession.IDLE and g_cooldown_mod == 0:
+    # Las señales se bloquean cuando la tendencia es desfavorable y se
+    # desbloquean automáticamente cuando vuelve a ser favorable.
+    # g_trend_favorable = None  → aún sin datos suficientes (no emitir)
+    # g_trend_favorable = False → tendencia desfavorable (bloqueado)
+    # g_trend_favorable = True  → tendencia favorable (activo)
+    if (g_signal_state == 'idle'
+            and g_session.state == GlobalSession.IDLE
+            and g_cooldown_mod == 0
+            and g_trend_favorable is True):
 
         level     = signal_level_for_col(g_session.col)
         sig_type  = None
