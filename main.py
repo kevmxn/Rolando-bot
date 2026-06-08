@@ -767,33 +767,27 @@ async def process_multiplier(value: float, round_id: str):
             )
             await _send_signal(value, pat, 0)
 
-        # Prioridad 2: Gráfica Moderada AMX 2x — CON filtro decimal >= 0.51
+        # Prioridad 2: Gráfica Moderada AMX 2x
         elif check_moderate_signal(g_positions, g_ema4, g_ema8, g_ema20, g_mults, level):
-            sig_names    = {1: 'Mod_S1', 2: 'Mod_S2', 3: 'Mod_S3'}
-            sig_type     = sig_names[level]
-            decimal_part = round(value % 1, 2)
-            if decimal_part < 0.51:
-                logger.info(
-                    f"🚫 Señal {sig_type} DESCARTADA — decimal {decimal_part:.2f} < 0.51 "
-                    f"(Trigger: {value:.2f}x) — sin cooldown, sigue buscando"
-                )
-            else:
-                g_signal_state        = 'evaluating'
-                g_signal_type         = sig_type
-                g_signal_strictness   = level
-                g_signal_trigger_mult = value
-                g_session.signal_trigger_mult = value
-                g_session.state       = GlobalSession.EVALUATING
-                g_cooldown_mod        = SIGNAL_COOLDOWN
+            sig_names  = {1: 'Mod_S1', 2: 'Mod_S2', 3: 'Mod_S3'}
+            sig_type   = sig_names[level]
 
-                if g_session.col == 1:
-                    g_session.start_ficha()
+            g_signal_state        = 'evaluating'
+            g_signal_type         = sig_type
+            g_signal_strictness   = level
+            g_signal_trigger_mult = value
+            g_session.signal_trigger_mult = value
+            g_session.state       = GlobalSession.EVALUATING
+            g_cooldown_mod        = SIGNAL_COOLDOWN
 
-                logger.info(
-                    f"🎯 SEÑAL {sig_type} "
-                    f"Col{g_session.col} | Trigger: {value:.2f}x | Decimal: {decimal_part:.2f} ✅"
-                )
-                await _send_signal(value, sig_type, level)
+            if g_session.col == 1:
+                g_session.start_ficha()
+
+            logger.info(
+                f"🎯 SEÑAL {sig_type} "
+                f"Col{g_session.col} | Trigger: {value:.2f}x"
+            )
+            await _send_signal(value, sig_type, level)
 
 
 
