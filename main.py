@@ -422,6 +422,62 @@ def check_moderate_signal(
     return False
 
 
+# ─── DETECCIÓN DE SEÑALES — GRÁFICA DE TENDENCIA AMX 2x (checkAlerts) ────────
+def check_trend_signal(
+    positions: list,
+    ema4: list, ema8: list, ema20: list,
+    data: list
+) -> bool:
+    """
+    Detecta señales del gráfico de TENDENCIA AMX con umbral 2.00x.
+    Equivalente a checkAlerts() → alert200 (Skrill 2.0) del HTML AMX_V20.
+    Posiciones: +1 si value >= 2.00x | -1 si value < 2.00x.
+
+    Cond 1: EMA4 cruza EMA20 al alza (sin condición de precio adicional).
+    Cond 2: 2 valores consecutivos >= 2.00 + precio sobre las 3 EMAs
+            + el valor anterior a ellos fue < 2.00.
+    Cond 3: EMA8 cruza EMA20 al alza + precio sobre las 3 EMAs.
+    Cond 4: precio cerca de EMA4 (tolerancia 0.5) + precio sobre las 3 EMAs.
+    """
+    if len(data) < 4 or not positions:
+        return False
+
+    cur_pos  = positions[-1]
+    cur_e4   = ema4[-1]  if ema4  else cur_pos
+    cur_e8   = ema8[-1]  if ema8  else cur_pos
+    cur_e20  = ema20[-1] if ema20 else cur_pos
+    prev_e4  = ema4[-2]  if len(ema4)  >= 2 else cur_e4
+    prev_e8  = ema8[-2]  if len(ema8)  >= 2 else cur_e8
+    prev_e20 = ema20[-2] if len(ema20) >= 2 else cur_e20
+
+    precio_sobre_emas = (
+        cur_pos > cur_e4 and
+        cur_pos > cur_e8 and
+        cur_pos > cur_e20
+    )
+
+    # Cond 1: EMA4 cruza EMA20 al alza
+    if len(ema4) >= 2 and prev_e4 <= prev_e20 and cur_e4 > cur_e20:
+        return True
+
+    # Cond 2: 2 consecutivos >= 2.00 + precio sobre EMAs + anterior < 2.00
+    if precio_sobre_emas and len(data) >= 2:
+        if data[-1]['value'] >= 2.00 and data[-2]['value'] >= 2.00:
+            before = data[-3] if len(data) >= 3 else None
+            if before is None or before['value'] < 2.00:
+                return True
+
+    # Cond 3: EMA8 cruza EMA20 al alza + precio sobre EMAs
+    if precio_sobre_emas and len(ema8) >= 2 and prev_e8 <= prev_e20 and cur_e8 > cur_e20:
+        return True
+
+    # Cond 4: precio cerca de EMA4 (tolerancia 0.5) + precio sobre EMAs
+    if precio_sobre_emas and abs(cur_pos - cur_e4) <= 0.5:
+        return True
+
+    return False
+
+
 # ─── SESIÓN GLOBAL ────────────────────────────────────────────────────────────
 class GlobalSession:
     """
@@ -636,32 +692,52 @@ async def process_multiplier(value: float, round_id: str):
             g_trend_favorable = new_fav
             asyncio.create_task(broadcast_trend_change(new_fav))
 
-    # ── FASE 4: Detectar nueva señal — Gráfica Moderada AMX 2x ──────────────
+    # ── FASE 4: Detectar nueva señal — Tendencia 2x + Moderada AMX 2x ──────
     if g_signal_state == 'idle' and g_session.state == GlobalSession.IDLE and g_cooldown_mod == 0:
 
-        level = signal_level_for_col(g_session.col)
-        sig_names = {1: 'Mod_S1', 2: 'Mod_S2', 3: 'Mod_S3'}
+        level     = signal_level_for_col(g_session.col)
+        sig_type  = None
+        strictness = 0
 
-        if check_moderate_signal(g_positions, g_ema4, g_ema8, g_ema20, g_mults, level):
+        # Prioridad 1: Gráfica de Tendencia AMX 2x (checkAlerts del HTML)
+        if check_trend_signal(g_positions, g_ema4, g_ema8, g_ema20, g_mults):
+            sig_type   = 'Trend_2x'
+            strictness = 0   # señal de tendencia: sin nivel de columna
+
+        # Prioridad 2: Gráfica Moderada AMX 2x (checkModerateAlerts del HTML)
+        elif check_moderate_signal(g_positions, g_ema4, g_ema8, g_ema20, g_mults, level):
+            sig_names  = {1: 'Mod_S1', 2: 'Mod_S2', 3: 'Mod_S3'}
             sig_type   = sig_names[level]
             strictness = level
 
-            g_signal_state        = 'evaluating'
-            g_signal_type         = sig_type
-            g_signal_strictness   = strictness
-            g_signal_trigger_mult = value
-            g_session.signal_trigger_mult = value
-            g_session.state       = GlobalSession.EVALUATING
-            g_cooldown_mod        = SIGNAL_COOLDOWN
+        if sig_type is not None:
+            # ── Filtro decimal: solo se emite señal si el decimal del
+            #    multiplicador activador es >= 0.51.
+            #    Ejemplos válidos:   1.54x, 3.79x, 10.57x  (decimal >= 0.51)
+            #    Ejemplos descartados: 1.15x, 2.49x, 5.32x  (decimal < 0.51)
+            decimal_part = round(value % 1, 2)
+            if decimal_part < 0.51:
+                logger.info(
+                    f"🚫 Señal {sig_type} DESCARTADA — decimal {decimal_part:.2f} < 0.51 "
+                    f"(Trigger: {value:.2f}x) — sin cooldown, sigue buscando"
+                )
+            else:
+                g_signal_state        = 'evaluating'
+                g_signal_type         = sig_type
+                g_signal_strictness   = strictness
+                g_signal_trigger_mult = value
+                g_session.signal_trigger_mult = value
+                g_session.state       = GlobalSession.EVALUATING
+                g_cooldown_mod        = SIGNAL_COOLDOWN
 
-            if g_session.col == 1:
-                g_session.start_ficha()
+                if g_session.col == 1:
+                    g_session.start_ficha()
 
-            logger.info(
-                f"🎯 SEÑAL {sig_type} (nivel {level}) "
-                f"Col{g_session.col} | Trigger: {value:.2f}x"
-            )
-            await _send_signal(value, sig_type, strictness)
+                logger.info(
+                    f"🎯 SEÑAL {sig_type} "
+                    f"Col{g_session.col} | Trigger: {value:.2f}x | Decimal: {decimal_part:.2f} ✅"
+                )
+                await _send_signal(value, sig_type, strictness)
 
 
 
@@ -746,7 +822,13 @@ async def _send_signal(trigger: float, signal_name: str, strictness: int):
     wins_bar = '⚪' * WINS_PER_CYCLE     # 2 círculos blancos (victorias meta)
 
     # Etiqueta de señal para log interno
-    sig_label = {1: 'S1 Wabe↑', 2: 'S2 Doble Piso', 3: 'S3 EMA3↑EMA4'}.get(strictness, f'S{strictness}')
+    sig_label_map = {
+        'Trend_2x': 'Tendencia 2x (Skrill)',
+        1: 'S1 Wabe↑',
+        2: 'S2 Doble Piso',
+        3: 'S3 EMA8↑EMA20',
+    }
+    sig_label = sig_label_map.get(signal_name) or sig_label_map.get(strictness, f'S{strictness}')
     logger.info(f"📤 Señal {sig_label} | Col{col} | Entrada {ents}/{MAX_COLS} | Ciclo {wins}/{WINS_PER_CYCLE}")
 
     txt = (
