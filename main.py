@@ -39,17 +39,17 @@ CURRENCY  = "BRL"
 GAME_ID   = 1301
 
 WIN_TARGET     = 2.00   # Umbral alcista/bajista del SISTEMA DE SEÑALES (EMAs, tendencia) — NO TOCAR
-BET_WIN_TARGET = 1.65   # Objetivo real de la apuesta: se gana si el resultado alcanza/supera este valor
-MAX_COLS       = 10
+BET_WIN_TARGET = 1.70   # Objetivo real de la apuesta: se gana si el resultado alcanza/supera este valor
+MAX_COLS       = 8
 MAX_ATTS       = 1
-WINS_PER_CYCLE = 4
+WINS_PER_CYCLE = 3
 BASE_BET       = 0.10
 
 THRESH_LOW_MAX = 51.0
 THRESH_MID_MIN = 29.0
 
 MAX_MULTS  = 400
-TRIM_MULTS = 200
+TRIM_MULTS = 250
 PERSIST_FILE = "spaceman_history.json"
 
 # ─── NIVEL MÍNIMO DE SEÑAL POR COLUMNA (exigencia creciente) ──────────────────
@@ -57,14 +57,12 @@ PERSIST_FILE = "spaceman_history.json"
 MIN_LEVEL_BY_COL = {
     1: 1,  # col1 acepta Moderado, Medio o Alto
     2: 1,
-    3: 1,  # col3 requiere al menos Medio
-    4: 2,
-    5: 2,  # col5 en adelante requiere Alto
+    3: 1,
+    4: 2,  # col4 requiere al menos Medio
+    5: 2,
     6: 2,
-    7: 3,
+    7: 3,  # col7 en adelante requiere Alto
     8: 3,
-    9: 3,
-    10: 3,
 }
 
 # Mapeo de nivel numérico a nombre para logs y mensajes
@@ -596,7 +594,10 @@ async def _dispatch_result(value: float, tipo: str, bet: float, attempt_num: int
     elif tipo == 'cycle_win':
         g_daily_wins += 1
         g_daily_cycles_won += 1
-        txt = f"<b>✅ GANAMOS {value:.2f}x — 🕐 {hora}</b>"
+        wins = g_session.wins_in_cycle
+        wins_bar = '🟢' * wins
+        txt = (f"<b>✅ GANAMOS {value:.2f}x — 🕐 {hora}</b>\n"
+               f"<b>💎 SESION {wins}/{WINS_PER_CYCLE} VICTORIAS {wins_bar}</b>")
         await broadcast(txt)
         await _broadcast_scoreboard()
         reset_global_session()
@@ -612,7 +613,8 @@ async def _dispatch_result(value: float, tipo: str, bet: float, attempt_num: int
     elif tipo == 'cycle_loss':
         g_daily_losses += 1
         g_daily_cycles_lost += 1
-        txt = f"<b>❌ PERDIMOS {value:.2f}x — 🕐 {hora}</b>"
+        txt = (f"<b>❌ PERDIMOS {value:.2f}x — 🕐 {hora}</b>\n"
+               f"<b>💎 SESION FINALIZADO 😭</b>")
         await broadcast(txt)
         await _broadcast_scoreboard()
         reset_global_session()
