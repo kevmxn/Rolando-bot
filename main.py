@@ -526,16 +526,16 @@ async def _broadcast_scoreboard():
     total_cyc = g_daily_cycles_won + g_daily_cycles_lost
     pct_cyc = (g_daily_cycles_won / total_cyc * 100) if total_cyc > 0 else 0.0
     hora = argentina_time()
-    txt = (f"📆 <b>MARCADOR DEL DÍA</b> — 🕐 <b>{hora}</b>\n"
-           f"┄┄┄┄┄┄┄┄┄┄┄┄┄┄┄┄┄┄┄┄┄┄┄\n"
-           f"✅ Ganadas: {g_daily_wins}\n"
-           f"❌ Perdidas: {g_daily_losses}\n"
-           f"📈 Acierto: {pct_sig:.1f}%\n"
-           f"┄┄┄┄┄┄┄┄┄┄┄┄┄┄┄┄┄┄┄┄┄┄┄\n"
-           f"🔄 Ciclos {MAX_COLS} entradas · {WINS_PER_CYCLE} victorias\n"
-           f"✅ Ganados: {g_daily_cycles_won}\n"
-           f"❌ Perdidos: {g_daily_cycles_lost}\n"
-           f"📈 Acierto: {pct_cyc:.1f}%")
+    txt = (f"<b>📆 MARCADOR DEL DÍA — 🕐 {hora}</b>\n"
+           f"<b>┄┄┄┄┄┄┄┄┄┄┄┄┄┄┄┄┄┄┄┄┄┄┄</b>\n"
+           f"<b>✅ Ganadas: {g_daily_wins}</b>\n"
+           f"<b>❌ Perdidas: {g_daily_losses}</b>\n"
+           f"<b>📈 Acierto: {pct_sig:.1f}%</b>\n"
+           f"<b>┄┄┄┄┄┄┄┄┄┄┄┄┄┄┄┄┄┄┄┄┄┄┄</b>\n"
+           f"<b>🔄 Ciclos {MAX_COLS} entradas · {WINS_PER_CYCLE} victorias</b>\n"
+           f"<b>✅ Ganados: {g_daily_cycles_won}</b>\n"
+           f"<b>❌ Perdidos: {g_daily_cycles_lost}</b>\n"
+           f"<b>📈 Acierto: {pct_cyc:.1f}%</b>")
     if g_scoreboard_msg_id:
         try:
             await bot.delete_message(CHANNEL_ID, g_scoreboard_msg_id)
@@ -568,17 +568,17 @@ async def _send_signal(trigger: float, level_name: str, level_num: int):
     ents = g_session.entries_in_cycle + 1
     wins = g_session.wins_in_cycle
     gestion_bar = render_gestion_bar(g_session.col_history, MAX_COLS, pending=True)
-    wins_bar = '⚪' * WINS_PER_CYCLE
+    wins_bar = '🟢' * wins + '⚫' * (WINS_PER_CYCLE - wins)
     logger.info(f"📤 Señal {level_name} | Col{col} | Entrada {ents}/{MAX_COLS} | Ciclo {wins}/{WINS_PER_CYCLE}")
-    txt = (f"🆔 <b>ENTRADA SPACEMAN</b> — 🕐 <b>{hora}</b>\n"
-           f"┄┄┄┄┄┄┄┄┄┄┄┄┄┄┄┄┄┄┄┄┄┄┄\n"
-           f"🧨 Después de: {trigger:.2f}x\n"
-           f"🎯 Objetivo: {BET_WIN_TARGET:.2f}x\n"
-           f"┄┄┄┄┄┄┄┄┄┄┄┄┄┄┄┄┄┄┄┄┄┄┄\n"
-           f"🔰 <b>Nivel de Gestión:</b>\n"
-           f"{gestion_bar}\n"
-           f"💎 Ciclo {wins}/{WINS_PER_CYCLE} victorias\n"
-           f"{wins_bar}")
+    txt = (f"<b>🆔 ENTRADA SPACEMAN — 🕐 {hora}</b>\n"
+           f"<b>┄┄┄┄┄┄┄┄┄┄┄┄┄┄┄┄┄┄┄┄┄┄┄</b>\n"
+           f"<b>🧨 Después de: {trigger:.2f}x</b>\n"
+           f"<b>🎯 Objetivo: {BET_WIN_TARGET:.2f}x</b>\n"
+           f"<b>┄┄┄┄┄┄┄┄┄┄┄┄┄┄┄┄┄┄┄┄┄┄┄</b>\n"
+           f"<b>🔰 Nivel de Gestión:</b>\n"
+           f"<b>{gestion_bar}</b>\n"
+           f"<b>💎 SESION {wins}/{WINS_PER_CYCLE} VICTORIAS</b>\n"
+           f"<b>{wins_bar}</b>")
     await broadcast_signal(txt)
 
 
@@ -589,30 +589,14 @@ async def _dispatch_result(value: float, tipo: str, bet: float, attempt_num: int
         g_daily_wins += 1
         wins = g_session.wins_in_cycle
         ents = g_session.entries_in_cycle
-        wins_bar = '🟢' * wins + '⚪' * (WINS_PER_CYCLE - wins)
-        gestion_bar = render_gestion_bar(g_session.col_history, MAX_COLS)
-        txt = (f"✅ <b>GANAMOS</b> <code>{value:.2f}x</code> — 🕐 <b>{hora}</b>\n"
-               f"┄┄┄┄┄┄┄┄┄┄┄┄┄┄┄┄┄┄┄┄┄┄┄\n"
-               f"💎 Ciclo  {wins_bar}  {wins}/{WINS_PER_CYCLE}\n"
-               f"🔰 <b>Nivel de Gestión:</b>\n"
-               f"{gestion_bar}")
+        wins_bar = '🟢' * wins + '⚫' * (WINS_PER_CYCLE - wins)
+        txt = f"<b>✅ GANAMOS {value:.2f}x — 🕐 {hora}</b>"
         await broadcast(txt)
         await _broadcast_scoreboard()
     elif tipo == 'cycle_win':
         g_daily_wins += 1
         g_daily_cycles_won += 1
-        total_cyc = g_daily_cycles_won + g_daily_cycles_lost
-        pct_cyc = (g_daily_cycles_won / total_cyc * 100) if total_cyc > 0 else 0.0
-        wins_bar = '🟢' * WINS_PER_CYCLE
-        gestion_bar = render_gestion_bar(g_session.col_history, MAX_COLS)
-        txt = (f"✅ <b>GANAMOS</b> <code>{value:.2f}x</code> — 🕐 <b>{hora}</b>\n"
-               f"┄┄┄┄┄┄┄┄┄┄┄┄┄┄┄┄┄┄┄┄┄┄┄\n"
-               f"❤️ <b>¡CICLO COMPLETADO!</b>\n"
-               f"{wins_bar}  {WINS_PER_CYCLE}/{WINS_PER_CYCLE} victorias\n"
-               f"🔰 <b>Nivel de Gestión:</b>\n"
-               f"{gestion_bar}\n"
-               f"💎 Ciclos ganados hoy: {g_daily_cycles_won} — {pct_cyc:.0f}%\n"
-               f"🔄 Nueva sesión iniciada")
+        txt = f"<b>✅ GANAMOS {value:.2f}x — 🕐 {hora}</b>"
         await broadcast(txt)
         await _broadcast_scoreboard()
         reset_global_session()
@@ -621,29 +605,14 @@ async def _dispatch_result(value: float, tipo: str, bet: float, attempt_num: int
         wins = g_session.wins_in_cycle
         ents = g_session.entries_in_cycle
         col = g_session.col
-        wins_bar = '🟢' * wins + '⚪' * (WINS_PER_CYCLE - wins)
-        gestion_bar = render_gestion_bar(g_session.col_history, MAX_COLS)
-        txt = (f"❌ <b>PERDIMOS</b> <code>{value:.2f}x</code> — 🕐 <b>{hora}</b>\n"
-               f"┄┄┄┄┄┄┄┄┄┄┄┄┄┄┄┄┄┄┄┄┄┄┄\n"
-               f"🔰 <b>Nivel de Gestión:</b>\n"
-               f"{gestion_bar}\n"
-               f"💎 Ciclo  {wins_bar}  {wins}/{WINS_PER_CYCLE}\n"
-               f"➡️ Siguiente entrada: Col {col}")
+        wins_bar = '🟢' * wins + '⚫' * (WINS_PER_CYCLE - wins)
+        txt = f"<b>❌ PERDIMOS {value:.2f}x — 🕐 {hora}</b>"
         await broadcast(txt)
         await _broadcast_scoreboard()
     elif tipo == 'cycle_loss':
         g_daily_losses += 1
         g_daily_cycles_lost += 1
-        total_cyc = g_daily_cycles_won + g_daily_cycles_lost
-        pct_cyc = (g_daily_cycles_won / total_cyc * 100) if total_cyc > 0 else 0.0
-        gestion_bar = render_gestion_bar(g_session.col_history, MAX_COLS)
-        txt = (f"❌ <b>PERDIMOS</b> <code>{value:.2f}x</code> — 🕐 <b>{hora}</b>\n"
-               f"┄┄┄┄┄┄┄┄┄┄┄┄┄┄┄┄┄┄┄┄┄┄┄\n"
-               f"😭 <b>¡CICLO PERDIDO!</b>\n"
-               f"🔰 <b>Nivel de Gestión:</b>\n"
-               f"{gestion_bar}\n"
-               f"💎 Ciclos ganados hoy: {g_daily_cycles_won} — {pct_cyc:.0f}%\n"
-               f"🔄 Nueva sesión iniciada")
+        txt = f"<b>❌ PERDIMOS {value:.2f}x — 🕐 {hora}</b>"
         await broadcast(txt)
         await _broadcast_scoreboard()
         reset_global_session()
