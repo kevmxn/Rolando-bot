@@ -1,9 +1,9 @@
 #!/usr/bin/env python3
 """
 ╔══════════════════════════════════════════════════╗
-║   SPACEMAN BOT — Sistema Moderado 2.00x         ║
-║   Señales: Maestro HTML (analyzeTrend)          ║
-║   Niveles: Medio | Moderado | Alto              ║
+║   SPACEMAN BOT — Sistema VB4 runPredictor       ║
+║   Señales: deep_VB4_websocket.html (5 checks)  ║
+║   Niveles: Moderado(3) | Medio(4) | Alto(5)    ║
 ║   Exigencia creciente por columna               ║
 ╚══════════════════════════════════════════════════╝
 """
@@ -38,14 +38,15 @@ CASINO_ID = "ppcdk00000005349"
 CURRENCY  = "BRL"
 GAME_ID   = 1301
 
-WIN_TARGET    = 2.00
-MAX_COLS       = 7
+WIN_TARGET     = 2.00   # Umbral alcista/bajista del SISTEMA DE SEÑALES (EMAs, tendencia) — NO TOCAR
+BET_WIN_TARGET = 1.65   # Objetivo real de la apuesta: se gana si el resultado alcanza/supera este valor
+MAX_COLS       = 10
 MAX_ATTS       = 1
-WINS_PER_CYCLE = 2
+WINS_PER_CYCLE = 4
 BASE_BET       = 0.10
 
-THRESH_LOW_MAX = 48.0
-THRESH_MID_MIN = 31.0
+THRESH_LOW_MAX = 51.0
+THRESH_MID_MIN = 29.0
 
 MAX_MULTS  = 400
 TRIM_MULTS = 200
@@ -56,11 +57,14 @@ PERSIST_FILE = "spaceman_history.json"
 MIN_LEVEL_BY_COL = {
     1: 1,  # col1 acepta Moderado, Medio o Alto
     2: 1,
-    3: 2,  # col3 requiere al menos Medio
+    3: 1,  # col3 requiere al menos Medio
     4: 2,
-    5: 3,  # col5 requiere Alto
-    6: 3,
+    5: 2,  # col5 en adelante requiere Alto
+    6: 2,
     7: 3,
+    8: 3,
+    9: 3,
+    10: 3,
 }
 
 # Mapeo de nivel numérico a nombre para logs y mensajes
@@ -77,6 +81,7 @@ g_positions: list = []
 g_ema3:  list     = []
 g_ema4:  list     = []
 g_ema8:  list     = []
+g_ema12: list     = []
 g_ema20: list     = []
 
 SIGNAL_COOLDOWN = 6
@@ -172,7 +177,7 @@ def save_mults_to_disk():
 
 
 def load_mults_from_disk():
-    global g_mults, g_positions, g_ema3, g_ema4, g_ema8, g_ema20
+    global g_mults, g_positions, g_ema3, g_ema4, g_ema8, g_ema12, g_ema20
     global g_daily_wins, g_daily_losses, g_daily_date
     if not os.path.exists(PERSIST_FILE):
         logger.info("Sin historial previo")
@@ -190,6 +195,7 @@ def load_mults_from_disk():
         g_ema3 = calc_ema(g_positions, 3)
         g_ema4 = calc_ema(g_positions, 4)
         g_ema8 = calc_ema(g_positions, 8)
+        g_ema12 = calc_ema(g_positions, 12)
         g_ema20 = calc_ema(g_positions, 20)
         for m in g_mults:
             g_seen_ids.add(str(m['id']))
@@ -248,30 +254,89 @@ def quota_stats_text(stats: dict) -> str:
             f"🔴 Cuotas (+10.00x):    <code>{stats['count_1000_plus']}</code> — {stats['pct_1000_plus']:.2f}%\n\n{fav_line}\n")
 
 
-# ─── DETECCIÓN DE SEÑALES (HTML analyzeTrend) ─────────────────────────────────
+# ─── DETECCIÓN DE SEÑALES (VB4 runPredictor — 5 checks, señal si ≥3) ─────────
+def classify_force(value: float) -> int:
+    """Mapea un multiplicador crudo a fuerza (−10..+10), igual que classify() del HTML."""
+    v = float(value)
+    if 1.00 <= v < 1.10: return -10
+    if 1.10 <= v < 1.20: return -9
+    if 1.20 <= v < 1.30: return -8
+    if 1.30 <= v < 1.40: return -7
+    if 1.40 <= v < 1.50: return -6
+    if 1.50 <= v < 1.60: return -5
+    if 1.60 <= v < 1.70: return -4
+    if 1.70 <= v < 1.80: return -3
+    if 1.80 <= v < 1.90: return -2
+    if 1.90 <= v < 2.00: return -1
+    if 2.00 <= v < 3.00: return 1
+    if 3.00 <= v < 4.00: return 2
+    if 4.00 <= v < 5.00: return 3
+    if 5.00 <= v < 6.00: return 4
+    if 6.00 <= v < 7.00: return 5
+    if 7.00 <= v < 8.00: return 6
+    if 8.00 <= v < 9.00: return 7
+    if 9.00 <= v < 10.00: return 8
+    if 10.00 <= v < 15.00: return 9
+    if v >= 15.00: return 10
+    return 0
+
+
 def check_html_signal(data: list) -> Tuple[bool, Optional[str], Optional[int]]:
-    """Retorna (detectada, nombre_nivel, nivel_numérico)."""
-    if len(data) < 3:
+    """
+    Replica el runPredictor() de deep_VB4_websocket.html.
+    5 checks — señal si trueCount >= 3.
+
+    Niveles asignados según cuántos checks pasan:
+      3/5 → Moderado (1)
+      4/5 → Medio    (2)
+      5/5 → Alto     (3)
+
+    Retorna (detectada, nombre_nivel, nivel_numérico).
+    """
+    if len(data) < 10:
         return False, None, None
-    recent = data[-10:] if len(data) >= 10 else data[:]
-    vals = [d['value'] for d in recent]
-    total = len(vals)
-    avg = sum(vals) / total
-    last3avg = sum(vals[:3]) / 3 if total >= 3 else avg
-    last_is_green = vals[0] >= 2.0
-    second_last = vals[1] if total > 1 else vals[0]
-    streak = 0
-    for v in vals:
-        if v >= 2.0:
-            break
-        streak += 1
-    # Condiciones en orden: S1 -> Moderado, S2 -> Medio, S3 -> Alto
-    if streak >= 3 and last_is_green:
-        return True, "Moderado", 1
-    if second_last < 2.0 and last_is_green:
-        return True, "Medio", 2
-    if last_is_green and last3avg > avg:
+
+    vals   = [m['value'] for m in data]   # cronológico ascendente (más viejo primero)
+    forces = [classify_force(v) for v in vals]
+
+    # ── Check 1: EMA(4) > EMA(12) Y EMA(4) subiendo ──────────────────────────
+    ema4_series  = g_ema4
+    ema12_series = g_ema12
+    check1 = False
+    if len(ema4_series) >= 2 and len(ema12_series) >= 1:
+        f_now  = ema4_series[-1]
+        f_prev = ema4_series[-2]
+        s_now  = ema12_series[-1]
+        check1 = (f_now > s_now) and (f_now > f_prev)
+
+    # ── Check 2: ≥5 de las últimas 8 barras son alcistas (value >= 2.00) ─────
+    last8 = vals[-8:]
+    check2 = sum(1 for v in last8 if v >= 2.00) >= 5
+
+    # ── Check 3: promedio fuerza últimas 4 > promedio fuerza previas 4 ───────
+    check3 = False
+    if len(forces) >= 8:
+        recent_avg = sum(forces[-4:]) / 4
+        prev_avg   = sum(forces[-8:-4]) / 4
+        check3 = recent_avg > prev_avg - 0.1
+
+    # ── Check 4: pendiente del acumulado (miniCum) positiva en últimas 5 ─────
+    check4 = False
+    if len(g_positions) >= 5:
+        check4 = (g_positions[-1] - g_positions[-5]) > 0
+
+    # ── Check 5: último resultado alcista Y fuerza positiva ──────────────────
+    check5 = (vals[-1] >= 2.00) and (forces[-1] > 0)
+
+    true_count = sum([check1, check2, check3, check4, check5])
+    logger.debug(f"VB4 checks: {check1}{check2}{check3}{check4}{check5} = {true_count}/5")
+
+    if true_count >= 5:
         return True, "Alto", 3
+    if true_count == 4:
+        return True, "Medio", 2
+    if true_count == 3:
+        return True, "Moderado", 1
     return False, None, None
 
 
@@ -296,6 +361,7 @@ class GlobalSession:
         self.attempt1_result_value = 0.0
         self.fichas = carry_fichas if carry_fichas is not None else []
         self._cur_ficha = None
+        self.col_history: list = []  # 'win'/'loss' por cada entrada del ciclo actual (orden cronológico)
 
     def start_ficha(self):
         self._cur_ficha = {'n': len(self.fichas) + 1,
@@ -312,6 +378,7 @@ class GlobalSession:
         if win:
             self.wins += 1
             self.wins_in_cycle += 1
+            self.col_history.append('win')
             self.lost = 0.0
             self.cur_bet = self.base_bet
             self.col = 1
@@ -329,6 +396,7 @@ class GlobalSession:
             return ('win', prev_bet)
         else:
             self.losses += 1
+            self.col_history.append('loss')
             self.lost += prev_bet
             self.cur_bet = self.lost + self.base_bet
             self.col += 1
@@ -365,7 +433,7 @@ def reset_global_session():
 # ─── PROCESADOR DE MULTIPLICADORES (señales con exigencia por columna) ────────
 async def process_multiplier(value: float, round_id: str):
     global g_signal_state, g_signal_type, g_signal_strictness, g_signal_trigger_mult
-    global g_positions, g_ema3, g_ema4, g_ema8, g_ema20, g_mults, g_seen_ids
+    global g_positions, g_ema3, g_ema4, g_ema8, g_ema12, g_ema20, g_mults, g_seen_ids
     global g_trend_favorable, g_session, g_cooldown_mod, _persist_counter
 
     logger.info(f"🎲 {value:.2f}x | ID: {round_id} | Señal: {g_signal_state}/{g_signal_type}")
@@ -374,7 +442,7 @@ async def process_multiplier(value: float, round_id: str):
 
     # Fase 1: Evaluar resultado pendiente
     if g_signal_state == 'evaluating' and g_session.state == GlobalSession.EVALUATING:
-        win = value >= WIN_TARGET
+        win = value >= BET_WIN_TARGET
         tipo, bet = g_session.on_result(win)
         await _dispatch_result(value, tipo, bet, attempt_num=g_session.attempt)
         g_signal_state = 'idle'
@@ -384,7 +452,7 @@ async def process_multiplier(value: float, round_id: str):
 
     g_cooldown_mod = max(0, g_cooldown_mod - 1)
 
-    # Actualizar datos
+    # Actualizar datos (sistema de detección de señales — usa WIN_TARGET fijo, no cambia)
     increment = 1 if value >= WIN_TARGET else -1
     prev = g_positions[-1] if g_positions else 0
     g_positions.append(prev + increment)
@@ -402,6 +470,7 @@ async def process_multiplier(value: float, round_id: str):
     g_ema3 = calc_ema(g_positions, 3)
     g_ema4 = calc_ema(g_positions, 4)
     g_ema8 = calc_ema(g_positions, 8)
+    g_ema12 = calc_ema(g_positions, 12)
     g_ema20 = calc_ema(g_positions, 20)
 
     if len(g_seen_ids) > 2000:
@@ -478,21 +547,36 @@ async def _broadcast_scoreboard():
 
 
 # ─── MENSAJERÍA ───────────────────────────────────────────────────────────────
+def render_gestion_bar(history: list, total: int, pending: bool = False) -> str:
+    """
+    Construye la barra de 'Nivel de Gestión' con el historial real de la sesión.
+    🟢 = entrada ganada · 🔴 = entrada perdida · 🔵 = entrada en curso (pendiente) · ⚫ = aún no jugada
+    """
+    chars = ['🟢' if r == 'win' else '🔴' for r in history]
+    if pending:
+        chars.append('🔵')
+    if len(chars) < total:
+        chars.extend(['⚫'] * (total - len(chars)))
+    else:
+        chars = chars[:total]
+    return ''.join(chars)
+
+
 async def _send_signal(trigger: float, level_name: str, level_num: int):
     hora = argentina_time()
     col = g_session.col
     ents = g_session.entries_in_cycle + 1
     wins = g_session.wins_in_cycle
-    ents_bar = '⚫' * (ents - 1) + '🔵' + '⚫' * (MAX_COLS - ents)
+    gestion_bar = render_gestion_bar(g_session.col_history, MAX_COLS, pending=True)
     wins_bar = '⚪' * WINS_PER_CYCLE
     logger.info(f"📤 Señal {level_name} | Col{col} | Entrada {ents}/{MAX_COLS} | Ciclo {wins}/{WINS_PER_CYCLE}")
     txt = (f"🆔 <b>ENTRADA SPACEMAN</b> — 🕐 <b>{hora}</b>\n"
            f"┄┄┄┄┄┄┄┄┄┄┄┄┄┄┄┄┄┄┄┄┄┄┄\n"
            f"🧨 Después de: {trigger:.2f}x\n"
-           f"🎯 Objetivo: 2.00x\n"
+           f"🎯 Objetivo: {BET_WIN_TARGET:.2f}x\n"
            f"┄┄┄┄┄┄┄┄┄┄┄┄┄┄┄┄┄┄┄┄┄┄┄\n"
-           f"🔰 Col {col}  |  Entradas {ents}/{MAX_COLS}\n"
-           f"{ents_bar}\n"
+           f"🔰 <b>Nivel de Gestión:</b>\n"
+           f"{gestion_bar}\n"
            f"💎 Ciclo {wins}/{WINS_PER_CYCLE} victorias\n"
            f"{wins_bar}")
     await broadcast_signal(txt)
@@ -506,10 +590,12 @@ async def _dispatch_result(value: float, tipo: str, bet: float, attempt_num: int
         wins = g_session.wins_in_cycle
         ents = g_session.entries_in_cycle
         wins_bar = '🟢' * wins + '⚪' * (WINS_PER_CYCLE - wins)
+        gestion_bar = render_gestion_bar(g_session.col_history, MAX_COLS)
         txt = (f"✅ <b>GANAMOS</b> <code>{value:.2f}x</code> — 🕐 <b>{hora}</b>\n"
                f"┄┄┄┄┄┄┄┄┄┄┄┄┄┄┄┄┄┄┄┄┄┄┄\n"
                f"💎 Ciclo  {wins_bar}  {wins}/{WINS_PER_CYCLE}\n"
-               f"🔰 Entradas usadas: {ents}/{MAX_COLS}")
+               f"🔰 <b>Nivel de Gestión:</b>\n"
+               f"{gestion_bar}")
         await broadcast(txt)
         await _broadcast_scoreboard()
     elif tipo == 'cycle_win':
@@ -518,10 +604,13 @@ async def _dispatch_result(value: float, tipo: str, bet: float, attempt_num: int
         total_cyc = g_daily_cycles_won + g_daily_cycles_lost
         pct_cyc = (g_daily_cycles_won / total_cyc * 100) if total_cyc > 0 else 0.0
         wins_bar = '🟢' * WINS_PER_CYCLE
+        gestion_bar = render_gestion_bar(g_session.col_history, MAX_COLS)
         txt = (f"✅ <b>GANAMOS</b> <code>{value:.2f}x</code> — 🕐 <b>{hora}</b>\n"
                f"┄┄┄┄┄┄┄┄┄┄┄┄┄┄┄┄┄┄┄┄┄┄┄\n"
                f"❤️ <b>¡CICLO COMPLETADO!</b>\n"
                f"{wins_bar}  {WINS_PER_CYCLE}/{WINS_PER_CYCLE} victorias\n"
+               f"🔰 <b>Nivel de Gestión:</b>\n"
+               f"{gestion_bar}\n"
                f"💎 Ciclos ganados hoy: {g_daily_cycles_won} — {pct_cyc:.0f}%\n"
                f"🔄 Nueva sesión iniciada")
         await broadcast(txt)
@@ -532,11 +621,12 @@ async def _dispatch_result(value: float, tipo: str, bet: float, attempt_num: int
         wins = g_session.wins_in_cycle
         ents = g_session.entries_in_cycle
         col = g_session.col
-        ents_bar = '⚫' * (ents - 1) + '🔴' + '⚫' * (MAX_COLS - ents)
         wins_bar = '🟢' * wins + '⚪' * (WINS_PER_CYCLE - wins)
-        txt = (f"❌ <b>PERDIMOS</b> <code>{value:.2f}x</code> — 🕐 {hora}\n"
+        gestion_bar = render_gestion_bar(g_session.col_history, MAX_COLS)
+        txt = (f"❌ <b>PERDIMOS</b> <code>{value:.2f}x</code> — 🕐 <b>{hora}</b>\n"
                f"┄┄┄┄┄┄┄┄┄┄┄┄┄┄┄┄┄┄┄┄┄┄┄\n"
-               f"🔰 {ents_bar}  {ents}/{MAX_COLS}\n"
+               f"🔰 <b>Nivel de Gestión:</b>\n"
+               f"{gestion_bar}\n"
                f"💎 Ciclo  {wins_bar}  {wins}/{WINS_PER_CYCLE}\n"
                f"➡️ Siguiente entrada: Col {col}")
         await broadcast(txt)
@@ -546,11 +636,12 @@ async def _dispatch_result(value: float, tipo: str, bet: float, attempt_num: int
         g_daily_cycles_lost += 1
         total_cyc = g_daily_cycles_won + g_daily_cycles_lost
         pct_cyc = (g_daily_cycles_won / total_cyc * 100) if total_cyc > 0 else 0.0
-        ents_bar = '🔴' * MAX_COLS
+        gestion_bar = render_gestion_bar(g_session.col_history, MAX_COLS)
         txt = (f"❌ <b>PERDIMOS</b> <code>{value:.2f}x</code> — 🕐 <b>{hora}</b>\n"
                f"┄┄┄┄┄┄┄┄┄┄┄┄┄┄┄┄┄┄┄┄┄┄┄\n"
                f"😭 <b>¡CICLO PERDIDO!</b>\n"
-               f"{ents_bar}  {MAX_COLS}/{MAX_COLS} entradas\n"
+               f"🔰 <b>Nivel de Gestión:</b>\n"
+               f"{gestion_bar}\n"
                f"💎 Ciclos ganados hoy: {g_daily_cycles_won} — {pct_cyc:.0f}%\n"
                f"🔄 Nueva sesión iniciada")
         await broadcast(txt)
@@ -655,7 +746,7 @@ async def cmd_start(message):
         f"🚀 <b>¡Bienvenido {name}!</b>\n\n"
         "━━━━━━━━━━━━━━━━━━━━━━━\n"
         "🤖 <b>Bot de Señales Spaceman</b>\n"
-        "📊 Sistema Moderado | Objetivo: <code>2.00x</code>\n"
+        f"📊 Sistema Moderado | Objetivo: <code>{BET_WIN_TARGET:.2f}x</code>\n"
         f"🔄 Gestión: <code>{MAX_COLS}</code> Entradas × <code>{WINS_PER_CYCLE}</code> Victorias/Ciclo\n"
         f"💵 Apuesta base fija: <code>${BASE_BET:.2f}</code>\n"
         "━━━━━━━━━━━━━━━━━━━━━━━\n"
