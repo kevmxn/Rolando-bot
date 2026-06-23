@@ -238,7 +238,7 @@ def get_quota_stats(n: int = 200) -> dict:
 def quota_stats_text(stats: dict) -> str:
     if stats['total'] == 0:
         return "📡 <i>Sin datos suficientes.</i>\n"
-    n_label = "200" if stats['has_enough'] else str(stats['total']) + " (acumulando...)"
+    n_label = "300" if stats["has_enough"] else str(stats["total"]) + " (acumulando...)"
     r1_flag = " ✅" if stats['pct_100_199'] <= THRESH_LOW_MAX else " ❌"
     r2_flag = " ✅" if stats['pct_200_499'] >= THRESH_MID_MIN else " ❌"
     fav_line = ("✅ <b>¡TENDENCIA FAVORABLE!</b>\n      <i>Se recomienda operar</i>"
@@ -477,7 +477,7 @@ async def process_multiplier(value: float, round_id: str):
             g_seen_ids.discard(oid)
 
     # Tendencia
-    stats_trend = get_quota_stats(200)
+    stats_trend = get_quota_stats(300)
     if stats_trend['total'] >= 10 and stats_trend['favorable'] != g_trend_favorable:
         g_trend_favorable = stats_trend['favorable']
         logger.info(f"Tendencia → {'FAVORABLE' if g_trend_favorable else 'DESFAVORABLE'}")
@@ -708,7 +708,7 @@ async def self_ping_loop():
 async def cmd_start(message):
     name = message.from_user.first_name or "usuario"
     g_all_chats.add(message.chat.id)
-    stats = get_quota_stats(200)
+    stats = get_quota_stats(300)
     stats_blk = quota_stats_text(stats)
     data_info = f"📡 <code>{len(g_mults)}/400</code> multiplicadores" if g_mults else "📡 Recopilando datos..."
     await bot.reply_to(message,
@@ -728,7 +728,7 @@ async def cmd_start(message):
 async def cmd_estadisticas(message):
     g_all_chats.add(message.chat.id)
     s = g_session
-    stats = get_quota_stats(200)
+    stats = get_quota_stats(300)
     trend = quota_stats_text(stats)
     fichas_recientes = s.fichas[-15:]
     if fichas_recientes:
@@ -760,11 +760,11 @@ async def cmd_estadisticas(message):
 async def cmd_tendencia(message):
     g_all_chats.add(message.chat.id)
     hora = argentina_time()
-    stats = get_quota_stats(200)
+    stats = get_quota_stats(300)
     if stats['total'] == 0:
         await bot.reply_to(message, "📡 <i>Sin datos suficientes.</i>", parse_mode='HTML')
         return
-    n_label = "200" if stats['has_enough'] else str(stats['total'])
+    n_label = "300" if stats["has_enough"] else str(stats["total"])
     r1_flag = "✅" if stats['pct_100_199'] <= THRESH_LOW_MAX else "❌"
     r2_flag = "✅" if stats['pct_200_499'] >= THRESH_MID_MIN else "❌"
     header = f"🟢 TENDENCIA FAVORABLE — {hora}" if stats['favorable'] else f"🔴 TENDENCIA DESFAVORABLE — {hora}"
