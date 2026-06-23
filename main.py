@@ -39,17 +39,17 @@ CURRENCY  = "BRL"
 GAME_ID   = 1301
 
 WIN_TARGET     = 2.00   # Umbral alcista/bajista del SISTEMA DE SEÑALES (EMAs, tendencia) — NO TOCAR
-BET_WIN_TARGET = 1.70   # Objetivo real de la apuesta: se gana si el resultado alcanza/supera este valor
+BET_WIN_TARGET = 3.00   # Objetivo real de la apuesta: se gana si el resultado alcanza/supera este valor
 MAX_COLS       = 8
 MAX_ATTS       = 1
-WINS_PER_CYCLE = 3
+WINS_PER_CYCLE = 1
 BASE_BET       = 0.10
 
 THRESH_LOW_MAX = 51.0
 THRESH_MID_MIN = 29.0
 
 MAX_MULTS  = 400
-TRIM_MULTS = 250
+TRIM_MULTS = 300
 PERSIST_FILE = "spaceman_history.json"
 
 # ─── NIVEL MÍNIMO DE SEÑAL POR COLUMNA (exigencia creciente) ──────────────────
@@ -573,10 +573,8 @@ async def _send_signal(trigger: float, level_name: str, level_num: int):
            f"<b>🧨 Después de: {trigger:.2f}x</b>\n"
            f"<b>🎯 Objetivo: {BET_WIN_TARGET:.2f}x</b>\n"
            f"<b>┄┄┄┄┄┄┄┄┄┄┄┄┄┄┄┄┄┄┄┄┄┄┄</b>\n"
-           f"<b>🔰 Nivel de Gestión:</b>\n"
-           f"<b>{gestion_bar}</b>\n"
-           f"<b>💎 SESION {wins}/{WINS_PER_CYCLE} VICTORIAS</b>\n"
-           f"<b>{wins_bar}</b>")
+           f"<b>💎GESTION DE ENTRADAS:</b>\n"
+           f"<b>{gestion_bar}</b>")
     await broadcast_signal(txt)
 
 
