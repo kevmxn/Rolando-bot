@@ -1,10 +1,10 @@
 #!/usr/bin/env python3
 """
 ╔══════════════════════════════════════════════════╗
-║   SPACEMAN BOT — Sistema VB4 runPredictor       ║
-║   Señales: deep_VB4_websocket.html (5 checks)  ║
-║   Niveles: Moderado(3) | Medio(4) | Alto(5)    ║
-║   Exigencia creciente por columna               ║
+║   SPACEMAN BOT — Sistema 2x por Tiempo          ║
+║   Señales: spaceman_2x_signal.html              ║
+║   Lógica: ventana ~20s antes del ETA promedio   ║
+║   Objetivo de apuesta: 2.00x                    ║
 ╚══════════════════════════════════════════════════╝
 """
 
@@ -38,60 +38,40 @@ CASINO_ID = "ppcdk00000005349"
 CURRENCY  = "BRL"
 GAME_ID   = 1301
 
-WIN_TARGET     = 2.00   # Umbral alcista/bajista del SISTEMA DE SEÑALES (EMAs, tendencia) — NO TOCAR
-BET_WIN_TARGET = 3.00   # Objetivo real de la apuesta: se gana si el resultado alcanza/supera este valor
+WIN_TARGET     = 2.00   # Umbral para registrar evento y para resolver señal
+BET_WIN_TARGET = 2.00   # Objetivo real de la apuesta: se gana si resultado >= 2.00x
 MAX_COLS       = 8
 MAX_ATTS       = 1
 WINS_PER_CYCLE = 1
 BASE_BET       = 0.10
 
-THRESH_LOW_MAX = 51.0
-THRESH_MID_MIN = 29.0
+# ─── SISTEMA 2X POR TIEMPO ────────────────────────────────────────────────────
+MIN_EVENTS_2X     = 25     # Mínimo de eventos ≥2x para evaluar señales
+SIGNAL_WINDOW_SEC = 20     # Ventana (segundos antes del ETA) para disparar señal
+MAX_EVENTS_2X     = 200    # Historial máximo de timestamps de eventos 2x
 
 MAX_MULTS  = 400
 TRIM_MULTS = 300
 PERSIST_FILE = "spaceman_history.json"
 
-# ─── NIVEL MÍNIMO DE SEÑAL POR COLUMNA (exigencia creciente) ──────────────────
-# 1 = Moderado, 2 = Medio, 3 = Alto
-MIN_LEVEL_BY_COL = {
-    1: 1,  # col1 acepta Moderado, Medio o Alto
-    2: 1,
-    3: 1,
-    4: 2,  # col4 requiere al menos Medio
-    5: 2,
-    6: 2,
-    7: 3,  # col7 en adelante requiere Alto
-    8: 3,
-}
-
-# Mapeo de nivel numérico a nombre para logs y mensajes
-LEVEL_NAMES = {
-    1: "Moderado",
-    2: "Medio",
-    3: "Alto",
-}
-
 # ─── ESTADO GLOBAL ────────────────────────────────────────────────────────────
 g_mults:    list  = []
 g_seen_ids: set   = set()
 g_positions: list = []
-g_ema3:  list     = []
-g_ema4:  list     = []
-g_ema8:  list     = []
-g_ema12: list     = []
-g_ema20: list     = []
 
-SIGNAL_COOLDOWN = 6
+# ─── ESTADO DEL SISTEMA 2X POR TIEMPO ────────────────────────────────────────
+g_events2x: list = []      # Timestamps (float) de cada ronda ≥ 2x
+g_gaps2x:   list = []      # Intervalos en segundos entre eventos consecutivos
+g_signal_armed: bool = False   # True cuando ya entramos en ventana de señal
+g_last_signal_fire: float = 0  # Timestamp del último disparo (antiflood 30s)
+
+SIGNAL_COOLDOWN = 30    # Antiflood: segundos mínimos entre señales consecutivas
 g_cooldown_mod  = 0
 
 g_signal_state        = 'idle'
-g_signal_type: Optional[str] = None
-g_signal_strictness: int     = 0
 g_signal_trigger_mult: float = 0.0
 
-g_all_chats: set              = set()
-g_trend_favorable: Optional[bool] = None
+g_all_chats: set = set()
 
 g_daily_wins:        int = 0
 g_daily_losses:      int = 0
@@ -143,15 +123,70 @@ async def delete_last_signal():
     g_last_signal_msgs.clear()
 
 
-# ─── EMAs ─────────────────────────────────────────────────────────────────────
-def calc_ema(data: list, period: int) -> list:
-    if not data:
-        return []
-    k = 2 / (period + 1)
-    ema = [data[0]]
-    for i in range(1, len(data)):
-        ema.append((data[i] - ema[i - 1]) * k + ema[i - 1])
-    return ema
+
+# ─── SISTEMA 2X POR TIEMPO (portado de spaceman_2x_signal.html) ───────────────
+def avg_sec(lst: list) -> Optional[float]:
+    """Promedio de una lista de floats. Retorna None si está vacía."""
+    return sum(lst) / len(lst) if lst else None
+
+
+def check_2x_timing_signal() -> bool:
+    """
+    Replica la lógica de update2xPredictor() del HTML.
+    Retorna True si el tiempo transcurrido desde el último evento 2x
+    está dentro de la ventana de disparo (avgGap - SIGNAL_WINDOW_SEC).
+    Requisitos:
+      - Al menos MIN_EVENTS_2X eventos ≥ 2x registrados
+      - Al menos 3 intervalos calculados
+      - El elapsed >= avgGap - SIGNAL_WINDOW_SEC
+    """
+    if len(g_events2x) < MIN_EVENTS_2X:
+        return False
+    gaps = g_gaps2x
+    if len(gaps) < 3:
+        return False
+    avg_gap = avg_sec(gaps)
+    if avg_gap is None or avg_gap <= 0:
+        return False
+    last_event = g_events2x[-1]
+    elapsed = time.time() - last_event
+    eta = avg_gap - elapsed
+    # Disparar cuando estamos dentro de la ventana de SIGNAL_WINDOW_SEC segundos
+    in_window = 0 <= eta <= SIGNAL_WINDOW_SEC
+    logger.debug(
+        f"2xTimer | avg={avg_gap:.1f}s elapsed={elapsed:.1f}s eta={eta:.1f}s "
+        f"window={in_window} events={len(g_events2x)}"
+    )
+    return in_window
+
+
+def register_event_2x(ts: float):
+    """Registra un nuevo evento ≥ 2x y actualiza los intervalos."""
+    global g_events2x, g_gaps2x
+    if g_events2x:
+        gap = ts - g_events2x[-1]
+        if gap > 0:
+            g_gaps2x.append(gap)
+    g_events2x.append(ts)
+    # Mantener historial acotado
+    if len(g_events2x) > MAX_EVENTS_2X:
+        g_events2x = g_events2x[-MAX_EVENTS_2X:]
+    if len(g_gaps2x) > MAX_EVENTS_2X:
+        g_gaps2x = g_gaps2x[-MAX_EVENTS_2X:]
+
+
+def quota_stats_text(events: int, gaps: list) -> str:
+    """Texto informativo del estado del predictor 2x."""
+    if events < MIN_EVENTS_2X:
+        return f"📡 <i>Acumulando datos... ({events}/{MIN_EVENTS_2X} eventos ≥2x)</i>\n"
+    avg = avg_sec(gaps)
+    if not avg:
+        return "📡 <i>Sin intervalos calculados aún.</i>\n"
+    last_gap = gaps[-1] if gaps else 0
+    return (f"📈 <b>Predictor 2x por Tiempo</b>\n"
+            f"⏱ Intervalo promedio: <code>{avg:.1f}s</code>\n"
+            f"⏱ Último intervalo: <code>{last_gap:.1f}s</code>\n"
+            f"📊 Eventos ≥2x: <code>{events}</code>\n")
 
 
 # ─── PERSISTENCIA ─────────────────────────────────────────────────────────────
@@ -159,7 +194,8 @@ def save_mults_to_disk():
     try:
         payload = {
             'mults': [{'id': m['id'], 'value': m['value'], 'ts': m['ts']} for m in g_mults],
-            'positions': g_positions,
+            'events2x': g_events2x,
+            'gaps2x': g_gaps2x,
             'daily_wins': g_daily_wins,
             'daily_losses': g_daily_losses,
             'daily_cycles_won': g_daily_cycles_won,
@@ -175,8 +211,8 @@ def save_mults_to_disk():
 
 
 def load_mults_from_disk():
-    global g_mults, g_positions, g_ema3, g_ema4, g_ema8, g_ema12, g_ema20
-    global g_daily_wins, g_daily_losses, g_daily_date
+    global g_mults, g_events2x, g_gaps2x
+    global g_daily_wins, g_daily_losses, g_daily_date, g_daily_cycles_won, g_daily_cycles_lost
     if not os.path.exists(PERSIST_FILE):
         logger.info("Sin historial previo")
         return
@@ -184,19 +220,14 @@ def load_mults_from_disk():
         with open(PERSIST_FILE) as f:
             data = json.load(f)
         loaded_mults = data.get('mults', [])
-        loaded_pos = data.get('positions', [])
         if len(loaded_mults) > MAX_MULTS:
             loaded_mults = loaded_mults[-TRIM_MULTS:]
-            loaded_pos = loaded_pos[-TRIM_MULTS:]
         g_mults[:] = loaded_mults
-        g_positions[:] = loaded_pos
-        g_ema3 = calc_ema(g_positions, 3)
-        g_ema4 = calc_ema(g_positions, 4)
-        g_ema8 = calc_ema(g_positions, 8)
-        g_ema12 = calc_ema(g_positions, 12)
-        g_ema20 = calc_ema(g_positions, 20)
         for m in g_mults:
             g_seen_ids.add(str(m['id']))
+        # Restaurar timing 2x
+        g_events2x[:] = data.get('events2x', [])[-MAX_EVENTS_2X:]
+        g_gaps2x[:]   = data.get('gaps2x', [])[-MAX_EVENTS_2X:]
         saved_date = data.get('daily_date', '')
         today_arg = (datetime.utcnow() - timedelta(hours=3)).strftime("%Y-%m-%d")
         if saved_date == today_arg:
@@ -208,135 +239,12 @@ def load_mults_from_disk():
         else:
             g_daily_wins = g_daily_losses = g_daily_cycles_won = g_daily_cycles_lost = 0
             g_daily_date = today_arg
-        logger.info(f"Historial cargado: {len(g_mults)} mults")
+        logger.info(f"Historial cargado: {len(g_mults)} mults | {len(g_events2x)} eventos2x")
     except Exception as e:
         logger.warning(f"Error cargando: {e}")
 
 
-# ─── ESTADÍSTICAS DE CUOTAS ───────────────────────────────────────────────────
-def get_quota_stats(n: int = 200) -> dict:
-    data = g_mults[-n:] if len(g_mults) >= n else g_mults[:]
-    total = len(data)
-    if total == 0:
-        return {'total': 0, 'has_enough': False, 'favorable': None,
-                'count_100_199': 0, 'count_200_499': 0, 'count_500_999': 0, 'count_1000_plus': 0,
-                'pct_100_199': 0.0, 'pct_200_499': 0.0, 'pct_500_999': 0.0, 'pct_1000_plus': 0.0}
-    r1 = sum(1 for m in data if 1.00 <= m['value'] < 2.00)
-    r2 = sum(1 for m in data if 2.00 <= m['value'] < 5.00)
-    r3 = sum(1 for m in data if 5.00 <= m['value'] < 10.00)
-    r4 = sum(1 for m in data if m['value'] >= 10.00)
-    pct1 = r1 / total * 100
-    pct2 = r2 / total * 100
-    unfavorable = pct1 > THRESH_LOW_MAX or pct2 < THRESH_MID_MIN
-    return {
-        'total': total, 'has_enough': total >= 200, 'favorable': not unfavorable,
-        'count_100_199': r1, 'count_200_499': r2, 'count_500_999': r3, 'count_1000_plus': r4,
-        'pct_100_199': pct1, 'pct_200_499': pct2, 'pct_500_999': r3/total*100, 'pct_1000_plus': r4/total*100,
-    }
-
-
-def quota_stats_text(stats: dict) -> str:
-    if stats['total'] == 0:
-        return "📡 <i>Sin datos suficientes.</i>\n"
-    n_label = "300" if stats["has_enough"] else str(stats["total"]) + " (acumulando...)"
-    r1_flag = " ✅" if stats['pct_100_199'] <= THRESH_LOW_MAX else " ❌"
-    r2_flag = " ✅" if stats['pct_200_499'] >= THRESH_MID_MIN else " ❌"
-    fav_line = ("✅ <b>¡TENDENCIA FAVORABLE!</b>\n      <i>Se recomienda operar</i>"
-                if stats['favorable'] else
-                "⚠️ <b>TENDENCIA DESFAVORABLE</b>\n      <i>Se recomienda esperar</i>")
-    return (f"📈 <b>Análisis de la Tendencia últimos</b>\n"
-            f"      <b>{n_label} multiplicadores</b>\n"
-            f"🔵 Cuotas (1.00-1.99x): <code>{stats['count_100_199']}</code> — {stats['pct_100_199']:.2f}%{r1_flag}\n"
-            f"🟣 Cuotas (2.00-4.99x): <code>{stats['count_200_499']}</code> — {stats['pct_200_499']:.2f}%{r2_flag}\n"
-            f"🟡 Cuotas (5.00-9.99x): <code>{stats['count_500_999']}</code> — {stats['pct_500_999']:.2f}%\n"
-            f"🔴 Cuotas (+10.00x):    <code>{stats['count_1000_plus']}</code> — {stats['pct_1000_plus']:.2f}%\n\n{fav_line}\n")
-
-
 # ─── DETECCIÓN DE SEÑALES (VB4 runPredictor — 5 checks, señal si ≥3) ─────────
-def classify_force(value: float) -> int:
-    """Mapea un multiplicador crudo a fuerza (−10..+10), igual que classify() del HTML."""
-    v = float(value)
-    if 1.00 <= v < 1.10: return -10
-    if 1.10 <= v < 1.20: return -9
-    if 1.20 <= v < 1.30: return -8
-    if 1.30 <= v < 1.40: return -7
-    if 1.40 <= v < 1.50: return -6
-    if 1.50 <= v < 1.60: return -5
-    if 1.60 <= v < 1.70: return -4
-    if 1.70 <= v < 1.80: return -3
-    if 1.80 <= v < 1.90: return -2
-    if 1.90 <= v < 2.00: return -1
-    if 2.00 <= v < 3.00: return 1
-    if 3.00 <= v < 4.00: return 2
-    if 4.00 <= v < 5.00: return 3
-    if 5.00 <= v < 6.00: return 4
-    if 6.00 <= v < 7.00: return 5
-    if 7.00 <= v < 8.00: return 6
-    if 8.00 <= v < 9.00: return 7
-    if 9.00 <= v < 10.00: return 8
-    if 10.00 <= v < 15.00: return 9
-    if v >= 15.00: return 10
-    return 0
-
-
-def check_html_signal(data: list) -> Tuple[bool, Optional[str], Optional[int]]:
-    """
-    Replica el runPredictor() de deep_VB4_websocket.html.
-    5 checks — señal si trueCount >= 3.
-
-    Niveles asignados según cuántos checks pasan:
-      3/5 → Moderado (1)
-      4/5 → Medio    (2)
-      5/5 → Alto     (3)
-
-    Retorna (detectada, nombre_nivel, nivel_numérico).
-    """
-    if len(data) < 10:
-        return False, None, None
-
-    vals   = [m['value'] for m in data]   # cronológico ascendente (más viejo primero)
-    forces = [classify_force(v) for v in vals]
-
-    # ── Check 1: EMA(4) > EMA(12) Y EMA(4) subiendo ──────────────────────────
-    ema4_series  = g_ema4
-    ema12_series = g_ema12
-    check1 = False
-    if len(ema4_series) >= 2 and len(ema12_series) >= 1:
-        f_now  = ema4_series[-1]
-        f_prev = ema4_series[-2]
-        s_now  = ema12_series[-1]
-        check1 = (f_now > s_now) and (f_now > f_prev)
-
-    # ── Check 2: ≥5 de las últimas 8 barras son alcistas (value >= 2.00) ─────
-    last8 = vals[-8:]
-    check2 = sum(1 for v in last8 if v >= 2.00) >= 5
-
-    # ── Check 3: promedio fuerza últimas 4 > promedio fuerza previas 4 ───────
-    check3 = False
-    if len(forces) >= 8:
-        recent_avg = sum(forces[-4:]) / 4
-        prev_avg   = sum(forces[-8:-4]) / 4
-        check3 = recent_avg > prev_avg - 0.1
-
-    # ── Check 4: pendiente del acumulado (miniCum) positiva en últimas 5 ─────
-    check4 = False
-    if len(g_positions) >= 5:
-        check4 = (g_positions[-1] - g_positions[-5]) > 0
-
-    # ── Check 5: último resultado alcista Y fuerza positiva ──────────────────
-    check5 = (vals[-1] >= 2.00) and (forces[-1] > 0)
-
-    true_count = sum([check1, check2, check3, check4, check5])
-    logger.debug(f"VB4 checks: {check1}{check2}{check3}{check4}{check5} = {true_count}/5")
-
-    if true_count >= 5:
-        return True, "Alto", 3
-    if true_count == 4:
-        return True, "Medio", 2
-    if true_count == 3:
-        return True, "Moderado", 1
-    return False, None, None
-
 
 # ─── SESIÓN GLOBAL ────────────────────────────────────────────────────────────
 class GlobalSession:
@@ -428,36 +336,33 @@ def reset_global_session():
     logger.info("🔄 Sesión reiniciada — fichas preservadas")
 
 
-# ─── PROCESADOR DE MULTIPLICADORES (señales con exigencia por columna) ────────
+# ─── PROCESADOR DE MULTIPLICADORES (sistema 2x por tiempo) ────────────────────
 async def process_multiplier(value: float, round_id: str):
-    global g_signal_state, g_signal_type, g_signal_strictness, g_signal_trigger_mult
-    global g_positions, g_ema3, g_ema4, g_ema8, g_ema12, g_ema20, g_mults, g_seen_ids
-    global g_trend_favorable, g_session, g_cooldown_mod, _persist_counter
+    global g_signal_state, g_signal_trigger_mult
+    global g_mults, g_seen_ids
+    global g_session, g_cooldown_mod, _persist_counter
+    global g_signal_armed, g_last_signal_fire
 
-    logger.info(f"🎲 {value:.2f}x | ID: {round_id} | Señal: {g_signal_state}/{g_signal_type}")
+    logger.info(f"🎲 {value:.2f}x | ID: {round_id} | Señal: {g_signal_state}")
 
     _check_daily_reset()
 
-    # Fase 1: Evaluar resultado pendiente
+    # ── Fase 1: Evaluar resultado pendiente ──────────────────────────────────
     if g_signal_state == 'evaluating' and g_session.state == GlobalSession.EVALUATING:
         win = value >= BET_WIN_TARGET
         tipo, bet = g_session.on_result(win)
         await _dispatch_result(value, tipo, bet, attempt_num=g_session.attempt)
         g_signal_state = 'idle'
-        g_signal_type = None
-        g_signal_strictness = 0
+        g_signal_armed = False
         g_cooldown_mod = max(g_cooldown_mod, 2)
 
     g_cooldown_mod = max(0, g_cooldown_mod - 1)
 
-    # Actualizar datos (sistema de detección de señales — usa WIN_TARGET fijo, no cambia)
-    increment = 1 if value >= WIN_TARGET else -1
-    prev = g_positions[-1] if g_positions else 0
-    g_positions.append(prev + increment)
-    g_mults.append({'id': round_id, 'value': value, 'ts': time.time()})
+    # ── Fase 2: Registrar multiplicador ──────────────────────────────────────
+    now_ts = time.time()
+    g_mults.append({'id': round_id, 'value': value, 'ts': now_ts})
     if len(g_mults) >= MAX_MULTS:
         g_mults[:] = g_mults[-TRIM_MULTS:]
-        g_positions[:] = g_positions[-TRIM_MULTS:]
         save_mults_to_disk()
     else:
         _persist_counter += 1
@@ -465,44 +370,50 @@ async def process_multiplier(value: float, round_id: str):
             _persist_counter = 0
             save_mults_to_disk()
 
-    g_ema3 = calc_ema(g_positions, 3)
-    g_ema4 = calc_ema(g_positions, 4)
-    g_ema8 = calc_ema(g_positions, 8)
-    g_ema12 = calc_ema(g_positions, 12)
-    g_ema20 = calc_ema(g_positions, 20)
-
     if len(g_seen_ids) > 2000:
         oldest = sorted(g_seen_ids)[:1000]
         for oid in oldest:
             g_seen_ids.discard(oid)
 
-    # Tendencia
-    stats_trend = get_quota_stats(300)
-    if stats_trend['total'] >= 10 and stats_trend['favorable'] != g_trend_favorable:
-        g_trend_favorable = stats_trend['favorable']
-        logger.info(f"Tendencia → {'FAVORABLE' if g_trend_favorable else 'DESFAVORABLE'}")
+    # ── Fase 3: Registrar evento ≥ 2x ────────────────────────────────────────
+    if value >= WIN_TARGET:
+        register_event_2x(now_ts)
+        # Si había señal armada → resetear (ya llegó el 2x, ciclo reinicia)
+        if g_signal_armed:
+            g_signal_armed = False
+            logger.info(f"🔄 Señal armada reseteada — llegó {value:.2f}x")
 
-    # Detección de señal con exigencia por columna
-    if (g_signal_state == 'idle' and g_session.state == GlobalSession.IDLE
-            and g_cooldown_mod == 0 and g_trend_favorable is True):
-        detected, level_name, level_num = check_html_signal(g_mults)
-        if detected:
-            col_actual = g_session.col
-            min_level = MIN_LEVEL_BY_COL.get(col_actual, 3)
-            if level_num >= min_level:
+    # ── Fase 4: Detectar ventana de señal 2x ─────────────────────────────────
+    if (g_signal_state == 'idle'
+            and g_session.state == GlobalSession.IDLE
+            and g_cooldown_mod == 0):
+
+        in_window = check_2x_timing_signal()
+
+        if in_window and not g_signal_armed:
+            # Entrar en ventana → armar señal
+            elapsed_since_fire = now_ts - g_last_signal_fire
+            if elapsed_since_fire >= SIGNAL_COOLDOWN:
+                g_signal_armed = True
+                g_last_signal_fire = now_ts
                 g_signal_state = 'evaluating'
-                g_signal_type = level_name
-                g_signal_strictness = level_num
                 g_signal_trigger_mult = value
                 g_session.signal_trigger_mult = value
                 g_session.state = GlobalSession.EVALUATING
-                g_cooldown_mod = SIGNAL_COOLDOWN
+                g_cooldown_mod = 6
                 if g_session.col == 1:
                     g_session.start_ficha()
-                logger.info(f"🎯 SEÑAL {level_name} (nivel {level_num}) | Col{col_actual} (mínimo {min_level}) | Trigger: {value:.2f}x")
-                await _send_signal(value, level_name, level_num)
+                avg_gap = avg_sec(g_gaps2x)
+                eta_s = max(0, round((avg_gap or 0) - (now_ts - (g_events2x[-1] if g_events2x else now_ts))))
+                logger.info(f"🎯 SEÑAL 2x TIEMPO | Trigger: {value:.2f}x | ETA ~{eta_s}s | "
+                            f"Eventos: {len(g_events2x)} | AvgGap: {avg_gap:.1f}s")
+                await _send_signal(value)
             else:
-                logger.info(f"🚫 Señal {level_name} (nivel {level_num}) DESCARTADA para Col{col_actual} — requiere mínimo {min_level}")
+                logger.debug(f"⏳ En ventana pero cooldown ({elapsed_since_fire:.0f}s/{SIGNAL_COOLDOWN}s)")
+
+        elif not in_window and g_signal_armed:
+            # Salió de ventana sin disparo → resetear armado
+            g_signal_armed = False
 
 
 # ─── MARCADOR DIARIO ──────────────────────────────────────────────────────────
@@ -560,17 +471,18 @@ def render_gestion_bar(history: list, total: int, pending: bool = False) -> str:
     return ''.join(chars)
 
 
-async def _send_signal(trigger: float, level_name: str, level_num: int):
+async def _send_signal(trigger: float):
     hora = argentina_time()
     col = g_session.col
     ents = g_session.entries_in_cycle + 1
     wins = g_session.wins_in_cycle
     gestion_bar = render_gestion_bar(g_session.col_history, MAX_COLS, pending=True)
-    wins_bar = '🟢' * wins + '⚫' * (WINS_PER_CYCLE - wins)
-    logger.info(f"📤 Señal {level_name} | Col{col} | Entrada {ents}/{MAX_COLS} | Ciclo {wins}/{WINS_PER_CYCLE}")
+    avg_gap = avg_sec(g_gaps2x)
+    eventos = len(g_events2x)
+    logger.info(f"📤 Señal 2x | Col{col} | Entrada {ents}/{MAX_COLS} | Ciclo {wins}/{WINS_PER_CYCLE} | AvgGap:{avg_gap:.1f}s")
     txt = (f"<b>🆔 ENTRADA SPACEMAN — 🕐 {hora}</b>\n"
            f"<b>┄┄┄┄┄┄┄┄┄┄┄┄┄┄┄┄┄┄┄┄┄┄┄</b>\n"
-           f"<b>🧨 Después de: {trigger:.2f}x</b>\n"
+           f"<b>⏱ Cuota registrada: {trigger:.2f}x</b>\n"
            f"<b>🎯 Objetivo: {BET_WIN_TARGET:.2f}x</b>\n"
            f"<b>┄┄┄┄┄┄┄┄┄┄┄┄┄┄┄┄┄┄┄┄┄┄┄</b>\n"
            f"<b>💎GESTION DE ENTRADAS:</b>\n"
@@ -678,9 +590,11 @@ def webhook():
 @flask_app.route('/stats')
 def stats_route():
     last5 = [f"{m['value']:.2f}x" for m in g_mults[-5:]] if g_mults else []
+    avg = avg_sec(g_gaps2x)
     return {"status": "ok", "mults_collected": len(g_mults), "signal_state": g_signal_state,
-            "signal_type": g_signal_type, "session_state": g_session.state, "session_col": g_session.col,
-            "wins": g_session.wins, "losses": g_session.losses, "trend_favorable": g_trend_favorable,
+            "events_2x": len(g_events2x), "avg_gap_sec": round(avg, 1) if avg else None,
+            "session_state": g_session.state, "session_col": g_session.col,
+            "wins": g_session.wins, "losses": g_session.losses,
             "last_5": last5}
 
 def run_flask():
@@ -708,19 +622,18 @@ async def self_ping_loop():
 async def cmd_start(message):
     name = message.from_user.first_name or "usuario"
     g_all_chats.add(message.chat.id)
-    stats = get_quota_stats(300)
-    stats_blk = quota_stats_text(stats)
+    stats_blk = quota_stats_text(len(g_events2x), g_gaps2x)
     data_info = f"📡 <code>{len(g_mults)}/400</code> multiplicadores" if g_mults else "📡 Recopilando datos..."
     await bot.reply_to(message,
         f"🚀 <b>¡Bienvenido {name}!</b>\n\n"
         "━━━━━━━━━━━━━━━━━━━━━━━\n"
         "🤖 <b>Bot de Señales Spaceman</b>\n"
-        f"📊 Sistema Moderado | Objetivo: <code>{BET_WIN_TARGET:.2f}x</code>\n"
+        f"📊 Sistema 2x por Tiempo | Objetivo: <code>{BET_WIN_TARGET:.2f}x</code>\n"
         f"🔄 Gestión: <code>{MAX_COLS}</code> Entradas × <code>{WINS_PER_CYCLE}</code> Victorias/Ciclo\n"
         f"💵 Apuesta base fija: <code>${BASE_BET:.2f}</code>\n"
         "━━━━━━━━━━━━━━━━━━━━━━━\n"
         f"{data_info}\n\n{stats_blk}\n"
-        "✅ <b>¡Registrado!</b>\n<i>Recibirás señales cuando la tendencia sea favorable.</i>",
+        "✅ <b>¡Registrado!</b>\n<i>Las señales se envían cuando una cuota ≥2x cae en la ventana de tiempo.</i>",
         parse_mode='HTML')
 
 
@@ -728,8 +641,7 @@ async def cmd_start(message):
 async def cmd_estadisticas(message):
     g_all_chats.add(message.chat.id)
     s = g_session
-    stats = get_quota_stats(300)
-    trend = quota_stats_text(stats)
+    trend = quota_stats_text(len(g_events2x), g_gaps2x)
     fichas_recientes = s.fichas[-15:]
     if fichas_recientes:
         lineas = []
@@ -756,27 +668,31 @@ async def cmd_estadisticas(message):
         parse_mode='HTML')
 
 
-@bot.message_handler(commands=['tendencia'])
-async def cmd_tendencia(message):
+@bot.message_handler(commands=['predictor'])
+async def cmd_predictor(message):
     g_all_chats.add(message.chat.id)
     hora = argentina_time()
-    stats = get_quota_stats(300)
-    if stats['total'] == 0:
-        await bot.reply_to(message, "📡 <i>Sin datos suficientes.</i>", parse_mode='HTML')
+    eventos = len(g_events2x)
+    avg = avg_sec(g_gaps2x)
+    if eventos < MIN_EVENTS_2X:
+        await bot.reply_to(message,
+            f"📡 <b>PREDICTOR 2x — 🕐 {hora}</b>\n"
+            f"━━━━━━━━━━━━━━━━━━━━━━━\n"
+            f"⏳ Acumulando datos: <code>{eventos}/{MIN_EVENTS_2X}</code> eventos ≥2x",
+            parse_mode='HTML')
         return
-    n_label = "300" if stats["has_enough"] else str(stats["total"])
-    r1_flag = "✅" if stats['pct_100_199'] <= THRESH_LOW_MAX else "❌"
-    r2_flag = "✅" if stats['pct_200_499'] >= THRESH_MID_MIN else "❌"
-    header = f"🟢 TENDENCIA FAVORABLE — {hora}" if stats['favorable'] else f"🔴 TENDENCIA DESFAVORABLE — {hora}"
-    footer = ("✅ <b>¡TENDENCIA FAVORABLE!</b>\n      <i>Se recomienda operar</i>"
-              if stats['favorable'] else
-              "⚠️ <b>TENDENCIA DESFAVORABLE</b>\n      <i>Se recomienda esperar</i>")
-    txt = (f"<b>{header}</b>\n━━━━━━━━━━━━━━━━━━━━━━━\n"
-           f"📈 Análisis últimos {n_label} multiplicadores\n"
-           f"🔵 1.00-1.99x: <code>{stats['count_100_199']}</code> — {stats['pct_100_199']:.2f}%{r1_flag}\n"
-           f"🟣 2.00-4.99x: <code>{stats['count_200_499']}</code> — {stats['pct_200_499']:.2f}%{r2_flag}\n"
-           f"🟡 5.00-9.99x: <code>{stats['count_500_999']}</code> — {stats['pct_500_999']:.2f}%\n"
-           f"🔴 +10.00x:    <code>{stats['count_1000_plus']}</code> — {stats['pct_1000_plus']:.2f}%\n\n{footer}")
+    last_event = g_events2x[-1] if g_events2x else 0
+    elapsed = time.time() - last_event
+    eta = max(0, (avg or 0) - elapsed)
+    last_gap = g_gaps2x[-1] if g_gaps2x else 0
+    txt = (f"📡 <b>PREDICTOR 2x — 🕐 {hora}</b>\n"
+           f"━━━━━━━━━━━━━━━━━━━━━━━\n"
+           f"⏱ Intervalo promedio: <code>{avg:.1f}s</code>\n"
+           f"⏱ Último intervalo: <code>{last_gap:.1f}s</code>\n"
+           f"⏱ Transcurrido: <code>{elapsed:.1f}s</code>\n"
+           f"🎯 ETA próximo 2x: <code>~{eta:.0f}s</code>\n"
+           f"📊 Eventos ≥2x: <code>{eventos}</code>\n"
+           f"🪟 Ventana de señal: <code>{SIGNAL_WINDOW_SEC}s</code>")
     await bot.reply_to(message, txt, parse_mode='HTML')
 
 
@@ -784,9 +700,12 @@ async def cmd_tendencia(message):
 async def main_async():
     global _main_loop
     _main_loop = asyncio.get_running_loop()
-    logger.info("🤖 Iniciando SpacemanBot (Niveles: Moderado/Medio/Alto)...")
+    logger.info("🤖 Iniciando SpacemanBot (Sistema 2x por Tiempo)...")
     load_mults_from_disk()
-    await bot.set_my_commands([types.BotCommand('tendencia', '📈 Ver tendencia actual')])
+    await bot.set_my_commands([
+        types.BotCommand('predictor', '📡 Estado del predictor 2x'),
+        types.BotCommand('estadisticas', '📊 Estadísticas de la sesión'),
+    ])
     asyncio.create_task(ws_collector())
     asyncio.create_task(self_ping_loop())
     render_url = os.environ.get('RENDER_EXTERNAL_URL', '').rstrip('/')
