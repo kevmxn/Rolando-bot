@@ -1,11 +1,10 @@
-
 #!/usr/bin/env python3
 """
 ╔══════════════════════════════════════════════════╗
-║   SPACEMAN BOT — Sistema 2x–4.99x por Tiempo   ║
-║   Rango aprendizaje: 2.00x – 4.99x             ║
-║   Confianza alta (CV + regularidad) requerida   ║
-║   Objetivo de apuesta: 2.00x · Ciclo: 2/2      ║
+║   SPACEMAN BOT — Sistema 2x por Tiempo          ║
+║   Señales: spaceman_2x_signal.html              ║
+║   Lógica: ventana ~20s antes del ETA promedio   ║
+║   Objetivo de apuesta: 3.00x (seguro a 2.00x)   ║
 ╚══════════════════════════════════════════════════╝
 """
 
@@ -39,23 +38,19 @@ CASINO_ID = "ppcdk00000005349"
 CURRENCY  = "BRL"
 GAME_ID   = 1301
 
-WIN_TARGET_LO  = 2.00   # Rango inferior del evento de aprendizaje
-WIN_TARGET_HI  = 5.00   # Rango superior exclusivo (2.00x – 4.99x)
-BET_WIN_TARGET = 2.00   # Objetivo real de la apuesta: se gana si resultado >= 2.00x
+WIN_TARGET       = 2.00   # Umbral para registrar evento ≥2x (solo timing de entrada, no resuelve la apuesta)
+OBJECTIVE_TARGET = 3.00   # Objetivo real: victoria completa si resultado >= 3.00x
+INSURANCE_TARGET = 2.00   # Umbral de seguro: entre INSURANCE_TARGET y OBJECTIVE_TARGET se recupera parte (cubierto)
+INSURANCE_SPLIT  = 0.70   # Fracción de la apuesta destinada al seguro (cashea a 2x); el resto va al objetivo 3x
 MAX_COLS       = 8
 MAX_ATTS       = 1
-WINS_PER_CYCLE = 2      # Victorias necesarias por ciclo: 2/2
+WINS_PER_CYCLE = 2
 BASE_BET       = 0.10
 
-# ─── SISTEMA 2x–4.99x POR TIEMPO ─────────────────────────────────────────────
-MIN_EVENTS_2X     = 25     # Mínimo de eventos en rango para evaluar señales
+# ─── SISTEMA 2X POR TIEMPO ────────────────────────────────────────────────────
+MIN_EVENTS_2X     = 15     # Mínimo de eventos ≥2x para evaluar señales
 SIGNAL_WINDOW_SEC = 20     # Ventana (segundos antes del ETA) para disparar señal
-MAX_EVENTS_2X     = 200    # Historial máximo de timestamps de eventos en rango
-
-# ─── UMBRAL DE CONFIANZA ──────────────────────────────────────────────────────
-# Confianza = proximity*0.6 + regularidad*0.4  (igual que el HTML)
-# Solo se dispara señal si confianza >= MIN_CONFIDENCE
-MIN_CONFIDENCE    = 0.60   # 60% mínimo para disparar señal
+MAX_EVENTS_2X     = 200    # Historial máximo de timestamps de eventos 2x
 
 MAX_MULTS  = 400
 TRIM_MULTS = 300
@@ -66,11 +61,11 @@ g_mults:    list  = []
 g_seen_ids: set   = set()
 g_positions: list = []
 
-# ─── ESTADO DEL SISTEMA 2x–4.99x POR TIEMPO ─────────────────────────────────
-g_events2x: list = []      # Timestamps (float) de cada ronda en rango 2.00–4.99x
+# ─── ESTADO DEL SISTEMA 2X POR TIEMPO ────────────────────────────────────────
+g_events2x: list = []      # Timestamps (float) de cada ronda ≥ 2x
 g_gaps2x:   list = []      # Intervalos en segundos entre eventos consecutivos
 g_signal_armed: bool = False   # True cuando ya entramos en ventana de señal
-g_last_signal_fire: float = 0  # Timestamp del último disparo (antiflood)
+g_last_signal_fire: float = 0  # Timestamp del último disparo (antiflood 30s)
 
 SIGNAL_COOLDOWN = 30    # Antiflood: segundos mínimos entre señales consecutivas
 g_cooldown_mod  = 0
@@ -82,6 +77,8 @@ g_all_chats: set = set()
 
 g_daily_wins:        int = 0
 g_daily_losses:      int = 0
+g_daily_covered:     int = 0
+g_daily_recovered:   float = 0.0
 g_daily_cycles_won:  int = 0
 g_daily_cycles_lost: int = 0
 g_daily_date:        str = ""
@@ -131,115 +128,69 @@ async def delete_last_signal():
 
 
 
-
-# ─── SISTEMA 2x–4.99x POR TIEMPO + CONFIANZA ─────────────────────────────────
+# ─── SISTEMA 2X POR TIEMPO (portado de spaceman_2x_signal.html) ───────────────
 def avg_sec(lst: list) -> Optional[float]:
     """Promedio de una lista de floats. Retorna None si está vacía."""
     return sum(lst) / len(lst) if lst else None
 
 
-def calc_confidence(gaps: list, elapsed: float) -> tuple:
+def check_2x_timing_signal() -> bool:
     """
-    Calcula confianza igual que update2xPredictor() del HTML.
-    Retorna (confianza_0_1, eta_seg, avg_gap_seg).
-
-    Fórmula:
-      mean      = avgGap
-      stdDev    = sqrt(varianza)
-      CV        = stdDev / mean           (coeficiente variación)
-      normalized= min(1, elapsed / mean)
-      proximity = 1 - |normalized - 1|   (1 cuando elapsed == mean)
-      regularity= max(0, 1 - CV)         (1 cuando todos los gaps son iguales)
-      confidence= min(0.98, proximity*0.6 + regularity*0.4)
-    """
-    if len(gaps) < 3:
-        return 0.0, 0.0, 0.0
-
-    mean = avg_sec(gaps)
-    if not mean or mean <= 0:
-        return 0.0, 0.0, 0.0
-
-    variance  = sum((g - mean) ** 2 for g in gaps) / len(gaps)
-    std_dev   = variance ** 0.5
-    cv        = std_dev / mean
-    normalized= min(1.0, elapsed / mean)
-    proximity = 1.0 - abs(normalized - 1.0)
-    regularity= max(0.0, 1.0 - cv)
-    confidence= min(0.98, proximity * 0.6 + regularity * 0.4)
-    eta       = max(0.0, mean - elapsed)
-
-    return confidence, eta, mean
-
-
-def check_2x_timing_signal() -> tuple:
-    """
-    Evalúa si se debe disparar señal para el rango 2.00x–4.99x.
-    Retorna (disparar: bool, confianza: float, eta_seg: float).
-
-    Condiciones para disparar:
-      1. >= MIN_EVENTS_2X eventos en rango acumulados
-      2. >= 3 intervalos calculados
-      3. Confianza >= MIN_CONFIDENCE
-      4. ETA dentro de la ventana SIGNAL_WINDOW_SEC
+    Replica la lógica de update2xPredictor() del HTML.
+    Retorna True si el tiempo transcurrido desde el último evento 2x
+    está dentro de la ventana de disparo (avgGap - SIGNAL_WINDOW_SEC).
+    Requisitos:
+      - Al menos MIN_EVENTS_2X eventos ≥ 2x registrados
+      - Al menos 3 intervalos calculados
+      - El elapsed >= avgGap - SIGNAL_WINDOW_SEC
     """
     if len(g_events2x) < MIN_EVENTS_2X:
-        return False, 0.0, 0.0
-
-    if len(g_gaps2x) < 3:
-        return False, 0.0, 0.0
-
+        return False
+    gaps = g_gaps2x
+    if len(gaps) < 3:
+        return False
+    avg_gap = avg_sec(gaps)
+    if avg_gap is None or avg_gap <= 0:
+        return False
     last_event = g_events2x[-1]
-    elapsed    = time.time() - last_event
-    conf, eta, avg_gap = calc_confidence(g_gaps2x, elapsed)
-
-    in_window  = 0.0 <= eta <= SIGNAL_WINDOW_SEC
-    high_conf  = conf >= MIN_CONFIDENCE
-
+    elapsed = time.time() - last_event
+    eta = avg_gap - elapsed
+    # Disparar cuando estamos dentro de la ventana de SIGNAL_WINDOW_SEC segundos
+    in_window = 0 <= eta <= SIGNAL_WINDOW_SEC
     logger.debug(
-        f"2x-Timer | avg={avg_gap:.1f}s elapsed={elapsed:.1f}s eta={eta:.1f}s "
-        f"conf={conf:.2f} window={in_window} high_conf={high_conf} events={len(g_events2x)}"
+        f"2xTimer | avg={avg_gap:.1f}s elapsed={elapsed:.1f}s eta={eta:.1f}s "
+        f"window={in_window} events={len(g_events2x)}"
     )
-    return (in_window and high_conf), conf, eta
+    return in_window
 
 
 def register_event_2x(ts: float):
-    """Registra un nuevo evento en rango 2.00x–4.99x y actualiza los intervalos."""
+    """Registra un nuevo evento ≥ 2x y actualiza los intervalos."""
     global g_events2x, g_gaps2x
     if g_events2x:
         gap = ts - g_events2x[-1]
         if gap > 0:
             g_gaps2x.append(gap)
     g_events2x.append(ts)
+    # Mantener historial acotado
     if len(g_events2x) > MAX_EVENTS_2X:
         g_events2x = g_events2x[-MAX_EVENTS_2X:]
     if len(g_gaps2x) > MAX_EVENTS_2X:
         g_gaps2x = g_gaps2x[-MAX_EVENTS_2X:]
 
 
-def is_in_range(value: float) -> bool:
-    """Retorna True si el valor está en el rango de aprendizaje 2.00x–4.99x."""
-    return WIN_TARGET_LO <= value < WIN_TARGET_HI
-
-
 def quota_stats_text(events: int, gaps: list) -> str:
-    """Texto informativo del estado del predictor 2x–4.99x."""
+    """Texto informativo del estado del predictor 2x."""
     if events < MIN_EVENTS_2X:
-        return f"📡 <i>Acumulando datos... ({events}/{MIN_EVENTS_2X} eventos 2x–4.99x)</i>\n"
+        return f"📡 <i>Acumulando datos... ({events}/{MIN_EVENTS_2X} eventos ≥2x)</i>\n"
     avg = avg_sec(gaps)
     if not avg:
         return "📡 <i>Sin intervalos calculados aún.</i>\n"
-
-    last_event = g_events2x[-1] if g_events2x else 0
-    elapsed    = time.time() - last_event
-    conf, eta, _ = calc_confidence(gaps, elapsed)
-    conf_pct   = round(conf * 100)
-    last_gap   = gaps[-1] if gaps else 0
-
-    return (f"📈 <b>Predictor 2x–4.99x por Tiempo</b>\n"
+    last_gap = gaps[-1] if gaps else 0
+    return (f"📈 <b>Predictor 2x por Tiempo</b>\n"
             f"⏱ Intervalo promedio: <code>{avg:.1f}s</code>\n"
             f"⏱ Último intervalo: <code>{last_gap:.1f}s</code>\n"
-            f"🎯 Confianza actual: <code>{conf_pct}%</code>\n"
-            f"📊 Eventos en rango: <code>{events}</code>\n")
+            f"📊 Eventos ≥2x: <code>{events}</code>\n")
 
 
 # ─── PERSISTENCIA ─────────────────────────────────────────────────────────────
@@ -251,6 +202,8 @@ def save_mults_to_disk():
             'gaps2x': g_gaps2x,
             'daily_wins': g_daily_wins,
             'daily_losses': g_daily_losses,
+            'daily_covered': g_daily_covered,
+            'daily_recovered': g_daily_recovered,
             'daily_cycles_won': g_daily_cycles_won,
             'daily_cycles_lost': g_daily_cycles_lost,
             'daily_date': g_daily_date,
@@ -265,7 +218,8 @@ def save_mults_to_disk():
 
 def load_mults_from_disk():
     global g_mults, g_events2x, g_gaps2x
-    global g_daily_wins, g_daily_losses, g_daily_date, g_daily_cycles_won, g_daily_cycles_lost
+    global g_daily_wins, g_daily_losses, g_daily_covered, g_daily_recovered, g_daily_date
+    global g_daily_cycles_won, g_daily_cycles_lost
     if not os.path.exists(PERSIST_FILE):
         logger.info("Sin historial previo")
         return
@@ -286,16 +240,22 @@ def load_mults_from_disk():
         if saved_date == today_arg:
             g_daily_wins = data.get('daily_wins', 0)
             g_daily_losses = data.get('daily_losses', 0)
+            g_daily_covered = data.get('daily_covered', 0)
+            g_daily_recovered = data.get('daily_recovered', 0.0)
             g_daily_cycles_won = data.get('daily_cycles_won', 0)
             g_daily_cycles_lost = data.get('daily_cycles_lost', 0)
             g_daily_date = saved_date
         else:
             g_daily_wins = g_daily_losses = g_daily_cycles_won = g_daily_cycles_lost = 0
+            g_daily_covered = 0
+            g_daily_recovered = 0.0
             g_daily_date = today_arg
         logger.info(f"Historial cargado: {len(g_mults)} mults | {len(g_events2x)} eventos2x")
     except Exception as e:
         logger.warning(f"Error cargando: {e}")
 
+
+# ─── DETECCIÓN DE SEÑALES (VB4 runPredictor — 5 checks, señal si ≥3) ─────────
 
 # ─── SESIÓN GLOBAL ────────────────────────────────────────────────────────────
 class GlobalSession:
@@ -318,21 +278,39 @@ class GlobalSession:
         self.attempt1_result_value = 0.0
         self.fichas = carry_fichas if carry_fichas is not None else []
         self._cur_ficha = None
-        self.col_history: list = []  # 'win'/'loss' por cada entrada del ciclo actual (orden cronológico)
+        self.col_history: list = []  # 'win'/'covered'/'loss' por cada entrada del ciclo actual (orden cronológico)
+        self.recovered_in_cycle: float = 0.0  # $ recuperados por el seguro a 2x en este ciclo
 
     def start_ficha(self):
         self._cur_ficha = {'n': len(self.fichas) + 1,
                            **{f'c{i}': 0.0 for i in range(1, 13)},
                            'result': None, 'ts': argentina_time()}
 
-    def on_result(self, win: bool) -> tuple:
+    def on_result(self, value: float) -> tuple:
+        """
+        Resuelve la apuesta dividida en dos patas:
+          - Seguro (INSURANCE_SPLIT de la apuesta): cashea fijo en INSURANCE_TARGET (2x)
+          - Objetivo (resto): cashea en OBJECTIVE_TARGET (3x)
+        Resultado:
+          - value >= 3.00x  -> victoria completa (resetea martingala)
+          - 2.00x <= value < 3.00x -> "cubierto": se recupera la pata del seguro,
+            pero para el ciclo/martingala escala exactamente igual que una derrota
+          - value < 2.00x   -> derrota completa, no se recupera nada
+        Retorna (tipo, bet, recovered) donde tipo ∈
+          {'win','cycle_win','covered','new_col','cycle_loss'}
+        """
         self.entries += 1
         self.entries_in_cycle += 1
         prev_bet = self.cur_bet
         prev_col = self.col
         if self._cur_ficha:
             self._cur_ficha[f'c{prev_col}'] = self._cur_ficha.get(f'c{prev_col}', 0.0) + prev_bet
-        if win:
+
+        insurance_amt = prev_bet * INSURANCE_SPLIT
+        objective_amt = prev_bet - insurance_amt
+
+        if value >= OBJECTIVE_TARGET:
+            recovered = insurance_amt * INSURANCE_TARGET + objective_amt * value
             self.wins += 1
             self.wins_in_cycle += 1
             self.col_history.append('win')
@@ -348,26 +326,32 @@ class GlobalSession:
                 self.fichas = self.fichas[-100:]
             if self.wins_in_cycle >= WINS_PER_CYCLE:
                 self.state = self.DONE
-                return ('cycle_win', prev_bet)
+                return ('cycle_win', prev_bet, recovered)
             self.state = self.IDLE
-            return ('win', prev_bet)
-        else:
-            self.losses += 1
-            self.col_history.append('loss')
-            self.lost += prev_bet
-            self.cur_bet = self.lost + self.base_bet
-            self.col += 1
-            if self.entries_in_cycle >= MAX_COLS:
-                if self._cur_ficha:
-                    self._cur_ficha['result'] = 'loss'
-                    self.fichas.append(self._cur_ficha)
-                    self._cur_ficha = None
-                if len(self.fichas) > 100:
-                    self.fichas = self.fichas[-100:]
-                self.state = self.DONE
-                return ('cycle_loss', prev_bet)
-            self.state = self.IDLE
-            return ('new_col', prev_bet)
+            return ('win', prev_bet, recovered)
+
+        # No llegó al objetivo (3x) -> derrota para la progresión de la martingala,
+        # aunque si llegó al seguro (>=2x) se recupera parte del capital.
+        covered = value >= INSURANCE_TARGET
+        recovered = insurance_amt * INSURANCE_TARGET if covered else 0.0
+
+        self.losses += 1
+        self.col_history.append('covered' if covered else 'loss')
+        self.recovered_in_cycle += recovered
+        self.lost += prev_bet          # escala IGUAL que una derrota total (sin descontar lo recuperado)
+        self.cur_bet = self.lost + self.base_bet
+        self.col += 1
+        if self.entries_in_cycle >= MAX_COLS:
+            if self._cur_ficha:
+                self._cur_ficha['result'] = 'loss'
+                self.fichas.append(self._cur_ficha)
+                self._cur_ficha = None
+            if len(self.fichas) > 100:
+                self.fichas = self.fichas[-100:]
+            self.state = self.DONE
+            return ('cycle_loss', prev_bet, recovered)
+        self.state = self.IDLE
+        return ('covered' if covered else 'new_col', prev_bet, recovered)
 
     def status_short(self) -> str:
         estado = {self.IDLE: "⏳ Esperando señal", self.EVALUATING: "⚡ Evaluando", self.DONE: "✅ Ciclo finalizado"}.get(self.state, "—")
@@ -375,6 +359,7 @@ class GlobalSession:
                 f"🎯 Ciclo: <code>{self.wins_in_cycle}/{WINS_PER_CYCLE}</code> victorias | <code>{self.entries_in_cycle}/{MAX_COLS}</code> entradas\n"
                 f"📍 Col: <code>{self.col}/{MAX_COLS}</code>\n"
                 f"💵 Próxima apuesta: <code>${self.cur_bet:.2f}</code>\n"
+                f"🛡️ Recuperado por seguro (ciclo): <code>${self.recovered_in_cycle:.2f}</code>\n"
                 f"📈 G/P sesión: <code>{self.wins}/{self.losses}</code>")
 
 
@@ -400,9 +385,8 @@ async def process_multiplier(value: float, round_id: str):
 
     # ── Fase 1: Evaluar resultado pendiente ──────────────────────────────────
     if g_signal_state == 'evaluating' and g_session.state == GlobalSession.EVALUATING:
-        win = value >= BET_WIN_TARGET
-        tipo, bet = g_session.on_result(win)
-        await _dispatch_result(value, tipo, bet, attempt_num=g_session.attempt)
+        tipo, bet, recovered = g_session.on_result(value)
+        await _dispatch_result(value, tipo, bet, recovered, attempt_num=g_session.attempt)
         g_signal_state = 'idle'
         g_signal_armed = False
         g_cooldown_mod = max(g_cooldown_mod, 2)
@@ -426,22 +410,23 @@ async def process_multiplier(value: float, round_id: str):
         for oid in oldest:
             g_seen_ids.discard(oid)
 
-    # ── Fase 3: Registrar evento en rango 2.00x–4.99x ───────────────────────
-    if is_in_range(value):
+    # ── Fase 3: Registrar evento ≥ 2x ────────────────────────────────────────
+    if value >= WIN_TARGET:
         register_event_2x(now_ts)
-        # Si había señal armada → resetear (ya llegó el evento, ciclo reinicia)
+        # Si había señal armada → resetear (ya llegó el 2x, ciclo reinicia)
         if g_signal_armed:
             g_signal_armed = False
-            logger.info(f"🔄 Señal armada reseteada — llegó {value:.2f}x (en rango)")
+            logger.info(f"🔄 Señal armada reseteada — llegó {value:.2f}x")
 
-    # ── Fase 4: Detectar ventana de señal 2x–4.99x ───────────────────────────
+    # ── Fase 4: Detectar ventana de señal 2x ─────────────────────────────────
     if (g_signal_state == 'idle'
             and g_session.state == GlobalSession.IDLE
             and g_cooldown_mod == 0):
 
-        should_fire, conf, eta = check_2x_timing_signal()
+        in_window = check_2x_timing_signal()
 
-        if should_fire and not g_signal_armed:
+        if in_window and not g_signal_armed:
+            # Entrar en ventana → armar señal
             elapsed_since_fire = now_ts - g_last_signal_fire
             if elapsed_since_fire >= SIGNAL_COOLDOWN:
                 g_signal_armed = True
@@ -454,25 +439,28 @@ async def process_multiplier(value: float, round_id: str):
                 if g_session.col == 1:
                     g_session.start_ficha()
                 avg_gap = avg_sec(g_gaps2x)
-                logger.info(
-                    f"🎯 SEÑAL 2x–4.99x | Trigger: {value:.2f}x | ETA ~{eta:.0f}s | "
-                    f"Conf: {conf*100:.0f}% | Eventos: {len(g_events2x)} | AvgGap: {avg_gap:.1f}s"
-                )
-                await _send_signal(value, conf)
+                eta_s = max(0, round((avg_gap or 0) - (now_ts - (g_events2x[-1] if g_events2x else now_ts))))
+                logger.info(f"🎯 SEÑAL 2x TIEMPO | Trigger: {value:.2f}x | ETA ~{eta_s}s | "
+                            f"Eventos: {len(g_events2x)} | AvgGap: {avg_gap:.1f}s")
+                await _send_signal(value)
             else:
                 logger.debug(f"⏳ En ventana pero cooldown ({elapsed_since_fire:.0f}s/{SIGNAL_COOLDOWN}s)")
 
-        elif not should_fire and g_signal_armed:
+        elif not in_window and g_signal_armed:
+            # Salió de ventana sin disparo → resetear armado
             g_signal_armed = False
 
 
 # ─── MARCADOR DIARIO ──────────────────────────────────────────────────────────
 def _check_daily_reset():
-    global g_daily_wins, g_daily_losses, g_daily_cycles_won, g_daily_cycles_lost, g_daily_date, g_scoreboard_msg_id
+    global g_daily_wins, g_daily_losses, g_daily_covered, g_daily_recovered
+    global g_daily_cycles_won, g_daily_cycles_lost, g_daily_date, g_scoreboard_msg_id
     now_arg = datetime.utcnow() - timedelta(hours=3)
     today = now_arg.strftime("%Y-%m-%d")
     if today != g_daily_date:
         g_daily_wins = g_daily_losses = g_daily_cycles_won = g_daily_cycles_lost = 0
+        g_daily_covered = 0
+        g_daily_recovered = 0.0
         g_daily_date = today
         g_scoreboard_msg_id = None
         logger.info(f"📅 Marcador reseteado para {today}")
@@ -487,11 +475,13 @@ async def _broadcast_scoreboard():
     hora = argentina_time()
     txt = (f"<b>📆 MARCADOR DEL DÍA — 🕐 {hora}</b>\n"
            f"<b>┄┄┄┄┄┄┄┄┄┄┄┄┄┄┄┄┄┄┄┄┄┄┄</b>\n"
-           f"<b>✅ Ganadas: {g_daily_wins}</b>\n"
+           f"<b>✅ Ganadas (≥3.00x): {g_daily_wins}</b>\n"
            f"<b>❌ Perdidas: {g_daily_losses}</b>\n"
+           f"<b>🛡️ Cubiertas (2.00x-2.99x): {g_daily_covered}</b>\n"
+           f"<b>💰 Recuperado por seguro: ${g_daily_recovered:.2f}</b>\n"
            f"<b>📈 Acierto: {pct_sig:.1f}%</b>\n"
            f"<b>┄┄┄┄┄┄┄┄┄┄┄┄┄┄┄┄┄┄┄┄┄┄┄</b>\n"
-           f"<b>🔄 Sesión {MAX_COLS} Entradas · {WINS_PER_CYCLE}/2 Victorias</b>\n"
+           f"<b>🔄 Ciclos {MAX_COLS} entradas · {WINS_PER_CYCLE} victorias</b>\n"
            f"<b>✅ Ganados: {g_daily_cycles_won}</b>\n"
            f"<b>❌ Perdidos: {g_daily_cycles_lost}</b>\n"
            f"<b>📈 Acierto: {pct_cyc:.1f}%</b>")
@@ -509,9 +499,11 @@ async def _broadcast_scoreboard():
 def render_gestion_bar(history: list, total: int, pending: bool = False) -> str:
     """
     Construye la barra de 'Nivel de Gestión' con el historial real de la sesión.
-    🟢 = entrada ganada · 🔴 = entrada perdida · 🔵 = entrada en curso (pendiente) · ⚫ = aún no jugada
+    🟢 = entrada ganada (>=3x) · 🟡 = cubierta por el seguro (2x-3x, cuenta como derrota) ·
+    🔴 = entrada perdida (<2x) · 🔵 = entrada en curso (pendiente) · ⚫ = aún no jugada
     """
-    chars = ['🟢' if r == 'win' else '🔴' for r in history]
+    icon_map = {'win': '🟢', 'covered': '🟡', 'loss': '🔴'}
+    chars = [icon_map.get(r, '🔴') for r in history]
     if pending:
         chars.append('🔵')
     if len(chars) < total:
@@ -521,35 +513,33 @@ def render_gestion_bar(history: list, total: int, pending: bool = False) -> str:
     return ''.join(chars)
 
 
-async def _send_signal(trigger: float, conf: float = 0.0):
+async def _send_signal(trigger: float):
     hora = argentina_time()
     col = g_session.col
     ents = g_session.entries_in_cycle + 1
     wins = g_session.wins_in_cycle
     gestion_bar = render_gestion_bar(g_session.col_history, MAX_COLS, pending=True)
     avg_gap = avg_sec(g_gaps2x)
-    conf_pct = round(conf * 100)
-    logger.info(f"📤 Señal 2x–4.99x | Col{col} | Entrada {ents}/{MAX_COLS} | Ciclo {wins}/{WINS_PER_CYCLE} | Conf:{conf_pct}%")
+    eventos = len(g_events2x)
+    logger.info(f"📤 Señal 2x | Col{col} | Entrada {ents}/{MAX_COLS} | Ciclo {wins}/{WINS_PER_CYCLE} | AvgGap:{avg_gap:.1f}s")
     txt = (f"<b>🆔 ENTRADA SPACEMAN — 🕐 {hora}</b>\n"
            f"<b>┄┄┄┄┄┄┄┄┄┄┄┄┄┄┄┄┄┄┄┄┄┄┄</b>\n"
            f"<b>⏱ Cuota registrada: {trigger:.2f}x</b>\n"
-           f"<b>🎯 Objetivo: {BET_WIN_TARGET:.2f}x</b>\n"
-           f"<b>📊 Confianza: {conf_pct}%</b>\n"
+           f"<b>🎯 Objetivo: {OBJECTIVE_TARGET:.2f}x</b>\n"
+           f"<b>🛡️ Seguro: {INSURANCE_TARGET:.2f}x ({INSURANCE_SPLIT*100:.0f}% seguro / {(1-INSURANCE_SPLIT)*100:.0f}% objetivo)</b>\n"
            f"<b>┄┄┄┄┄┄┄┄┄┄┄┄┄┄┄┄┄┄┄┄┄┄┄</b>\n"
            f"<b>💎GESTION DE ENTRADAS:</b>\n"
            f"<b>{gestion_bar}</b>")
     await broadcast_signal(txt)
 
 
-async def _dispatch_result(value: float, tipo: str, bet: float, attempt_num: int):
-    global g_session, g_daily_wins, g_daily_losses, g_daily_cycles_won, g_daily_cycles_lost
+async def _dispatch_result(value: float, tipo: str, bet: float, recovered: float, attempt_num: int):
+    global g_session, g_daily_wins, g_daily_losses, g_daily_covered, g_daily_recovered
+    global g_daily_cycles_won, g_daily_cycles_lost
     hora = argentina_time()
     if tipo == 'win':
         g_daily_wins += 1
-        wins = g_session.wins_in_cycle
-        ents = g_session.entries_in_cycle
-        wins_bar = '🟢' * wins + '⚫' * (WINS_PER_CYCLE - wins)
-        txt = f"<b>✅ GANAMOS {value:.2f}x — 🕐 {hora}</b>"
+        txt = f"<b>✅ GANAMOS {value:.2f}x (objetivo 3.00x) — 🕐 {hora}</b>"
         await broadcast(txt)
         await _broadcast_scoreboard()
     elif tipo == 'cycle_win':
@@ -557,25 +547,37 @@ async def _dispatch_result(value: float, tipo: str, bet: float, attempt_num: int
         g_daily_cycles_won += 1
         wins = g_session.wins_in_cycle
         wins_bar = '🟢' * wins
-        txt = (f"<b>✅ GANAMOS {value:.2f}x — 🕐 {hora}</b>\n"
-               f"<b>💎 CICLO COMPLETO {wins}/{WINS_PER_CYCLE} VICTORIAS {wins_bar}</b>")
+        txt = (f"<b>✅ GANAMOS {value:.2f}x (objetivo 3.00x) — 🕐 {hora}</b>\n"
+               f"<b>💎 SESION {wins}/{WINS_PER_CYCLE} VICTORIAS {wins_bar}</b>")
         await broadcast(txt)
         await _broadcast_scoreboard()
         reset_global_session()
+    elif tipo == 'covered':
+        g_daily_losses += 1
+        g_daily_covered += 1
+        g_daily_recovered += recovered
+        col = g_session.col
+        txt = (f"<b>🛡️ CUBIERTO {value:.2f}x — no llegó a 3.00x, seguro a 2.00x recuperó ${recovered:.2f} — 🕐 {hora}</b>\n"
+               f"<i>Sigue la racha (cuenta como derrota para la progresión) → Col{col}</i>")
+        await broadcast(txt)
+        await _broadcast_scoreboard()
     elif tipo == 'new_col':
         g_daily_losses += 1
-        wins = g_session.wins_in_cycle
-        ents = g_session.entries_in_cycle
         col = g_session.col
-        wins_bar = '🟢' * wins + '⚫' * (WINS_PER_CYCLE - wins)
-        txt = f"<b>❌ PERDIMOS {value:.2f}x — 🕐 {hora}</b>"
+        txt = f"<b>❌ PERDIMOS {value:.2f}x (no llegó al seguro de 2.00x) — 🕐 {hora}</b>"
         await broadcast(txt)
         await _broadcast_scoreboard()
     elif tipo == 'cycle_loss':
         g_daily_losses += 1
         g_daily_cycles_lost += 1
-        txt = (f"<b>❌ PERDIMOS {value:.2f}x — 🕐 {hora}</b>\n"
-               f"<b>💎 CICLO PERDIDO 😭</b>")
+        if recovered > 0:
+            g_daily_covered += 1
+            g_daily_recovered += recovered
+            txt = (f"<b>🛡️ CUBIERTO {value:.2f}x — seguro a 2.00x recuperó ${recovered:.2f} — 🕐 {hora}</b>\n"
+                   f"<b>💎 SESION FINALIZADO 😭</b>")
+        else:
+            txt = (f"<b>❌ PERDIMOS {value:.2f}x — 🕐 {hora}</b>\n"
+                   f"<b>💎 SESION FINALIZADO 😭</b>")
         await broadcast(txt)
         await _broadcast_scoreboard()
         reset_global_session()
@@ -646,6 +648,7 @@ def stats_route():
             "events_2x": len(g_events2x), "avg_gap_sec": round(avg, 1) if avg else None,
             "session_state": g_session.state, "session_col": g_session.col,
             "wins": g_session.wins, "losses": g_session.losses,
+            "recovered_in_cycle": round(g_session.recovered_in_cycle, 2),
             "last_5": last5}
 
 def run_flask():
@@ -679,12 +682,14 @@ async def cmd_start(message):
         f"🚀 <b>¡Bienvenido {name}!</b>\n\n"
         "━━━━━━━━━━━━━━━━━━━━━━━\n"
         "🤖 <b>Bot de Señales Spaceman</b>\n"
-        f"📊 Sistema 2x–4.99x por Tiempo | Objetivo: <code>{BET_WIN_TARGET:.2f}x</code>\n"
+        f"📊 Sistema 2x por Tiempo | Objetivo: <code>{OBJECTIVE_TARGET:.2f}x</code> · Seguro: <code>{INSURANCE_TARGET:.2f}x</code>\n"
+        f"🛡️ Reparto: <code>{INSURANCE_SPLIT*100:.0f}%</code> seguro / <code>{(1-INSURANCE_SPLIT)*100:.0f}%</code> objetivo\n"
         f"🔄 Gestión: <code>{MAX_COLS}</code> Entradas × <code>{WINS_PER_CYCLE}</code> Victorias/Ciclo\n"
         f"💵 Apuesta base fija: <code>${BASE_BET:.2f}</code>\n"
         "━━━━━━━━━━━━━━━━━━━━━━━\n"
         f"{data_info}\n\n{stats_blk}\n"
-        "✅ <b>¡Registrado!</b>\n<i>Señales con confianza ≥60% cuando el patrón de tiempo es regular.</i>",
+        "✅ <b>¡Registrado!</b>\n<i>Las señales se envían cuando una cuota ≥2x cae en la ventana de tiempo. "
+        "Si el resultado no llega a 3x pero sí a 2x, el seguro recupera parte del capital (queda como 🟡 cubierto).</i>",
         parse_mode='HTML')
 
 
@@ -727,27 +732,23 @@ async def cmd_predictor(message):
     avg = avg_sec(g_gaps2x)
     if eventos < MIN_EVENTS_2X:
         await bot.reply_to(message,
-            f"📡 <b>PREDICTOR 2x–4.99x — 🕐 {hora}</b>\n"
+            f"📡 <b>PREDICTOR 2x — 🕐 {hora}</b>\n"
             f"━━━━━━━━━━━━━━━━━━━━━━━\n"
-            f"⏳ Acumulando datos: <code>{eventos}/{MIN_EVENTS_2X}</code> eventos en rango",
+            f"⏳ Acumulando datos: <code>{eventos}/{MIN_EVENTS_2X}</code> eventos ≥2x",
             parse_mode='HTML')
         return
     last_event = g_events2x[-1] if g_events2x else 0
-    elapsed    = time.time() - last_event
-    conf, eta, avg_gap = calc_confidence(g_gaps2x, elapsed)
-    conf_pct   = round(conf * 100)
-    last_gap   = g_gaps2x[-1] if g_gaps2x else 0
-    estado_conf = "🟢 ALTA" if conf >= MIN_CONFIDENCE else "🟡 MEDIA" if conf >= 0.40 else "🔴 BAJA"
-    txt = (f"📡 <b>PREDICTOR 2x–4.99x — 🕐 {hora}</b>\n"
+    elapsed = time.time() - last_event
+    eta = max(0, (avg or 0) - elapsed)
+    last_gap = g_gaps2x[-1] if g_gaps2x else 0
+    txt = (f"📡 <b>PREDICTOR 2x — 🕐 {hora}</b>\n"
            f"━━━━━━━━━━━━━━━━━━━━━━━\n"
-           f"⏱ Intervalo promedio: <code>{avg_gap:.1f}s</code>\n"
+           f"⏱ Intervalo promedio: <code>{avg:.1f}s</code>\n"
            f"⏱ Último intervalo: <code>{last_gap:.1f}s</code>\n"
            f"⏱ Transcurrido: <code>{elapsed:.1f}s</code>\n"
-           f"🎯 ETA próximo evento: <code>~{eta:.0f}s</code>\n"
-           f"📊 Confianza: <code>{conf_pct}%</code> — {estado_conf}\n"
-           f"📊 Eventos en rango: <code>{eventos}</code>\n"
-           f"🪟 Ventana de señal: <code>{SIGNAL_WINDOW_SEC}s</code>\n"
-           f"🔒 Umbral mínimo: <code>{round(MIN_CONFIDENCE*100)}%</code>")
+           f"🎯 ETA próximo 2x: <code>~{eta:.0f}s</code>\n"
+           f"📊 Eventos ≥2x: <code>{eventos}</code>\n"
+           f"🪟 Ventana de señal: <code>{SIGNAL_WINDOW_SEC}s</code>")
     await bot.reply_to(message, txt, parse_mode='HTML')
 
 
@@ -755,7 +756,7 @@ async def cmd_predictor(message):
 async def main_async():
     global _main_loop
     _main_loop = asyncio.get_running_loop()
-    logger.info("🤖 Iniciando SpacemanBot (Sistema 2x–4.99x · Confianza · Ciclo 2/2)...")
+    logger.info("🤖 Iniciando SpacemanBot (Sistema 2x por Tiempo)...")
     load_mults_from_disk()
     await bot.set_my_commands([
         types.BotCommand('predictor', '📡 Estado del predictor 2x'),
