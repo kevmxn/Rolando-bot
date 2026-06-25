@@ -5,8 +5,9 @@
 ║   • Timing (2x/3x) con EMA y tendencia de gaps          ║
 ║   • Tendencia (continuación alcista)                    ║
 ║   • Rango alto (≥10x / ≥15x) por intervalos             ║
-║   • Seguro universal: 1.50x                             ║
+║   • Seguro universal: 2.00x                             ║
 ║   • Marcador diario: aciertos ≥2x                       ║
+║   • Aprendizaje adaptativo por señales falladas         ║
 ╚══════════════════════════════════════════════════════════╝
 """
 
@@ -44,17 +45,17 @@ GAME_ID   = 1301
 # ── Umbrales ──────────────────────────────────────────────────────────────────
 TARGET_2X        = 2.00
 TARGET_3X        = 3.00
-INSURANCE_1_5    = 1.50   # seguro universal
+INSURANCE_2_0    = 2.00   # seguro universal (igual al objetivo 2x)
 MAX_ATTEMPTS     = 2
 MIN_CONFIDENCE   = 60.0   # solo para señales de timing
 
 # ── Predictor temporal (timing) ─────────────────────────────────────────────
-MIN_EVENTS_2X     = 15
+MIN_EVENTS_2X     = 5
 SIGNAL_WINDOW_2X  = 20
 MAX_HIST_2X       = 200
 ALPHA_2X          = 0.25
 
-MIN_EVENTS_3X      = 10
+MIN_EVENTS_3X      = 5
 SIGNAL_WINDOW_3X_B = 10
 SIGNAL_WINDOW_3X_A = 10
 MAX_HIST_3X        = 150
@@ -115,6 +116,22 @@ g_high_force_10_indices = []
 g_high_range_search = None
 
 g_all_chats: set = set()
+
+# ─── APRENDIZAJE ADAPTATIVO (señales falladas) ───────────────────────────────
+# Historial de resultados recientes para ajuste dinámico de umbrales
+g_recent_results: list = []          # lista de dicts: {kind, result, value, attempt}
+MAX_RECENT_RESULTS  = 50
+g_consecutive_misses: dict = {       # fallos consecutivos por tipo de señal
+    '2x': 0, '3x': 0, 'trend': 0, 'high_range': 0
+}
+g_learning_conf_penalty: dict = {    # penalización dinámica de confianza mínima
+    '2x': 0.0, '3x': 0.0, 'trend': 0.0, 'high_range': 0.0
+}
+# Bonus de confianza acumulado por señales exitosas consecutivas
+g_consecutive_hits: dict = {
+    '2x': 0, '3x': 0, 'trend': 0, 'high_range': 0
+}
+
 
 # ─── MARCADOR DIARIO ────────────────────────────────────────────────────────
 g_daily_hits:   int = 0
@@ -246,7 +263,8 @@ def _predict_next_event(
     window_before: float,
     window_after: float,
     alpha: float = 0.3,
-    use_value_correction: bool = True
+    use_value_correction: bool = True,
+    kind: str = '2x'
 ) -> Tuple[bool, float, float, float, float]:
     if len(events_data) < min_events:
         return False, 0.0, 0.0, 0.0, 0.0
@@ -265,17 +283,20 @@ def _predict_next_event(
     if n < 3:
         return False, 0.0, 0.0, 0.0, 0.0
 
+    # EMA ponderada exponencial
     weights = [alpha * (1 - alpha) ** (n - 1 - i) for i in range(n)]
     total_w = sum(weights)
     weights = [w / total_w for w in weights]
     ema_gap = sum(weights[i] * gaps[i] for i in range(n))
 
+    # Regresión lineal sobre los últimos gaps (tendencia de ciclo)
     x = list(range(n))
     mean_x = (n - 1) / 2
     mean_y = sum(gaps) / n
-    slope = sum((x[i] - mean_x) * (gaps[i] - mean_y) for i in range(n)) / sum((x[i] - mean_x) ** 2 for i in range(n)) if n > 1 else 0.0
+    denom = sum((x[i] - mean_x) ** 2 for i in range(n))
+    slope = sum((x[i] - mean_x) * (gaps[i] - mean_y) for i in range(n)) / denom if denom > 0 else 0.0
 
-    mean_gap = sum(gaps) / n
+    mean_gap = mean_y
     variance = sum((g - mean_gap) ** 2 for g in gaps) / n
     std_gap = variance ** 0.5 if variance > 0 else 1.0
     cv = std_gap / mean_gap if mean_gap > 0 else 1.0
@@ -283,11 +304,12 @@ def _predict_next_event(
     volatility_factor = min(1.0, 1.0 / (1 + cv))
     trend_adj = slope * 0.5 * volatility_factor
 
+    # Corrección por valor reciente (señales de alta cuota predicen ciclos más largos)
     correction = 0.0
     if use_value_correction and len(values) > 0:
         recent_vals = values[-5:] if len(values) >= 5 else values
         avg_val = sum(recent_vals) / len(recent_vals)
-        threshold = 2.0 if len(events_data) == len(g_events_data_2x) else 3.0
+        threshold = 2.0 if kind == '2x' else 3.0
         correction = (avg_val - threshold) * 0.1
 
     predicted_gap = ema_gap + trend_adj + correction
@@ -299,13 +321,100 @@ def _predict_next_event(
 
     in_window = -window_after <= eta <= window_before
 
+    # ── Cálculo de confianza mejorado ──────────────────────────────────────────
+    # 1. Regularidad del ciclo (inversa del CV)
     regularity = max(0.0, 1.0 - cv)
-    proximity = 1.0 - abs(min(1.0, elapsed / predicted_gap) - 1.0) if predicted_gap > 0 else 0.0
-    confidence = min(98.0, proximity * 50 + regularity * 50)
 
-    return in_window, eta, predicted_gap, confidence, trend_adj + correction
+    # 2. Proximidad al momento predicho (curva gaussiana centrada en eta=0)
+    norm_pos = elapsed / predicted_gap if predicted_gap > 0 else 1.0
+    # Máxima confianza cuando estamos justo en el punto predicho (norm_pos≈1.0)
+    proximity = max(0.0, 1.0 - abs(norm_pos - 1.0) * 1.5)
 
-# ─── PREDICTOR DE RANGO ALTO ──────────────────────────────────────────────────
+    # 3. Consistencia de la tendencia del slope (baja varianza en gaps recientes)
+    recent_gaps = gaps[-min(10, n):]
+    recent_mean = sum(recent_gaps) / len(recent_gaps)
+    recent_var = sum((g - recent_mean) ** 2 for g in recent_gaps) / len(recent_gaps)
+    recent_cv = (recent_var ** 0.5) / recent_mean if recent_mean > 0 else 1.0
+    consistency = max(0.0, 1.0 - recent_cv)
+
+    # 4. Bonus por cantidad de eventos históricos (más datos → más confianza)
+    data_bonus = min(10.0, (n - 3) * 0.5)
+
+    base_confidence = proximity * 40 + regularity * 35 + consistency * 15 + data_bonus
+    base_confidence = min(98.0, base_confidence)
+
+    # Aplicar ajuste adaptativo por historial de fallos/aciertos
+    final_confidence = weighted_confidence_boost(events_data, base_confidence, kind)
+
+    return in_window, eta, predicted_gap, final_confidence, trend_adj + correction
+
+
+# ─── APRENDIZAJE ADAPTATIVO ──────────────────────────────────────────────────
+def record_signal_result(kind: str, result: str, value: float, attempt: int):
+    """Registra el resultado de una señal y ajusta umbrales dinámicamente."""
+    global g_consecutive_misses, g_consecutive_hits, g_learning_conf_penalty
+
+    entry = {'kind': kind, 'result': result, 'value': value, 'attempt': attempt,
+             'ts': time.time()}
+    g_recent_results.append(entry)
+    if len(g_recent_results) > MAX_RECENT_RESULTS:
+        del g_recent_results[:-MAX_RECENT_RESULTS]
+
+    if result == 'hit':
+        g_consecutive_misses[kind] = 0
+        g_consecutive_hits[kind] += 1
+        # Reducir penalización si encadenamos aciertos
+        g_learning_conf_penalty[kind] = max(0.0, g_learning_conf_penalty[kind] - 3.0)
+        logger.info(f"📚 Aprendizaje HIT {kind}: hits_consec={g_consecutive_hits[kind]} penalty={g_learning_conf_penalty[kind]:.1f}")
+    else:  # miss o insurance_miss
+        g_consecutive_hits[kind] = 0
+        g_consecutive_misses[kind] += 1
+        # Aumentar penalización de confianza según fallos consecutivos
+        penalty_inc = 5.0 * g_consecutive_misses[kind]
+        g_learning_conf_penalty[kind] = min(30.0, g_learning_conf_penalty[kind] + penalty_inc)
+        logger.info(f"📚 Aprendizaje MISS {kind}: misses_consec={g_consecutive_misses[kind]} penalty={g_learning_conf_penalty[kind]:.1f}")
+
+def get_effective_confidence_threshold(kind: str) -> float:
+    """Retorna el umbral de confianza efectivo según el historial de fallos."""
+    base = MIN_CONFIDENCE
+    penalty = g_learning_conf_penalty.get(kind, 0.0)
+    return min(90.0, base + penalty)
+
+def compute_recent_accuracy(kind: str, window: int = 20) -> float:
+    """Calcula la precisión reciente para un tipo de señal."""
+    relevant = [r for r in g_recent_results if r['kind'] == kind][-window:]
+    if not relevant:
+        return 0.5  # neutro
+    hits = sum(1 for r in relevant if r['result'] == 'hit')
+    return hits / len(relevant)
+
+def weighted_confidence_boost(events_data: List[Tuple[float, float]], base_conf: float, kind: str) -> float:
+    """
+    Ajusta la confianza base según:
+    - Precisión reciente del tipo de señal
+    - Penalización por fallos consecutivos
+    - Bonus por valor promedio reciente alto
+    """
+    if not events_data:
+        return base_conf
+
+    # Factor de precisión reciente
+    recent_acc = compute_recent_accuracy(kind)
+    acc_factor = (recent_acc - 0.5) * 20.0  # -10 a +10 puntos
+
+    # Penalización por fallos consecutivos
+    penalty = g_learning_conf_penalty.get(kind, 0.0)
+
+    # Bonus si el valor promedio reciente de eventos es significativamente alto
+    recent_vals = [v for _, v in events_data[-10:]] if len(events_data) >= 10 else [v for _, v in events_data]
+    avg_recent_val = sum(recent_vals) / len(recent_vals) if recent_vals else 2.0
+    threshold = 2.0 if kind == '2x' else 3.0
+    val_bonus = min(5.0, (avg_recent_val - threshold) * 0.5)
+
+    adjusted = base_conf + acc_factor + val_bonus - (penalty * 0.3)
+    return max(0.0, min(98.0, adjusted))
+
+
 def compute_average_interval(indices: List[int]) -> Optional[float]:
     if len(indices) < 2:
         return None
@@ -467,6 +576,10 @@ def save_to_disk():
             'daily_date':  g_daily_date,
             'high_force_9': g_high_force_9_indices,
             'high_force_10': g_high_force_10_indices,
+            'recent_results': g_recent_results[-MAX_RECENT_RESULTS:],
+            'consecutive_misses': g_consecutive_misses,
+            'consecutive_hits': g_consecutive_hits,
+            'learning_conf_penalty': g_learning_conf_penalty,
         }
         tmp = PERSIST_FILE + ".tmp"
         with open(tmp, 'w') as f:
@@ -502,6 +615,17 @@ def load_from_disk():
         cutoff = max(0, len(g_mults) - 200)
         g_high_force_9_indices = [i for i in g_high_force_9_indices if i >= cutoff]
         g_high_force_10_indices = [i for i in g_high_force_10_indices if i >= cutoff]
+        # Cargar estado de aprendizaje adaptativo
+        loaded_results = data.get('recent_results', [])
+        g_recent_results.clear()
+        g_recent_results.extend(loaded_results[-MAX_RECENT_RESULTS:])
+        saved_misses = data.get('consecutive_misses', {})
+        saved_hits   = data.get('consecutive_hits', {})
+        saved_penalty = data.get('learning_conf_penalty', {})
+        for k in ('2x', '3x', 'trend', 'high_range'):
+            g_consecutive_misses[k] = saved_misses.get(k, 0)
+            g_consecutive_hits[k]   = saved_hits.get(k, 0)
+            g_learning_conf_penalty[k] = saved_penalty.get(k, 0.0)
         today = (datetime.utcnow() - timedelta(hours=3)).strftime("%Y-%m-%d")
         if data.get('daily_date', '') == today:
             g_daily_hits   = data.get('daily_hits',   0)
@@ -525,7 +649,7 @@ async def _send_signal_2x(trigger: float, attempt: int,
         f"<b>┄┄┄┄┄┄┄┄┄┄┄┄┄┄┄┄┄┄┄┄┄┄┄</b>\n"
         f"<b>🧨 ÚLTIMA CUOTA: {last_high_value:.2f}x</b>\n"
         f"<b>💠 OBJETIVO: {TARGET_2X:.2f}x</b>\n"
-        f"<b>🛡️ SEGURO: {INSURANCE_1_5:.2f}x</b>\n"
+        f"<b>🛡️ SEGURO: {INSURANCE_2_0:.2f}x</b>\n"
         f"<b>♣️ ETA próximo 2X: ~{eta_s:.0f}s</b>\n"
         f"<b>💡 CONFIANZA: {conf:.0f}%</b>\n"
         f"<b>🔄 INTENTO {attempt}/{MAX_ATTEMPTS}</b>"
@@ -549,7 +673,7 @@ async def _send_signal_3x(trigger: float, attempt: int,
         f"<b>┄┄┄┄┄┄┄┄┄┄┄┄┄┄┄┄┄┄┄┄┄┄┄</b>\n"
         f"<b>🧨 ÚLTIMA CUOTA: {last_high_value:.2f}x</b>\n"
         f"<b>💠 OBJETIVO: {TARGET_3X:.2f}x</b>\n"
-        f"<b>🛡️ SEGURO: {INSURANCE_1_5:.2f}x</b>\n"
+        f"<b>🛡️ SEGURO: {INSURANCE_2_0:.2f}x</b>\n"
         f"<b>♣️ ETA próximo ≥3X: {eta_txt}</b>\n"
         f"<b>💡 CONFIANZA: {conf:.0f}%</b>\n"
         f"<b>🔄 INTENTO {attempt}/{MAX_ATTEMPTS}</b>"
@@ -564,7 +688,7 @@ async def _send_signal_trend(trigger: float, attempt: int, last_value: float):
         f"<b>┄┄┄┄┄┄┄┄┄┄┄┄┄┄┄┄┄┄┄┄┄┄┄</b>\n"
         f"<b>🧨 ÚLTIMA CUOTA: {last_value:.2f}x</b>\n"
         f"<b>💠 OBJETIVO: {TARGET_2X:.2f}x</b>\n"
-        f"<b>🛡️ SEGURO: {INSURANCE_1_5:.2f}x</b>\n"
+        f"<b>🛡️ SEGURO: {INSURANCE_2_0:.2f}x</b>\n"
         f"<b>🔄 INTENTO {attempt}/{MAX_ATTEMPTS}</b>"
     )
     await broadcast_signal(txt)
@@ -576,7 +700,7 @@ async def _send_signal_high_range(trigger: float, attempt: int, target_label: st
         f"<b>┄┄┄┄┄┄┄┄┄┄┄┄┄┄┄┄┄┄┄┄┄┄┄</b>\n"
         f"<b>🧨 ÚLTIMA CUOTA: {trigger:.2f}x</b>\n"
         f"<b>💠 OBJETIVO: ≥{target_label}</b>\n"
-        f"<b>🛡️ SEGURO: {INSURANCE_1_5:.2f}x</b>\n"
+        f"<b>🛡️ SEGURO: {INSURANCE_2_0:.2f}x</b>\n"
         f"<b>🔄 INTENTO {attempt}/{MAX_ATTEMPTS}</b>"
     )
     await broadcast_signal(txt)
@@ -630,6 +754,7 @@ async def process_multiplier(value: float, round_id: str):
 
         if value >= TARGET_2X:  # Acierto completo
             g_daily_hits += 1
+            record_signal_result(kind, 'hit', value, att)
             await _send_hit(value, att, kind)
             await _broadcast_scoreboard()
             save_to_disk()
@@ -638,12 +763,13 @@ async def process_multiplier(value: float, round_id: str):
             g_cooldown3x_mod = max(g_cooldown3x_mod, 3)
             g_trend_cooldown_mod = max(g_trend_cooldown_mod, 3)
             g_high_range_cooldown_mod = max(g_high_range_cooldown_mod, 3)
-        elif value >= INSURANCE_1_5:  # Seguro activado (1.50 a 1.99)
+        elif value >= INSURANCE_2_0:  # Seguro activado (≥2.00x, igual que objetivo → siempre es acierto)
             if att < MAX_ATTEMPTS:
                 sig.attempt += 1
                 logger.info(f"Seguro en intento {att} para {kind}. Pasando a {sig.attempt}.")
             else:
                 g_daily_misses += 1
+                record_signal_result(kind, 'miss', value, att)
                 await _send_insurance(value, att, kind)
                 await _broadcast_scoreboard()
                 save_to_disk()
@@ -652,12 +778,13 @@ async def process_multiplier(value: float, round_id: str):
             g_cooldown3x_mod = max(g_cooldown3x_mod, 2)
             g_trend_cooldown_mod = max(g_trend_cooldown_mod, 2)
             g_high_range_cooldown_mod = max(g_high_range_cooldown_mod, 2)
-        else:  # Fallo total (<1.50)
+        else:  # Fallo total (<2.00x)
             if att < MAX_ATTEMPTS:
                 sig.attempt += 1
                 logger.info(f"Intento {att} fallido para {kind}. Pasando a {sig.attempt}.")
             else:
                 g_daily_misses += 1
+                record_signal_result(kind, 'miss', value, att)
                 await _send_miss(value, att, kind)
                 await _broadcast_scoreboard()
                 save_to_disk()
@@ -719,10 +846,12 @@ async def process_multiplier(value: float, round_id: str):
             g_events_data_3x, MIN_EVENTS_3X,
             SIGNAL_WINDOW_3X_B, SIGNAL_WINDOW_3X_A,
             alpha=ALPHA_3X,
-            use_value_correction=True
+            use_value_correction=True,
+            kind='3x'
         )
+        eff_thresh_3x = get_effective_confidence_threshold('3x')
         if in_win3 and not g_armed3x:
-            if conf3 >= MIN_CONFIDENCE:
+            if conf3 >= eff_thresh_3x:
                 elapsed_since = now_ts - g_last_fire3x
                 if elapsed_since >= COOLDOWN_3X:
                     g_armed3x      = True
@@ -737,7 +866,7 @@ async def process_multiplier(value: float, round_id: str):
                     await _send_signal_3x(value, 1, avg3, eta3, conf3, coef_range, g_last_high_3x_value)
                     return
             else:
-                logger.debug(f"Señal 3x descartada por baja confianza: {conf3:.1f}% (umbral {MIN_CONFIDENCE}%)")
+                logger.debug(f"Señal 3x descartada por baja confianza: {conf3:.1f}% (umbral adaptativo {eff_thresh_3x:.1f}%)")
         elif not in_win3 and g_armed3x:
             g_armed3x = False
 
@@ -747,10 +876,12 @@ async def process_multiplier(value: float, round_id: str):
             g_events_data_2x, MIN_EVENTS_2X,
             SIGNAL_WINDOW_2X, 0.0,
             alpha=ALPHA_2X,
-            use_value_correction=True
+            use_value_correction=True,
+            kind='2x'
         )
+        eff_thresh_2x = get_effective_confidence_threshold('2x')
         if in_win2 and not g_armed2x:
-            if conf2 >= MIN_CONFIDENCE:
+            if conf2 >= eff_thresh_2x:
                 elapsed_since = now_ts - g_last_fire2x
                 if elapsed_since >= SIGNAL_COOLDOWN_2X:
                     g_armed2x      = True
@@ -759,12 +890,12 @@ async def process_multiplier(value: float, round_id: str):
                     active_signal = ActiveSignal('2x', value)
                     logger.info(
                         f"🎯 SEÑAL 2x (timing) | trigger={value:.2f}x | ETA~{eta2:.0f}s | "
-                        f"avg={avg2:.1f}s | conf={conf2:.0f}%"
+                        f"avg={avg2:.1f}s | conf={conf2:.0f}% | umbral_adapt={eff_thresh_2x:.0f}%"
                     )
                     await _send_signal_2x(value, 1, avg2, eta2, conf2, g_last_high_2x_value)
                     return
             else:
-                logger.debug(f"Señal 2x descartada por baja confianza: {conf2:.1f}% (umbral {MIN_CONFIDENCE}%)")
+                logger.debug(f"Señal 2x descartada por baja confianza: {conf2:.1f}% (umbral adaptativo {eff_thresh_2x:.1f}%)")
         elif not in_win2 and g_armed2x:
             g_armed2x = False
 
@@ -773,12 +904,17 @@ async def process_multiplier(value: float, round_id: str):
         elapsed_since = now_ts - g_last_trend_fire
         if elapsed_since >= TREND_COOLDOWN:
             if check_trend_conditions():
-                g_last_trend_fire = now_ts
-                g_trend_cooldown_mod = 8
-                active_signal = ActiveSignal('trend', value)
-                logger.info(f"📈 SEÑAL TREND | trigger={value:.2f}x")
-                await _send_signal_trend(value, 1, value)
-                return
+                # Solo disparar si la precisión reciente de tendencia es aceptable
+                trend_acc = compute_recent_accuracy('trend', window=10)
+                if trend_acc >= 0.35 or len([r for r in g_recent_results if r['kind'] == 'trend']) < 5:
+                    g_last_trend_fire = now_ts
+                    g_trend_cooldown_mod = 8
+                    active_signal = ActiveSignal('trend', value)
+                    logger.info(f"📈 SEÑAL TREND | trigger={value:.2f}x | acc_reciente={trend_acc:.0%}")
+                    await _send_signal_trend(value, 1, value)
+                    return
+                else:
+                    logger.info(f"📈 Señal TREND bloqueada por baja precisión reciente: {trend_acc:.0%}")
 
     # ── 4d. Señal de rango alto ──────────────────────────────────────────────
     if g_high_range_cooldown_mod == 0 and g_high_range_search is not None:
@@ -924,19 +1060,20 @@ async def cmd_start(message):
     await bot.reply_to(message,
         f"🚀 <b>¡Bienvenido {name}!</b>\n\n"
         "━━━━━━━━━━━━━━━━━━━━━━━\n"
-        "🤖 <b>Bot de Señales Spaceman — Predictor Híbrido</b>\n\n"
-        f"🔵 <b>Señal 2x (Timing)</b> · Objetivo ≥<code>2.00x</code> · Seguro <code>1.50x</code>\n"
+        "🤖 <b>Bot de Señales Spaceman — Predictor Híbrido + Aprendizaje</b>\n\n"
+        f"🔵 <b>Señal 2x (Timing)</b> · Objetivo ≥<code>2.00x</code> · Seguro <code>2.00x</code>\n"
         f"   Predictor adaptativo: {info2}\n\n"
-        f"🚀 <b>Señal 3x (Timing)</b> · Objetivo ≥<code>3.00x</code> · Seguro <code>1.50x</code>\n"
+        f"🚀 <b>Señal 3x (Timing)</b> · Objetivo ≥<code>3.00x</code> · Seguro <code>2.00x</code>\n"
         f"   Predictor adaptativo: {info3}\n"
         f"   + Rango de cuota estimado por hash\n\n"
-        f"📈 <b>Señal de Tendencia</b> · Objetivo ≥<code>2.00x</code> · Seguro <code>1.50x</code>\n"
+        f"📈 <b>Señal de Tendencia</b> · Objetivo ≥<code>2.00x</code> · Seguro <code>2.00x</code>\n"
         f"   Basada en continuación alcista\n\n"
-        f"🔮 <b>Señal de Rango Alto</b> · Objetivo ≥<code>10x/15x</code> · Seguro <code>1.50x</code>\n"
+        f"🔮 <b>Señal de Rango Alto</b> · Objetivo ≥<code>10x/15x</code> · Seguro <code>2.00x</code>\n"
         f"   {high_info}\n\n"
         f"🔄 Cada señal tiene <code>{MAX_ATTEMPTS}</code> intentos\n"
         f"✅ Acierto = ≥2x (o ≥3x según señal)\n"
-        f"🛡️ Seguro = 1.50x\n"
+        f"🛡️ Seguro = 2.00x\n"
+        f"🧠 Umbral adaptativo según historial de fallos\n"
         f"🎯 Confianza mínima para timing: <code>{MIN_CONFIDENCE}%</code>\n"
         "━━━━━━━━━━━━━━━━━━━━━━━",
         parse_mode='HTML')
@@ -989,11 +1126,13 @@ async def cmd_predictor(message):
     await bot.reply_to(message,
         f"📡 <b>PREDICTORES — 🕐 {hora}</b>\n"
         "━━━━━━━━━━━━━━━━━━━━━━━\n"
-        f"🔵 <b>Predictor 2x (Timing)</b>\n{info2}\n\n"
-        f"🚀 <b>Predictor 3x (Timing)</b>\n{info3}\n\n"
+        f"🔵 <b>Predictor 2x (Timing)</b>\n{info2}\n"
+        f"   🧠 Umbral adapt.: <code>{get_effective_confidence_threshold('2x'):.0f}%</code> | Precisión reciente: <code>{compute_recent_accuracy('2x')*100:.0f}%</code>\n\n"
+        f"🚀 <b>Predictor 3x (Timing)</b>\n{info3}\n"
+        f"   🧠 Umbral adapt.: <code>{get_effective_confidence_threshold('3x'):.0f}%</code> | Precisión reciente: <code>{compute_recent_accuracy('3x')*100:.0f}%</code>\n\n"
         f"📈 <b>Predictor de Tendencia</b>\n"
         f"   Estado: {trend_status}\n"
-        f"   Cooldown: <code>{trend_cooldown}s</code>\n\n"
+        f"   Cooldown: <code>{trend_cooldown}s</code> | Precisión reciente: <code>{compute_recent_accuracy('trend')*100:.0f}%</code>\n\n"
         f"🔮 <b>Predictor de Rango Alto</b>\n"
         f"   {high_info}\n"
         "━━━━━━━━━━━━━━━━━━━━━━━",
@@ -1016,6 +1155,10 @@ async def cmd_estadisticas(message):
         f"📡 Señal activa: {sig_txt}\n"
         f"📦 Eventos 2x: <code>{len(g_events_data_2x)}</code> | 3x: <code>{len(g_events_data_3x)}</code>\n"
         f"🔮 Rangos altos: 9: <code>{len(g_high_force_9_indices)}</code> | 10: <code>{len(g_high_force_10_indices)}</code>\n"
+        f"🧠 <b>Aprendizaje adaptativo</b>\n"
+        f"   2x  · fallos consec: <code>{g_consecutive_misses['2x']}</code> · penalidad: <code>{g_learning_conf_penalty['2x']:.0f}pt</code>\n"
+        f"   3x  · fallos consec: <code>{g_consecutive_misses['3x']}</code> · penalidad: <code>{g_learning_conf_penalty['3x']:.0f}pt</code>\n"
+        f"   trend · fallos consec: <code>{g_consecutive_misses['trend']}</code> · penalidad: <code>{g_learning_conf_penalty['trend']:.0f}pt</code>\n"
         "━━━━━━━━━━━━━━━━━━━━━━━",
         parse_mode='HTML')
 
