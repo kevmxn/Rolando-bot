@@ -318,14 +318,13 @@ async def _send_signal_2x(trigger: float, attempt: int,
     eventos = len(g_events2x)
     logger.info(f"📤 Señal 2x intento {attempt} | trigger={trigger:.2f}x")
     txt = (
-        f"<b>🆔 SEÑAL 2x SPACEMAN — 🕐 {hora}</b>\n"
+        f"<b>🆔 SEÑAL SPACEMAN — 🕐 {hora}</b>\n"
         f"<b>┄┄┄┄┄┄┄┄┄┄┄┄┄┄┄┄┄┄┄┄┄┄┄</b>\n"
-        f"<b>⏱ ÚLTIMA CUOTA: {trigger:.2f}x</b>\n"
-        f"<b>🎯 OBJETIVO: {TARGET_2X:.2f}x</b>\n"
-        f"<b>🛡️ SEGURO: {INSURANCE_2X:.2f}x</b>\n"
-        f"<b>⏳ ETA próximo 2x: ~{eta_s:.0f}s</b>\n"
-        f"<b>📊 Confianza: {conf:.0f}%</b>\n"
-        f"<b>🔄 Intento {attempt}/{MAX_ATTEMPTS}</b>"
+        f"<b>🧨 ÚLTIMA CUOTA: {trigger:.2f}x</b>\n"
+        f"<b>🛡️ OBJECTIVO: {TARGET_2X:.2f}x — 3.00x</b>\n"
+        f"<b>♣️ ETA próximo 2X: ~{eta_s:.0f}s</b>\n"
+        f"<b>💡 CONFIANZA: {conf:.0f}%</b>\n"
+        f"<b>🔄 INTENTO {attempt}/{MAX_ATTEMPTS}</b>"
     )
     await broadcast_signal(txt)
 
@@ -345,16 +344,14 @@ async def _send_signal_3x(trigger: float, attempt: int,
         eta_txt = "¡AHORA!"
     logger.info(f"📤 Señal 3x intento {attempt} | trigger={trigger:.2f}x | rango={coef_range} | eta={eta_s:.1f}s")
     txt = (
-        f"<b>🚀 SEÑAL 3x SPACEMAN — 🕐 {hora}</b>\n"
+        f"<b>💎 SEÑAL SPACEMAN — 🕐 {hora}</b>\n"
         f"<b>┄┄┄┄┄┄┄┄┄┄┄┄┄┄┄┄┄┄┄┄┄┄┄</b>\n"
-        f"<b>⏱ ÚLTIMA CUOTA ≥3x: {trigger:.2f}x</b>\n"
+        f"<b>🧨 ÚLTIMA CUOTA ≥3X: {trigger:.2f}x</b>\n"
         f"<b>🎯 OBJETIVO: {TARGET_3X:.2f}x</b>\n"
         f"<b>🛡️ SEGURO: {INSURANCE_2X:.2f}x</b>\n"
-        f"<b>📈 RANGO ESTIMADO: {coef_range}</b>\n"
-        f"<b>⏳ ETA próximo ≥3x: {eta_txt}</b>\n"
-        f"<b>🪟 VENTANA: ±{SIGNAL_WINDOW_3X_B}s del ETA</b>\n"
-        f"<b>📊 Confianza: {conf:.0f}% | Eventos: {eventos}</b>\n"
-        f"<b>🔄 Intento {attempt}/{MAX_ATTEMPTS}</b>"
+        f"<b>♣️ ETA próximo ≥3X: {eta_txt}</b>\n"
+        f"<b>💡 CONFIANZA: {conf:.0f}%</b>\n"
+        f"<b>🔄 INTENTO {attempt}/{MAX_ATTEMPTS}</b>"
     )
     await broadcast_signal(txt)
 
@@ -382,7 +379,7 @@ async def _send_miss(value: float, attempt: int, kind: str, last: bool):
     else:
         txt = (
             f"<b>❌ {value:.2f}x — 🕐 {hora}</b>\n"
-            f"<b>Señal {kind.upper()} · Intento {attempt}/{MAX_ATTEMPTS} fallido → preparando intento {attempt+1}...</b>"
+            f"<b>Señal {kind.upper()} · Intento {attempt}/{MAX_ATTEMPTS} fallido</b>"
         )
     await broadcast(txt)
 
@@ -449,22 +446,29 @@ async def process_multiplier(value: float, round_id: str):
         for oid in sorted(g_seen_ids)[:1000]:
             g_seen_ids.discard(oid)
 
-    # ── Fase 3: Registrar eventos por tier ────────────────────────────────────
+    # ── Fase 3: Registrar eventos y resetear timer si cuota ≥ 2x ───────────────
     if value >= 2.0:
+        # Registra el gap para aprender el intervalo de timing
         _register_event(now_ts, g_events2x, g_gaps2x, MAX_HIST_2X)
-        if g_armed2x:
-            g_armed2x = False
-            logger.debug(f"Señal 2x reseteada — llegó {value:.2f}x")
+        # ⚠️ Cuota ≥ 2x → el reloj vuelve a cero desde ahora.
+        # Se cancela cualquier señal armada pero NO la señal activa (ya evaluada).
+        g_armed2x = False
+        logger.info(f"🔄 Timer 2x reseteado — cuota {value:.2f}x")
 
     if value >= 3.0:
         _register_event(now_ts, g_events3x, g_gaps3x, MAX_HIST_3X)
-        if g_armed3x:
-            g_armed3x = False
-            logger.debug(f"Señal 3x reseteada — llegó {value:.2f}x")
+        g_armed3x = False
+        logger.info(f"🔄 Timer 3x reseteado — cuota {value:.2f}x")
 
     # ── Fase 4: Disparar señal (solo si no hay señal activa) ──────────────────
     if active_signal is not None:
         return   # ya hay señal activa esperando
+
+    # ⛔ CONDICIÓN CLAVE: solo dispara señal si la cuota actual es < 2x.
+    # Si la ronda terminó en ≥ 2x el timer ya se reseteó arriba y no
+    # tiene sentido disparar — el ciclo empieza de cero.
+    if value >= 2.0:
+        return
 
     # ── 4a. Señal 3x (tiene prioridad si el predictor está listo) ─────────────
     if g_cooldown3x_mod == 0:
