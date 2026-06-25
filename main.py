@@ -1,10 +1,11 @@
 #!/usr/bin/env python3
 """
 ╔══════════════════════════════════════════════════════════╗
-║   SPACEMAN BOT — Triple Predictor (Adaptativo)          ║
-║   • Predictor 2x y 3x con EMA, tendencia y corrección   ║
-║   • Adaptación dinámica a rachas altas/bajas            ║
-║   • Intentos: sin mensaje de fallo en intento 1         ║
+║   SPACEMAN BOT — Triple Predictor + Trend + High Range  ║
+║   • Timing (2x/3x) con EMA y tendencia de gaps          ║
+║   • Tendencia (continuación alcista)                    ║
+║   • Rango alto (≥10x / ≥15x) por intervalos             ║
+║   • Seguro universal: 1.50x                             ║
 ║   • Marcador diario: aciertos ≥2x                       ║
 ╚══════════════════════════════════════════════════════════╝
 """
@@ -41,24 +42,37 @@ CURRENCY  = "BRL"
 GAME_ID   = 1301
 
 # ── Umbrales ──────────────────────────────────────────────────────────────────
-TARGET_2X        = 2.00   # señal 2x: acierto si resultado ≥ 2x
-TARGET_3X        = 3.00   # señal 3x: objetivo principal
-INSURANCE_2X     = 2.00   # seguro 3x: si llega a 2x pero no a 3x → acierto igual
-MAX_ATTEMPTS     = 2      # intentos por señal (aplica a ambos tipos)
+TARGET_2X        = 2.00
+TARGET_3X        = 3.00
+INSURANCE_1_5    = 1.50   # seguro universal
+MAX_ATTEMPTS     = 2
+MIN_CONFIDENCE   = 60.0   # solo para señales de timing
 
-# ── Predictor 2x (adaptativo) ──────────────────────────────────────────────
-MIN_EVENTS_2X     = 15    # mínimo de eventos ≥2x para activar predictor
-SIGNAL_WINDOW_2X  = 20    # segundos antes del ETA para disparar señal 2x
+# ── Predictor temporal (timing) ─────────────────────────────────────────────
+MIN_EVENTS_2X     = 15
+SIGNAL_WINDOW_2X  = 20
 MAX_HIST_2X       = 200
-ALPHA_2X          = 0.25  # factor de suavizado EMA
+ALPHA_2X          = 0.25
 
-# ── Predictor 3x (adaptativo) ──────────────────────────────────────────────
 MIN_EVENTS_3X      = 10
-SIGNAL_WINDOW_3X_B = 10   # segundos ANTES del ETA
-SIGNAL_WINDOW_3X_A = 10   # segundos DESPUÉS del ETA
+SIGNAL_WINDOW_3X_B = 10
+SIGNAL_WINDOW_3X_A = 10
 MAX_HIST_3X        = 150
 COOLDOWN_3X        = 45
 ALPHA_3X           = 0.30
+
+# ── Predictor de tendencia ──────────────────────────────────────────────────
+TREND_COOLDOWN          = 60
+TREND_MIN_CONDITIONS    = 3
+TREND_EMA_FAST          = 4
+TREND_EMA_SLOW          = 12
+TREND_BULLISH_LOOKBACK  = 8
+TREND_STRENGTH_WINDOW   = 4
+
+# ── Predictor de rango alto ──────────────────────────────────────────────────
+HIGH_RANGE_COOLDOWN            = 90
+HIGH_RANGE_MIN_OCCURRENCES     = 3
+HIGH_RANGE_CONFIDENCE_THRESHOLD= 60.0
 
 # ── General ──────────────────────────────────────────────────────────────────
 SIGNAL_COOLDOWN_2X = 30
@@ -70,19 +84,35 @@ PERSIST_FILE       = "spaceman_history.json"
 g_mults:    list = []
 g_seen_ids: set  = set()
 
-# Nuevas estructuras: listas de tuplas (timestamp, value)
+# Listas de eventos (timestamp, value) para timing
 g_events_data_2x: List[Tuple[float, float]] = []   # eventos ≥2.0
 g_events_data_3x: List[Tuple[float, float]] = []   # eventos ≥3.0
 
-# Control de señal 2x
+# Últimos valores reales de cuota alta (para mostrar en mensajes)
+g_last_high_2x_value = 0.0
+g_last_high_3x_value = 0.0
+
+# Control de señal de timing
 g_armed2x:          bool  = False
 g_last_fire2x:      float = 0
 g_cooldown2x_mod:   int   = 0
 
-# Control de señal 3x
 g_armed3x:          bool  = False
 g_last_fire3x:      float = 0
 g_cooldown3x_mod:   int   = 0
+
+# Control de señal de tendencia
+g_last_trend_fire:  float = 0
+g_trend_cooldown_mod: int = 0
+
+# Control de señal de rango alto
+g_last_high_range_fire: float = 0
+g_high_range_cooldown_mod: int = 0
+
+# Historial de índices de fuerzas 9 y 10 (rangos altos)
+g_high_force_9_indices = []
+g_high_force_10_indices = []
+g_high_range_search = None
 
 g_all_chats: set = set()
 
@@ -124,12 +154,92 @@ def avg_sec(lst: List[float]) -> Optional[float]:
     return sum(lst) / len(lst) if lst else None
 
 def _register_event(ts: float, value: float, events_data: List[Tuple[float, float]], max_hist: int):
-    """Registra un evento (timestamp, valor) y mantiene el historial acotado."""
     events_data.append((ts, value))
     if len(events_data) > max_hist:
         del events_data[:-max_hist]
 
-# ─── PREDICTOR ADAPTATIVO (EMA + TENDENCIA + CORRECCIÓN POR VALOR) ──────
+# ─── CLASIFICACIÓN DE FUERZA ──────────────────────────────────────────────
+def classify(value: float) -> int:
+    v = float(value)
+    if v >= 1.00 and v <= 1.09: return -10
+    if v >= 1.10 and v <= 1.19: return -9
+    if v >= 1.20 and v <= 1.29: return -8
+    if v >= 1.30 and v <= 1.39: return -7
+    if v >= 1.40 and v <= 1.49: return -6
+    if v >= 1.50 and v <= 1.59: return -5
+    if v >= 1.60 and v <= 1.69: return -4
+    if v >= 1.70 and v <= 1.79: return -3
+    if v >= 1.80 and v <= 1.89: return -2
+    if v >= 1.90 and v <= 1.99: return -1
+    if v >= 2.00 and v <= 2.99: return 1
+    if v >= 3.00 and v <= 3.99: return 2
+    if v >= 4.00 and v <= 4.99: return 3
+    if v >= 5.00 and v <= 5.99: return 4
+    if v >= 6.00 and v <= 6.99: return 5
+    if v >= 7.00 and v <= 7.99: return 6
+    if v >= 8.00 and v <= 8.99: return 7
+    if v >= 9.00 and v <= 9.99: return 8
+    if v >= 10.00 and v <= 14.99: return 9
+    if v >= 15.00: return 10
+    return 0
+
+# ─── PREDICTOR DE TENDENCIA ──────────────────────────────────────────────────
+def check_trend_conditions() -> bool:
+    if len(g_mults) < TREND_EMA_SLOW + 2:
+        return False
+
+    vals = [m['value'] for m in g_mults]
+    n = len(vals)
+
+    def calc_ema(data, period):
+        k = 2 / (period + 1)
+        ema = data[0]
+        for val in data[1:]:
+            ema = val * k + ema * (1 - k)
+        return ema
+
+    fast_ema = calc_ema(vals[-TREND_EMA_FAST:], TREND_EMA_FAST)
+    slow_ema = calc_ema(vals[-TREND_EMA_SLOW:], TREND_EMA_SLOW)
+    cond1 = fast_ema > slow_ema and (fast_ema > vals[-2] if len(vals) >= 2 else False)
+
+    lookback = TREND_BULLISH_LOOKBACK
+    if n >= lookback + 1:
+        recent = vals[-lookback:]
+        bullish_count = sum(1 for i in range(1, len(recent)) if recent[i] > recent[i-1])
+        cond2 = bullish_count >= lookback * 0.6
+    else:
+        cond2 = False
+
+    window = TREND_STRENGTH_WINDOW
+    if n >= 2 * window:
+        forces = [classify(v) for v in vals]
+        recent_avg = sum(forces[-window:]) / window
+        prev_avg = sum(forces[-2*window:-window]) / window
+        cond3 = recent_avg > prev_avg
+    else:
+        cond3 = False
+
+    if n >= 5:
+        diff_vals = [vals[i] - vals[i-1] for i in range(1, len(vals))]
+        last_diffs = diff_vals[-5:] if len(diff_vals) >= 5 else diff_vals
+        cond4 = sum(last_diffs) > 0
+    else:
+        cond4 = False
+
+    if n >= 2:
+        last_val = vals[-1]
+        prev_val = vals[-2]
+        force = classify(last_val)
+        cond5 = last_val > prev_val and force > 0
+    else:
+        cond5 = False
+
+    conditions = [cond1, cond2, cond3, cond4, cond5]
+    true_count = sum(conditions)
+    logger.debug(f"Trend conditions: {true_count}/5 -> {conditions}")
+    return true_count >= TREND_MIN_CONDITIONS
+
+# ─── PREDICTOR TEMPORAL (timing) ────────────────────────────────────────────
 def _predict_next_event(
     events_data: List[Tuple[float, float]],
     min_events: int,
@@ -138,14 +248,9 @@ def _predict_next_event(
     alpha: float = 0.3,
     use_value_correction: bool = True
 ) -> Tuple[bool, float, float, float, float]:
-    """
-    Predice el próximo evento usando EMA con ajuste por tendencia y valor de cuota.
-    Retorna: (in_window, eta, predicted_gap, confidence, trend_adj)
-    """
     if len(events_data) < min_events:
         return False, 0.0, 0.0, 0.0, 0.0
 
-    # Extraer gaps y valores
     gaps = []
     values = []
     for i in range(1, len(events_data)):
@@ -160,38 +265,30 @@ def _predict_next_event(
     if n < 3:
         return False, 0.0, 0.0, 0.0, 0.0
 
-    # 1. EMA de los gaps con pesos exponenciales
     weights = [alpha * (1 - alpha) ** (n - 1 - i) for i in range(n)]
     total_w = sum(weights)
     weights = [w / total_w for w in weights]
     ema_gap = sum(weights[i] * gaps[i] for i in range(n))
 
-    # 2. Tendencia (pendiente lineal)
     x = list(range(n))
     mean_x = (n - 1) / 2
     mean_y = sum(gaps) / n
     slope = sum((x[i] - mean_x) * (gaps[i] - mean_y) for i in range(n)) / sum((x[i] - mean_x) ** 2 for i in range(n)) if n > 1 else 0.0
 
-    # 3. Volatilidad (CV)
     mean_gap = sum(gaps) / n
     variance = sum((g - mean_gap) ** 2 for g in gaps) / n
     std_gap = variance ** 0.5 if variance > 0 else 1.0
     cv = std_gap / mean_gap if mean_gap > 0 else 1.0
 
-    # 4. Ajuste por tendencia (atenuado por volatilidad)
     volatility_factor = min(1.0, 1.0 / (1 + cv))
     trend_adj = slope * 0.5 * volatility_factor
 
-    # 5. Corrección por valor de la última cuota
     correction = 0.0
     if use_value_correction and len(values) > 0:
-        # Promedio de valores recientes (últimos 5)
         recent_vals = values[-5:] if len(values) >= 5 else values
         avg_val = sum(recent_vals) / len(recent_vals)
-        # Determinamos el umbral según el tipo de evento (2x o 3x)
-        # Lo inferimos del tamaño de events_data comparado con los globales
         threshold = 2.0 if len(events_data) == len(g_events_data_2x) else 3.0
-        correction = (avg_val - threshold) * 0.1   # factor empírico
+        correction = (avg_val - threshold) * 0.1
 
     predicted_gap = ema_gap + trend_adj + correction
     if predicted_gap <= 0:
@@ -202,30 +299,109 @@ def _predict_next_event(
 
     in_window = -window_after <= eta <= window_before
 
-    # Confianza: regularidad + proximidad al ETA
     regularity = max(0.0, 1.0 - cv)
     proximity = 1.0 - abs(min(1.0, elapsed / predicted_gap) - 1.0) if predicted_gap > 0 else 0.0
     confidence = min(98.0, proximity * 50 + regularity * 50)
 
     return in_window, eta, predicted_gap, confidence, trend_adj + correction
 
-# ─── RANGO DE CUOTA (derivePrediction) ──────────────────────────────────────
+# ─── PREDICTOR DE RANGO ALTO ──────────────────────────────────────────────────
+def compute_average_interval(indices: List[int]) -> Optional[float]:
+    if len(indices) < 2:
+        return None
+    diffs = [indices[i] - indices[i-1] for i in range(1, len(indices))]
+    return sum(diffs) / len(diffs)
+
+def record_high_range_occurrence(force: int, bar_index: int):
+    if force == 9:
+        g_high_force_9_indices.append(bar_index)
+    elif force == 10:
+        g_high_force_10_indices.append(bar_index)
+    cutoff = max(0, bar_index - 200)
+    g_high_force_9_indices = [i for i in g_high_force_9_indices if i >= cutoff]
+    g_high_force_10_indices = [i for i in g_high_force_10_indices if i >= cutoff]
+
+def update_high_range_search(bar_index: int):
+    global g_high_range_search
+    if g_high_range_search:
+        elapsed = bar_index - g_high_range_search['created_at_bar']
+        remaining = max(0, g_high_range_search['window'] - elapsed)
+        g_high_range_search['remaining'] = remaining
+        if remaining == 0:
+            logger.info("Búsqueda de rango alto fallida")
+            g_high_range_search = None
+        return
+
+    avg9 = compute_average_interval(g_high_force_9_indices)
+    avg10 = compute_average_interval(g_high_force_10_indices)
+
+    if avg9 is not None and avg10 is not None:
+        if avg9 < avg10:
+            target = 9; avg = avg9
+        elif avg10 < avg9:
+            target = 10; avg = avg10
+        else:
+            target = 9 if len(g_high_force_9_indices) >= len(g_high_force_10_indices) else 10
+            avg = avg9 if target == 9 else avg10
+    elif avg9 is not None:
+        target = 9; avg = avg9
+    elif avg10 is not None:
+        target = 10; avg = avg10
+    else:
+        return
+
+    if len(g_high_force_9_indices) < HIGH_RANGE_MIN_OCCURRENCES and len(g_high_force_10_indices) < HIGH_RANGE_MIN_OCCURRENCES:
+        return
+
+    window = max(2, int(round(avg)) + 2)
+    g_high_range_search = {
+        'target': target,
+        'expected_in': int(round(avg)),
+        'remaining': window,
+        'created_at_bar': bar_index,
+        'window': window,
+        'avg': avg
+    }
+    logger.info(f"Iniciada búsqueda rango alto {target} ventana {window}")
+
+def check_high_range_signal(bar_index: int) -> Tuple[bool, float]:
+    if not g_high_range_search:
+        return False, 0.0
+    remaining = g_high_range_search['remaining']
+    window = g_high_range_search['window']
+    elapsed = bar_index - g_high_range_search['created_at_bar']
+
+    if remaining <= 3 and remaining > 0 and elapsed >= window * 0.5:
+        target = g_high_range_search['target']
+        indices = g_high_force_9_indices if target == 9 else g_high_force_10_indices
+        if len(indices) >= 3:
+            diffs = [indices[i] - indices[i-1] for i in range(1, len(indices))]
+            mean = sum(diffs) / len(diffs)
+            variance = sum((d - mean) ** 2 for d in diffs) / len(diffs)
+            std = variance ** 0.5
+            cv = std / mean if mean > 0 else 1.0
+            confidence = max(0, 100 * (1 - min(cv, 1.0)))
+            if confidence >= HIGH_RANGE_CONFIDENCE_THRESHOLD:
+                return True, confidence
+    return False, 0.0
+
+# ─── RANGO DE CUOTA (para 3x) ──────────────────────────────────────────────
 def derive_prediction(trigger: float, ts: float) -> str:
     sec_str = str(int(ts))[-4:]
     raw = f"{trigger:.2f}|{sec_str}|3x"
     hex_digest = hashlib.sha256(raw.encode()).hexdigest()
     n = int(hex_digest[:8], 16)
-    r = (n % 1000) / 10.0   # 0.0 – 99.9
+    r = (n % 1000) / 10.0
     if r < 20:
-        coef = 3.0 + (int(r / 5)) * 0.5          # 3.0 – 4.5
+        coef = 3.0 + (int(r / 5)) * 0.5
     elif r < 45:
-        coef = 5.0 + (int((r - 20) / 5)) * 1.0   # 5.0 – 9.0
+        coef = 5.0 + (int((r - 20) / 5)) * 1.0
     elif r < 70:
-        coef = 10.0 + (int((r - 45) / 5)) * 2.0  # 10.0 – 20.0
+        coef = 10.0 + (int((r - 45) / 5)) * 2.0
     elif r < 90:
-        coef = 20.0 + (int((r - 70) / 5)) * 5.0  # 20.0 – 40.0
+        coef = 20.0 + (int((r - 70) / 5)) * 5.0
     else:
-        coef = 50.0 + (int((r - 90) / 5)) * 10.0 # 50.0+
+        coef = 50.0 + (int((r - 90) / 5)) * 10.0
     lo = max(3.0, coef * 0.8)
     hi = coef * 1.2
     return f"{lo:.1f}x – {hi:.1f}x"
@@ -233,7 +409,7 @@ def derive_prediction(trigger: float, ts: float) -> str:
 # ─── ESTADO DE SEÑAL ACTIVA ─────────────────────────────────────────────────
 class ActiveSignal:
     def __init__(self, kind: str, trigger: float):
-        self.kind    = kind
+        self.kind    = kind    # '2x', '3x', 'trend', 'high_range'
         self.trigger = trigger
         self.attempt = 1
 
@@ -289,6 +465,8 @@ def save_to_disk():
             'daily_hits':  g_daily_hits,
             'daily_misses': g_daily_misses,
             'daily_date':  g_daily_date,
+            'high_force_9': g_high_force_9_indices,
+            'high_force_10': g_high_force_10_indices,
         }
         tmp = PERSIST_FILE + ".tmp"
         with open(tmp, 'w') as f:
@@ -300,6 +478,8 @@ def save_to_disk():
 def load_from_disk():
     global g_mults, g_events_data_2x, g_events_data_3x
     global g_daily_hits, g_daily_misses, g_daily_date
+    global g_last_high_2x_value, g_last_high_3x_value
+    global g_high_force_9_indices, g_high_force_10_indices
     if not os.path.exists(PERSIST_FILE):
         return
     try:
@@ -311,9 +491,17 @@ def load_from_disk():
         g_mults[:] = loaded
         for m in g_mults:
             g_seen_ids.add(str(m['id']))
-        # Cargar listas de eventos (se guardan como listas de listas)
         g_events_data_2x = [(e[0], e[1]) for e in data.get('events2x', [])[-MAX_HIST_2X:]]
         g_events_data_3x = [(e[0], e[1]) for e in data.get('events3x', [])[-MAX_HIST_3X:]]
+        if g_events_data_2x:
+            g_last_high_2x_value = g_events_data_2x[-1][1]
+        if g_events_data_3x:
+            g_last_high_3x_value = g_events_data_3x[-1][1]
+        g_high_force_9_indices = data.get('high_force_9', [])
+        g_high_force_10_indices = data.get('high_force_10', [])
+        cutoff = max(0, len(g_mults) - 200)
+        g_high_force_9_indices = [i for i in g_high_force_9_indices if i >= cutoff]
+        g_high_force_10_indices = [i for i in g_high_force_10_indices if i >= cutoff]
         today = (datetime.utcnow() - timedelta(hours=3)).strftime("%Y-%m-%d")
         if data.get('daily_date', '') == today:
             g_daily_hits   = data.get('daily_hits',   0)
@@ -322,19 +510,22 @@ def load_from_disk():
         else:
             g_daily_hits = g_daily_misses = 0
             g_daily_date = today
-        logger.info(f"Cargado: {len(g_mults)} mults | {len(g_events_data_2x)} ev2x | {len(g_events_data_3x)} ev3x")
+        logger.info(f"Cargado: {len(g_mults)} mults | ev2x:{len(g_events_data_2x)} ev3x:{len(g_events_data_3x)} | high9:{len(g_high_force_9_indices)} high10:{len(g_high_force_10_indices)}")
     except Exception as e:
         logger.warning(f"load error: {e}")
 
 # ─── MENSAJES DE SEÑAL ──────────────────────────────────────────────────────
+# Señales de tiempo (2x y 3x) mantienen su formato completo con ETA y confianza
 async def _send_signal_2x(trigger: float, attempt: int,
-                          avg_gap: float, eta_s: float, conf: float):
+                          avg_gap: float, eta_s: float, conf: float,
+                          last_high_value: float):
     hora = argentina_time()
     txt = (
         f"<b>🆔 SEÑAL SPACEMAN — 🕐 {hora}</b>\n"
         f"<b>┄┄┄┄┄┄┄┄┄┄┄┄┄┄┄┄┄┄┄┄┄┄┄</b>\n"
-        f"<b>🧨 ÚLTIMA CUOTA: {trigger:.2f}x</b>\n"
-        f"<b>🛡️ OBJECTIVO: {TARGET_2X:.2f}x — 3.00x</b>\n"
+        f"<b>🧨 ÚLTIMA CUOTA: {last_high_value:.2f}x</b>\n"
+        f"<b>💠 OBJETIVO: {TARGET_2X:.2f}x</b>\n"
+        f"<b>🛡️ SEGURO: {INSURANCE_1_5:.2f}x</b>\n"
         f"<b>♣️ ETA próximo 2X: ~{eta_s:.0f}s</b>\n"
         f"<b>💡 CONFIANZA: {conf:.0f}%</b>\n"
         f"<b>🔄 INTENTO {attempt}/{MAX_ATTEMPTS}</b>"
@@ -343,47 +534,72 @@ async def _send_signal_2x(trigger: float, attempt: int,
 
 async def _send_signal_3x(trigger: float, attempt: int,
                           avg_gap: float, eta_s: float,
-                          conf: float, coef_range: str):
+                          conf: float, coef_range: str,
+                          last_high_value: float):
     hora = argentina_time()
     eta_abs = abs(eta_s)
     if eta_s > 0:
         eta_txt = f"en ~{eta_abs:.0f}s"
     elif eta_s < -1:
-        eta_txt = f"hace {eta_abs:.0f}s"
+        eta_txt = f"hace {eta_abs:.0f}s (ventana +{SIGNAL_WINDOW_3X_A}s)"
     else:
         eta_txt = "¡AHORA!"
     txt = (
         f"<b>💎 SEÑAL SPACEMAN — 🕐 {hora}</b>\n"
         f"<b>┄┄┄┄┄┄┄┄┄┄┄┄┄┄┄┄┄┄┄┄┄┄┄</b>\n"
-        f"<b>🧨 ÚLTIMA CUOTA ≥3X: {trigger:.2f}x</b>\n"
-        f"<b>🎯 OBJETIVO: {TARGET_3X:.2f}x</b>\n"
-        f"<b>🛡️ SEGURO: {INSURANCE_2X:.2f}x</b>\n"
+        f"<b>🧨 ÚLTIMA CUOTA: {last_high_value:.2f}x</b>\n"
+        f"<b>💠 OBJETIVO: {TARGET_3X:.2f}x</b>\n"
+        f"<b>🛡️ SEGURO: {INSURANCE_1_5:.2f}x</b>\n"
         f"<b>♣️ ETA próximo ≥3X: {eta_txt}</b>\n"
         f"<b>💡 CONFIANZA: {conf:.0f}%</b>\n"
         f"<b>🔄 INTENTO {attempt}/{MAX_ATTEMPTS}</b>"
     )
     await broadcast_signal(txt)
 
-async def _send_hit(value: float, attempt: int, kind: str):
-    """Mensaje de acierto (para cualquier intento)."""
+# Señales de tendencia y rango alto usan el formato básico (sin ETA ni confianza)
+async def _send_signal_trend(trigger: float, attempt: int, last_value: float):
     hora = argentina_time()
-    if value >= TARGET_3X:
-        emoji, label = "✅", f"GANAMOS {value:.2f}x"
-    else:
-        emoji, label = "🛡️", f"SEGURO ACTIVADO {value:.2f}x"
+    txt = (
+        f"<b>♦️ SEÑAL SPACEMAN — 🕐 {hora}</b>\n"
+        f"<b>┄┄┄┄┄┄┄┄┄┄┄┄┄┄┄┄┄┄┄┄┄┄┄</b>\n"
+        f"<b>🧨 ÚLTIMA CUOTA: {last_value:.2f}x</b>\n"
+        f"<b>💠 OBJETIVO: {TARGET_2X:.2f}x</b>\n"
+        f"<b>🛡️ SEGURO: {INSURANCE_1_5:.2f}x</b>\n"
+        f"<b>🔄 INTENTO {attempt}/{MAX_ATTEMPTS}</b>"
+    )
+    await broadcast_signal(txt)
+
+async def _send_signal_high_range(trigger: float, attempt: int, target_label: str):
+    hora = argentina_time()
+    txt = (
+        f"<b>♦️ SEÑAL SPACEMAN — 🕐 {hora}</b>\n"
+        f"<b>┄┄┄┄┄┄┄┄┄┄┄┄┄┄┄┄┄┄┄┄┄┄┄</b>\n"
+        f"<b>🧨 ÚLTIMA CUOTA: {trigger:.2f}x</b>\n"
+        f"<b>💠 OBJETIVO: ≥{target_label}</b>\n"
+        f"<b>🛡️ SEGURO: {INSURANCE_1_5:.2f}x</b>\n"
+        f"<b>🔄 INTENTO {attempt}/{MAX_ATTEMPTS}</b>"
+    )
+    await broadcast_signal(txt)
+
+async def _send_hit(value: float, attempt: int, kind: str):
+    hora = argentina_time()
+    emoji, label = "✅", f"GANAMOS {value:.2f}x"
     txt = (
         f"<b>{emoji} {label} — 🕐 {hora}</b>\n"
         f"<b>Señal {kind.upper()} · Intento {attempt}/{MAX_ATTEMPTS}</b>"
     )
     await broadcast(txt)
 
-async def _send_miss(value: float, attempt: int, kind: str):
-    """
-    Mensaje de fallo. Solo se llama cuando el intento actual es el último
-    y ha fallado, o cuando el intento 1 falla y no hay más intentos (no ocurre aquí).
-    """
+async def _send_insurance(value: float, attempt: int, kind: str):
     hora = argentina_time()
-    # Siempre será el último intento (2) porque en el intento 1 no se envía miss.
+    txt = (
+        f"<b>🛡️ SEGURO ACTIVADO {value:.2f}x — 🕐 {hora}</b>\n"
+        f"<b>Señal {kind.upper()} · Intento {attempt}/{MAX_ATTEMPTS}</b>"
+    )
+    await broadcast(txt)
+
+async def _send_miss(value: float, attempt: int, kind: str):
+    hora = argentina_time()
     txt = (
         f"<b>❌ PERDIMOS {value:.2f}x — 🕐 {hora}</b>\n"
         f"<b>Señal {kind.upper()} · Intento {attempt}/{MAX_ATTEMPTS} — Señal fallida 😭</b>"
@@ -395,8 +611,12 @@ async def process_multiplier(value: float, round_id: str):
     global active_signal
     global g_armed2x, g_last_fire2x, g_cooldown2x_mod
     global g_armed3x, g_last_fire3x, g_cooldown3x_mod
+    global g_last_trend_fire, g_trend_cooldown_mod
+    global g_last_high_range_fire, g_high_range_cooldown_mod
     global g_mults, g_seen_ids, _persist_counter
     global g_daily_hits, g_daily_misses
+    global g_last_high_2x_value, g_last_high_3x_value
+    global g_high_range_search
 
     logger.info(f"🎲 {value:.2f}x | ID:{round_id} | señal:{active_signal.kind if active_signal else 'idle'}")
 
@@ -408,35 +628,49 @@ async def process_multiplier(value: float, round_id: str):
         kind = sig.kind
         att  = sig.attempt
 
-        # ¿Acierto? Para señal 2x: ≥2x. Para señal 3x: ≥2x (seguro) o ≥3x.
-        hit = value >= INSURANCE_2X
-
-        if hit:
+        if value >= TARGET_2X:  # Acierto completo
             g_daily_hits += 1
-            await _send_hit(value, att, kind)   # Envía mensaje de acierto (intento actual)
+            await _send_hit(value, att, kind)
             await _broadcast_scoreboard()
             save_to_disk()
             _clear_signal()
             g_cooldown2x_mod = max(g_cooldown2x_mod, 3)
             g_cooldown3x_mod = max(g_cooldown3x_mod, 3)
-        else:
+            g_trend_cooldown_mod = max(g_trend_cooldown_mod, 3)
+            g_high_range_cooldown_mod = max(g_high_range_cooldown_mod, 3)
+        elif value >= INSURANCE_1_5:  # Seguro activado (1.50 a 1.99)
             if att < MAX_ATTEMPTS:
-                # Intento 1 fallido → solo incrementamos el intento, NO enviamos mensaje de pérdida
                 sig.attempt += 1
-                logger.info(f"Intento {att} fallido para señal {kind}. Pasando a intento {sig.attempt}.")
-                # No se limpia la señal, se espera el próximo multiplicador
+                logger.info(f"Seguro en intento {att} para {kind}. Pasando a {sig.attempt}.")
             else:
-                # Intento 2 (último) fallido → enviamos mensaje de pérdida
                 g_daily_misses += 1
-                await _send_miss(value, att, kind)   # att es 2 aquí
+                await _send_insurance(value, att, kind)
                 await _broadcast_scoreboard()
                 save_to_disk()
                 _clear_signal()
             g_cooldown2x_mod = max(g_cooldown2x_mod, 2)
             g_cooldown3x_mod = max(g_cooldown3x_mod, 2)
+            g_trend_cooldown_mod = max(g_trend_cooldown_mod, 2)
+            g_high_range_cooldown_mod = max(g_high_range_cooldown_mod, 2)
+        else:  # Fallo total (<1.50)
+            if att < MAX_ATTEMPTS:
+                sig.attempt += 1
+                logger.info(f"Intento {att} fallido para {kind}. Pasando a {sig.attempt}.")
+            else:
+                g_daily_misses += 1
+                await _send_miss(value, att, kind)
+                await _broadcast_scoreboard()
+                save_to_disk()
+                _clear_signal()
+            g_cooldown2x_mod = max(g_cooldown2x_mod, 2)
+            g_cooldown3x_mod = max(g_cooldown3x_mod, 2)
+            g_trend_cooldown_mod = max(g_trend_cooldown_mod, 2)
+            g_high_range_cooldown_mod = max(g_high_range_cooldown_mod, 2)
 
     g_cooldown2x_mod = max(0, g_cooldown2x_mod - 1)
     g_cooldown3x_mod = max(0, g_cooldown3x_mod - 1)
+    g_trend_cooldown_mod = max(0, g_trend_cooldown_mod - 1)
+    g_high_range_cooldown_mod = max(0, g_high_range_cooldown_mod - 1)
 
     # ── Fase 2: Registrar multiplicador ───────────────────────────────────────
     now_ts = time.time()
@@ -454,27 +688,33 @@ async def process_multiplier(value: float, round_id: str):
         for oid in sorted(g_seen_ids)[:1000]:
             g_seen_ids.discard(oid)
 
-    # ── Fase 3: Registrar eventos y resetear timer si cuota ≥2x o ≥3x ──────
+    # ── Fase 3: Registrar eventos de timing ─────────────────────────────────
     if value >= 2.0:
         _register_event(now_ts, value, g_events_data_2x, MAX_HIST_2X)
+        g_last_high_2x_value = value
         g_armed2x = False
         logger.info(f"🔄 Timer 2x reseteado — cuota {value:.2f}x")
 
     if value >= 3.0:
         _register_event(now_ts, value, g_events_data_3x, MAX_HIST_3X)
+        g_last_high_3x_value = value
         g_armed3x = False
         logger.info(f"🔄 Timer 3x reseteado — cuota {value:.2f}x")
 
-    # ── Fase 4: Disparar señal (solo si no hay señal activa) ──────────────────
-    if active_signal is not None:
-        return   # ya hay señal activa
+    # ── Fase 3b: Actualizar búsqueda de rango alto ──────────────────────────
+    force = classify(value)
+    if force in (9, 10):
+        record_high_range_occurrence(force, len(g_mults) - 1)
+    update_high_range_search(len(g_mults) - 1)
 
-    # ⛔ Solo disparar si la cuota actual es <2x (el timer se reseteó arriba si era ≥2x)
-    if value >= 2.0:
+    # ── Fase 4: Disparar señales (solo si no hay señal activa) ────────────────
+    if active_signal is not None:
         return
 
-    # ── 4a. Señal 3x (prioridad) ──────────────────────────────────────────────
-    if g_cooldown3x_mod == 0:
+    can_timing = (value < 2.0)
+
+    # ── 4a. Señal 3x (timing, prioridad) ─────────────────────────────────────
+    if can_timing and g_cooldown3x_mod == 0:
         in_win3, eta3, avg3, conf3, _ = _predict_next_event(
             g_events_data_3x, MIN_EVENTS_3X,
             SIGNAL_WINDOW_3X_B, SIGNAL_WINDOW_3X_A,
@@ -482,24 +722,27 @@ async def process_multiplier(value: float, round_id: str):
             use_value_correction=True
         )
         if in_win3 and not g_armed3x:
-            elapsed_since = now_ts - g_last_fire3x
-            if elapsed_since >= COOLDOWN_3X:
-                g_armed3x      = True
-                g_last_fire3x  = now_ts
-                g_cooldown3x_mod = 8
-                coef_range = derive_prediction(value, now_ts)
-                active_signal = ActiveSignal('3x', value)
-                logger.info(
-                    f"🎯 SEÑAL 3x | trigger={value:.2f}x | ETA~{eta3:.0f}s | "
-                    f"avg={avg3:.1f}s | conf={conf3:.0f}% | rango={coef_range}"
-                )
-                await _send_signal_3x(value, 1, avg3, eta3, conf3, coef_range)
-                return
+            if conf3 >= MIN_CONFIDENCE:
+                elapsed_since = now_ts - g_last_fire3x
+                if elapsed_since >= COOLDOWN_3X:
+                    g_armed3x      = True
+                    g_last_fire3x  = now_ts
+                    g_cooldown3x_mod = 8
+                    coef_range = derive_prediction(value, now_ts)
+                    active_signal = ActiveSignal('3x', value)
+                    logger.info(
+                        f"🎯 SEÑAL 3x (timing) | trigger={value:.2f}x | ETA~{eta3:.0f}s | "
+                        f"avg={avg3:.1f}s | conf={conf3:.0f}% | rango={coef_range}"
+                    )
+                    await _send_signal_3x(value, 1, avg3, eta3, conf3, coef_range, g_last_high_3x_value)
+                    return
+            else:
+                logger.debug(f"Señal 3x descartada por baja confianza: {conf3:.1f}% (umbral {MIN_CONFIDENCE}%)")
         elif not in_win3 and g_armed3x:
             g_armed3x = False
 
-    # ── 4b. Señal 2x ──────────────────────────────────────────────────────────
-    if g_cooldown2x_mod == 0:
+    # ── 4b. Señal 2x (timing) ──────────────────────────────────────────────────
+    if can_timing and g_cooldown2x_mod == 0:
         in_win2, eta2, avg2, conf2, _ = _predict_next_event(
             g_events_data_2x, MIN_EVENTS_2X,
             SIGNAL_WINDOW_2X, 0.0,
@@ -507,20 +750,50 @@ async def process_multiplier(value: float, round_id: str):
             use_value_correction=True
         )
         if in_win2 and not g_armed2x:
-            elapsed_since = now_ts - g_last_fire2x
-            if elapsed_since >= SIGNAL_COOLDOWN_2X:
-                g_armed2x      = True
-                g_last_fire2x  = now_ts
-                g_cooldown2x_mod = 6
-                active_signal = ActiveSignal('2x', value)
-                logger.info(
-                    f"🎯 SEÑAL 2x | trigger={value:.2f}x | ETA~{eta2:.0f}s | "
-                    f"avg={avg2:.1f}s | conf={conf2:.0f}%"
-                )
-                await _send_signal_2x(value, 1, avg2, eta2, conf2)
-                return
+            if conf2 >= MIN_CONFIDENCE:
+                elapsed_since = now_ts - g_last_fire2x
+                if elapsed_since >= SIGNAL_COOLDOWN_2X:
+                    g_armed2x      = True
+                    g_last_fire2x  = now_ts
+                    g_cooldown2x_mod = 6
+                    active_signal = ActiveSignal('2x', value)
+                    logger.info(
+                        f"🎯 SEÑAL 2x (timing) | trigger={value:.2f}x | ETA~{eta2:.0f}s | "
+                        f"avg={avg2:.1f}s | conf={conf2:.0f}%"
+                    )
+                    await _send_signal_2x(value, 1, avg2, eta2, conf2, g_last_high_2x_value)
+                    return
+            else:
+                logger.debug(f"Señal 2x descartada por baja confianza: {conf2:.1f}% (umbral {MIN_CONFIDENCE}%)")
         elif not in_win2 and g_armed2x:
             g_armed2x = False
+
+    # ── 4c. Señal de tendencia ────────────────────────────────────────────────
+    if g_trend_cooldown_mod == 0:
+        elapsed_since = now_ts - g_last_trend_fire
+        if elapsed_since >= TREND_COOLDOWN:
+            if check_trend_conditions():
+                g_last_trend_fire = now_ts
+                g_trend_cooldown_mod = 8
+                active_signal = ActiveSignal('trend', value)
+                logger.info(f"📈 SEÑAL TREND | trigger={value:.2f}x")
+                await _send_signal_trend(value, 1, value)
+                return
+
+    # ── 4d. Señal de rango alto ──────────────────────────────────────────────
+    if g_high_range_cooldown_mod == 0 and g_high_range_search is not None:
+        elapsed_since = now_ts - g_last_high_range_fire
+        if elapsed_since >= HIGH_RANGE_COOLDOWN:
+            signal, conf = check_high_range_signal(len(g_mults) - 1)
+            if signal:
+                target = g_high_range_search['target']
+                target_label = "10x" if target == 9 else "15x"
+                g_last_high_range_fire = now_ts
+                g_high_range_cooldown_mod = 10
+                active_signal = ActiveSignal('high_range', value)
+                logger.info(f"🔮 SEÑAL HIGH RANGE | target={target_label}, remaining={g_high_range_search['remaining']}, conf={conf:.1f}%")
+                await _send_signal_high_range(value, 1, target_label)
+                return
 
 # ─── WEBSOCKET ──────────────────────────────────────────────────────────────
 async def ws_collector():
@@ -591,7 +864,6 @@ def webhook():
 
 @flask_app.route('/stats')
 def stats_route():
-    # Calcular promedios a partir de los gaps
     gaps2 = [g_events_data_2x[i][0] - g_events_data_2x[i-1][0] for i in range(1, len(g_events_data_2x)) if g_events_data_2x[i][0] > g_events_data_2x[i-1][0]]
     gaps3 = [g_events_data_3x[i][0] - g_events_data_3x[i-1][0] for i in range(1, len(g_events_data_3x)) if g_events_data_3x[i][0] > g_events_data_3x[i-1][0]]
     avg2 = sum(gaps2)/len(gaps2) if gaps2 else None
@@ -633,7 +905,6 @@ async def self_ping_loop():
 async def cmd_start(message):
     name = message.from_user.first_name or "usuario"
     g_all_chats.add(message.chat.id)
-    # Calcular promedios de gaps para mostrar
     gaps2 = [g_events_data_2x[i][0] - g_events_data_2x[i-1][0] for i in range(1, len(g_events_data_2x)) if g_events_data_2x[i][0] > g_events_data_2x[i-1][0]]
     gaps3 = [g_events_data_3x[i][0] - g_events_data_3x[i-1][0] for i in range(1, len(g_events_data_3x)) if g_events_data_3x[i][0] > g_events_data_3x[i-1][0]]
     avg2 = sum(gaps2)/len(gaps2) if gaps2 else None
@@ -642,17 +913,31 @@ async def cmd_start(message):
     ev3 = len(g_events_data_3x)
     info2 = f"<code>{avg2:.1f}s</code> avg ({ev2} eventos)" if avg2 else f"<code>{ev2}/{MIN_EVENTS_2X}</code> eventos"
     info3 = f"<code>{avg3:.1f}s</code> avg ({ev3} eventos)" if avg3 else f"<code>{ev3}/{MIN_EVENTS_3X}</code> eventos"
+    high_info = "⏳ Sin datos suficientes"
+    if g_high_range_search:
+        target_label = "10x" if g_high_range_search['target'] == 9 else "15x"
+        remaining = g_high_range_search['remaining']
+        avg = g_high_range_search['avg']
+        high_info = f"🔍 Buscando {target_label} | restan {remaining} velas | promedio {avg:.1f}"
+    elif len(g_high_force_9_indices) >= HIGH_RANGE_MIN_OCCURRENCES or len(g_high_force_10_indices) >= HIGH_RANGE_MIN_OCCURRENCES:
+        high_info = "⏳ Esperando ventana para rango alto"
     await bot.reply_to(message,
         f"🚀 <b>¡Bienvenido {name}!</b>\n\n"
         "━━━━━━━━━━━━━━━━━━━━━━━\n"
-        "🤖 <b>Bot de Señales Spaceman — Triple Predictor (Adaptativo)</b>\n\n"
-        f"🔵 <b>Señal 2x</b> · Objetivo ≥<code>2.00x</code>\n"
-        f"   Predictor adaptativo (EMA+tendencia): {info2}\n\n"
-        f"🚀 <b>Señal 3x</b> · Objetivo ≥<code>3.00x</code> · Seguro <code>2.00x</code>\n"
-        f"   Predictor adaptativo (EMA+tendencia): {info3}\n"
+        "🤖 <b>Bot de Señales Spaceman — Predictor Híbrido</b>\n\n"
+        f"🔵 <b>Señal 2x (Timing)</b> · Objetivo ≥<code>2.00x</code> · Seguro <code>1.50x</code>\n"
+        f"   Predictor adaptativo: {info2}\n\n"
+        f"🚀 <b>Señal 3x (Timing)</b> · Objetivo ≥<code>3.00x</code> · Seguro <code>1.50x</code>\n"
+        f"   Predictor adaptativo: {info3}\n"
         f"   + Rango de cuota estimado por hash\n\n"
+        f"📈 <b>Señal de Tendencia</b> · Objetivo ≥<code>2.00x</code> · Seguro <code>1.50x</code>\n"
+        f"   Basada en continuación alcista\n\n"
+        f"🔮 <b>Señal de Rango Alto</b> · Objetivo ≥<code>10x/15x</code> · Seguro <code>1.50x</code>\n"
+        f"   {high_info}\n\n"
         f"🔄 Cada señal tiene <code>{MAX_ATTEMPTS}</code> intentos\n"
-        f"✅ Acierto = ≥2x en cualquier intento\n"
+        f"✅ Acierto = ≥2x (o ≥3x según señal)\n"
+        f"🛡️ Seguro = 1.50x\n"
+        f"🎯 Confianza mínima para timing: <code>{MIN_CONFIDENCE}%</code>\n"
         "━━━━━━━━━━━━━━━━━━━━━━━",
         parse_mode='HTML')
 
@@ -662,14 +947,12 @@ async def cmd_predictor(message):
     hora = argentina_time()
     now  = time.time()
 
-    # 2x
     ev2  = len(g_events_data_2x)
     gaps2 = [g_events_data_2x[i][0] - g_events_data_2x[i-1][0] for i in range(1, ev2) if g_events_data_2x[i][0] > g_events_data_2x[i-1][0]]
     avg2 = sum(gaps2)/len(gaps2) if gaps2 else None
     if avg2 and ev2 >= MIN_EVENTS_2X:
         el2  = now - g_events_data_2x[-1][0] if g_events_data_2x else 0
         eta2 = max(0, avg2 - el2)
-        # Calcular regularidad (CV inverso)
         cv2 = (sum((g-avg2)**2 for g in gaps2)/len(gaps2))**0.5 / avg2 if avg2 else 1
         reg2 = max(0, 1-cv2)
         info2 = (f"⏱ Avg gap: <code>{avg2:.1f}s</code> | Transcurrido: <code>{el2:.1f}s</code>\n"
@@ -677,7 +960,6 @@ async def cmd_predictor(message):
     else:
         info2 = f"⏳ Acumulando: <code>{ev2}/{MIN_EVENTS_2X}</code> eventos ≥2x"
 
-    # 3x
     ev3  = len(g_events_data_3x)
     gaps3 = [g_events_data_3x[i][0] - g_events_data_3x[i-1][0] for i in range(1, ev3) if g_events_data_3x[i][0] > g_events_data_3x[i-1][0]]
     avg3 = sum(gaps3)/len(gaps3) if gaps3 else None
@@ -691,11 +973,29 @@ async def cmd_predictor(message):
     else:
         info3 = f"⏳ Acumulando: <code>{ev3}/{MIN_EVENTS_3X}</code> eventos ≥3x"
 
+    trend_status = "✅ Activo" if check_trend_conditions() else "⏳ Inactivo"
+    last_trend_sec = int(time.time() - g_last_trend_fire) if g_last_trend_fire else 0
+    trend_cooldown = max(0, TREND_COOLDOWN - last_trend_sec)
+
+    high_info = "⏳ Sin búsqueda activa"
+    if g_high_range_search:
+        target_label = "10x" if g_high_range_search['target'] == 9 else "15x"
+        remaining = g_high_range_search['remaining']
+        avg = g_high_range_search['avg']
+        high_info = f"🔍 Buscando {target_label} | restan {remaining} velas | promedio {avg:.1f}"
+    elif len(g_high_force_9_indices) >= HIGH_RANGE_MIN_OCCURRENCES or len(g_high_force_10_indices) >= HIGH_RANGE_MIN_OCCURRENCES:
+        high_info = "⏳ Esperando ventana para rango alto"
+
     await bot.reply_to(message,
         f"📡 <b>PREDICTORES — 🕐 {hora}</b>\n"
         "━━━━━━━━━━━━━━━━━━━━━━━\n"
-        f"🔵 <b>Predictor 2x</b>\n{info2}\n\n"
-        f"🚀 <b>Predictor 3x (eventos ≥3x)</b>\n{info3}\n"
+        f"🔵 <b>Predictor 2x (Timing)</b>\n{info2}\n\n"
+        f"🚀 <b>Predictor 3x (Timing)</b>\n{info3}\n\n"
+        f"📈 <b>Predictor de Tendencia</b>\n"
+        f"   Estado: {trend_status}\n"
+        f"   Cooldown: <code>{trend_cooldown}s</code>\n\n"
+        f"🔮 <b>Predictor de Rango Alto</b>\n"
+        f"   {high_info}\n"
         "━━━━━━━━━━━━━━━━━━━━━━━",
         parse_mode='HTML')
 
@@ -715,6 +1015,7 @@ async def cmd_estadisticas(message):
         f"📈 Precisión: <code>{pct:.1f}%</code>\n"
         f"📡 Señal activa: {sig_txt}\n"
         f"📦 Eventos 2x: <code>{len(g_events_data_2x)}</code> | 3x: <code>{len(g_events_data_3x)}</code>\n"
+        f"🔮 Rangos altos: 9: <code>{len(g_high_force_9_indices)}</code> | 10: <code>{len(g_high_force_10_indices)}</code>\n"
         "━━━━━━━━━━━━━━━━━━━━━━━",
         parse_mode='HTML')
 
@@ -722,7 +1023,7 @@ async def cmd_estadisticas(message):
 async def main_async():
     global _main_loop
     _main_loop = asyncio.get_running_loop()
-    logger.info("🤖 Iniciando SpacemanBot (Triple Predictor Adaptativo)...")
+    logger.info("🤖 Iniciando SpacemanBot (Predictor Híbrido + Trend + High Range)...")
     load_from_disk()
     await bot.set_my_commands([
         types.BotCommand('predictor',    '📡 Estado de los predictores'),
