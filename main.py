@@ -475,16 +475,15 @@ async def _broadcast_scoreboard():
     hora = argentina_time()
     txt = (f"<b>📆 MARCADOR DEL DÍA — 🕐 {hora}</b>\n"
            f"<b>┄┄┄┄┄┄┄┄┄┄┄┄┄┄┄┄┄┄┄┄┄┄┄</b>\n"
-           f"<b>✅ Ganadas (≥3.00x): {g_daily_wins}</b>\n"
-           f"<b>❌ Perdidas: {g_daily_losses}</b>\n"
-           f"<b>🛡️ Cubiertas (2.00x-2.99x): {g_daily_covered}</b>\n"
-           f"<b>💰 Recuperado por seguro: ${g_daily_recovered:.2f}</b>\n"
-           f"<b>📈 Acierto: {pct_sig:.1f}%</b>\n"
+           f"<b>✅ GANADAS ≥3.00x: {g_daily_wins}</b>\n"
+           f"<b>❌ PERDIDAS: {g_daily_losses}</b>\n"
+           f"<b>🛡️ GANADAS CON SEGURO: {g_daily_covered}</b>\n"
+           f"<b>📈 ACIERTO: {pct_sig:.1f}%</b>\n"
            f"<b>┄┄┄┄┄┄┄┄┄┄┄┄┄┄┄┄┄┄┄┄┄┄┄</b>\n"
-           f"<b>🔄 Ciclos {MAX_COLS} entradas · {WINS_PER_CYCLE} victorias</b>\n"
-           f"<b>✅ Ganados: {g_daily_cycles_won}</b>\n"
-           f"<b>❌ Perdidos: {g_daily_cycles_lost}</b>\n"
-           f"<b>📈 Acierto: {pct_cyc:.1f}%</b>")
+           f"<b>🔄 SESION {MAX_COLS} entradas · {WINS_PER_CYCLE} victorias</b>\n"
+           f"<b>✅ GANADAS: {g_daily_cycles_won}</b>\n"
+           f"<b>❌ PERDIDAS: {g_daily_cycles_lost}</b>\n"
+           f"<b>📈 ACIERTO: {pct_cyc:.1f}%</b>")
     if g_scoreboard_msg_id:
         try:
             await bot.delete_message(CHANNEL_ID, g_scoreboard_msg_id)
@@ -524,9 +523,9 @@ async def _send_signal(trigger: float):
     logger.info(f"📤 Señal 2x | Col{col} | Entrada {ents}/{MAX_COLS} | Ciclo {wins}/{WINS_PER_CYCLE} | AvgGap:{avg_gap:.1f}s")
     txt = (f"<b>🆔 ENTRADA SPACEMAN — 🕐 {hora}</b>\n"
            f"<b>┄┄┄┄┄┄┄┄┄┄┄┄┄┄┄┄┄┄┄┄┄┄┄</b>\n"
-           f"<b>⏱ Cuota registrada: {trigger:.2f}x</b>\n"
-           f"<b>🎯 Objetivo: {OBJECTIVE_TARGET:.2f}x</b>\n"
-           f"<b>🛡️ Seguro: {INSURANCE_TARGET:.2f}x ({INSURANCE_SPLIT*100:.0f}% seguro / {(1-INSURANCE_SPLIT)*100:.0f}% objetivo)</b>\n"
+           f"<b>⏱ ÚLTIMA CUOTA: {trigger:.2f}x</b>\n"
+           f"<b>🎯 OBJECTIVO: {OBJECTIVE_TARGET:.2f}x</b>\n"
+           f"<b>🛡️ SEGURO: {INSURANCE_TARGET:.2f}x</b>\n"
            f"<b>┄┄┄┄┄┄┄┄┄┄┄┄┄┄┄┄┄┄┄┄┄┄┄</b>\n"
            f"<b>💎GESTION DE ENTRADAS:</b>\n"
            f"<b>{gestion_bar}</b>")
@@ -539,7 +538,7 @@ async def _dispatch_result(value: float, tipo: str, bet: float, recovered: float
     hora = argentina_time()
     if tipo == 'win':
         g_daily_wins += 1
-        txt = f"<b>✅ GANAMOS {value:.2f}x (objetivo 3.00x) — 🕐 {hora}</b>"
+        txt = f"<b>✅ GANAMOS {value:.2f}x — 🕐 {hora}</b>"
         await broadcast(txt)
         await _broadcast_scoreboard()
     elif tipo == 'cycle_win':
@@ -547,7 +546,7 @@ async def _dispatch_result(value: float, tipo: str, bet: float, recovered: float
         g_daily_cycles_won += 1
         wins = g_session.wins_in_cycle
         wins_bar = '🟢' * wins
-        txt = (f"<b>✅ GANAMOS {value:.2f}x (objetivo 3.00x) — 🕐 {hora}</b>\n"
+        txt = (f"<b>✅ GANAMOS {value:.2f}x — 🕐 {hora}</b>\n"
                f"<b>💎 SESION {wins}/{WINS_PER_CYCLE} VICTORIAS {wins_bar}</b>")
         await broadcast(txt)
         await _broadcast_scoreboard()
@@ -557,14 +556,13 @@ async def _dispatch_result(value: float, tipo: str, bet: float, recovered: float
         g_daily_covered += 1
         g_daily_recovered += recovered
         col = g_session.col
-        txt = (f"<b>🛡️ CUBIERTO {value:.2f}x — no llegó a 3.00x, seguro a 2.00x recuperó ${recovered:.2f} — 🕐 {hora}</b>\n"
-               f"<i>Sigue la racha (cuenta como derrota para la progresión) → Col{col}</i>")
+        txt = (f"<b>🛡️ CUBIERTO SEGURO {value:.2f}x — 🕐 {hora}</b>\n")
         await broadcast(txt)
         await _broadcast_scoreboard()
     elif tipo == 'new_col':
         g_daily_losses += 1
         col = g_session.col
-        txt = f"<b>❌ PERDIMOS {value:.2f}x (no llegó al seguro de 2.00x) — 🕐 {hora}</b>"
+        txt = f"<b>❌ PERDIMOS {value:.2f}x — 🕐 {hora}</b>"
         await broadcast(txt)
         await _broadcast_scoreboard()
     elif tipo == 'cycle_loss':
@@ -573,7 +571,7 @@ async def _dispatch_result(value: float, tipo: str, bet: float, recovered: float
         if recovered > 0:
             g_daily_covered += 1
             g_daily_recovered += recovered
-            txt = (f"<b>🛡️ CUBIERTO {value:.2f}x — seguro a 2.00x recuperó ${recovered:.2f} — 🕐 {hora}</b>\n"
+            txt = (f"<b>🛡️ CUBIERTO SEGURO {value:.2f}x — 🕐 {hora}</b>\n"
                    f"<b>💎 SESION FINALIZADO 😭</b>")
         else:
             txt = (f"<b>❌ PERDIMOS {value:.2f}x — 🕐 {hora}</b>\n"
