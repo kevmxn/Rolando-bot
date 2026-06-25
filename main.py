@@ -50,12 +50,12 @@ MAX_ATTEMPTS     = 2
 MIN_CONFIDENCE   = 60.0   # solo para señales de timing
 
 # ── Predictor temporal (timing) ─────────────────────────────────────────────
-MIN_EVENTS_2X     = 5
+MIN_EVENTS_2X     = 10
 SIGNAL_WINDOW_2X  = 20
 MAX_HIST_2X       = 200
 ALPHA_2X          = 0.25
 
-MIN_EVENTS_3X      = 5
+MIN_EVENTS_3X      = 10
 SIGNAL_WINDOW_3X_B = 10
 SIGNAL_WINDOW_3X_A = 10
 MAX_HIST_3X        = 150
@@ -200,13 +200,18 @@ def classify(value: float) -> int:
     if v >= 15.00: return 10
     return 0
 
-# ─── PREDICTOR DE TENDENCIA ──────────────────────────────────────────────────
-def check_trend_conditions() -> bool:
-    if len(g_mults) < TREND_EMA_SLOW + 2:
-        return False
+# ─── PREDICTOR DE TENDENCIA (mejorado) ──────────────────────────────────────
+def check_trend_conditions() -> Tuple[bool, float]:
+    """
+    Retorna (disparar, score_0_100).
+    Usa 8 condiciones ponderadas + filtro de momentum + anti-falso-positivo.
+    """
+    if len(g_mults) < TREND_EMA_SLOW + 4:
+        return False, 0.0
 
     vals = [m['value'] for m in g_mults]
     n = len(vals)
+    forces = [classify(v) for v in vals]
 
     def calc_ema(data, period):
         k = 2 / (period + 1)
@@ -215,46 +220,80 @@ def check_trend_conditions() -> bool:
             ema = val * k + ema * (1 - k)
         return ema
 
+    score = 0.0  # acumulador ponderado (máx ~100)
+
+    # ── C1: EMA rápida > EMA lenta (peso 20) ─────────────────────────────────
     fast_ema = calc_ema(vals[-TREND_EMA_FAST:], TREND_EMA_FAST)
     slow_ema = calc_ema(vals[-TREND_EMA_SLOW:], TREND_EMA_SLOW)
-    cond1 = fast_ema > slow_ema and (fast_ema > vals[-2] if len(vals) >= 2 else False)
+    if fast_ema > slow_ema:
+        margin = (fast_ema - slow_ema) / slow_ema if slow_ema > 0 else 0
+        score += min(20.0, 20.0 * (1 + margin * 5))
 
+    # ── C2: EMA rápida acelerando (peso 15) ──────────────────────────────────
+    if n >= TREND_EMA_FAST + 2:
+        prev_fast = calc_ema(vals[-(TREND_EMA_FAST + 2):-2], TREND_EMA_FAST)
+        if fast_ema > prev_fast:
+            score += 15.0
+
+    # ── C3: Mayoría de velas recientes son alcistas (peso 15) ────────────────
     lookback = TREND_BULLISH_LOOKBACK
     if n >= lookback + 1:
         recent = vals[-lookback:]
         bullish_count = sum(1 for i in range(1, len(recent)) if recent[i] > recent[i-1])
-        cond2 = bullish_count >= lookback * 0.6
-    else:
-        cond2 = False
+        ratio = bullish_count / (lookback - 1)
+        if ratio >= 0.55:
+            score += 15.0 * ratio
 
+    # ── C4: Fuerza promedio reciente mayor que ventana anterior (peso 15) ─────
     window = TREND_STRENGTH_WINDOW
     if n >= 2 * window:
-        forces = [classify(v) for v in vals]
-        recent_avg = sum(forces[-window:]) / window
-        prev_avg = sum(forces[-2*window:-window]) / window
-        cond3 = recent_avg > prev_avg
-    else:
-        cond3 = False
+        recent_avg_f = sum(forces[-window:]) / window
+        prev_avg_f   = sum(forces[-2*window:-window]) / window
+        if recent_avg_f > prev_avg_f:
+            delta = recent_avg_f - prev_avg_f
+            score += min(15.0, 10.0 + delta * 2)
 
-    if n >= 5:
-        diff_vals = [vals[i] - vals[i-1] for i in range(1, len(vals))]
-        last_diffs = diff_vals[-5:] if len(diff_vals) >= 5 else diff_vals
-        cond4 = sum(last_diffs) > 0
-    else:
-        cond4 = False
+    # ── C5: Momentum positivo (suma de diferencias últimas 5 velas) (peso 10) ─
+    if n >= 6:
+        diffs = [vals[i] - vals[i-1] for i in range(n-5, n)]
+        momentum = sum(diffs)
+        if momentum > 0:
+            score += min(10.0, 5.0 + momentum * 0.5)
 
-    if n >= 2:
-        last_val = vals[-1]
-        prev_val = vals[-2]
-        force = classify(last_val)
-        cond5 = last_val > prev_val and force > 0
-    else:
-        cond5 = False
+    # ── C6: Última vela ≥2x (fuerza positiva confirmada) (peso 10) ───────────
+    if forces[-1] >= 1:
+        score += 5.0 + min(5.0, forces[-1] * 1.0)
 
-    conditions = [cond1, cond2, cond3, cond4, cond5]
-    true_count = sum(conditions)
-    logger.debug(f"Trend conditions: {true_count}/5 -> {conditions}")
-    return true_count >= TREND_MIN_CONDITIONS
+    # ── C7: No hay racha de cuotas bajas recientes (anti-falso-positivo) (peso 10) ──
+    last_4_forces = forces[-4:] if n >= 4 else forces
+    low_count = sum(1 for f in last_4_forces if f < 0)
+    if low_count <= 1:
+        score += 10.0
+    elif low_count == 2:
+        score += 4.0
+    # si low_count >= 3 → no suma nada (señal débil)
+
+    # ── C8: Consistencia de la tendencia (R² lineal sobre fuerzas) (peso 5) ──
+    w = min(12, n)
+    recent_f = forces[-w:]
+    if len(recent_f) >= 4:
+        xs = list(range(len(recent_f)))
+        mx = sum(xs) / len(xs)
+        my = sum(recent_f) / len(recent_f)
+        ss_xy = sum((xs[i]-mx)*(recent_f[i]-my) for i in range(len(xs)))
+        ss_xx = sum((x-mx)**2 for x in xs)
+        ss_yy = sum((y-my)**2 for y in recent_f)
+        if ss_xx > 0 and ss_yy > 0:
+            r2 = (ss_xy**2) / (ss_xx * ss_yy)
+            if ss_xy > 0:  # pendiente positiva
+                score += 5.0 * r2
+
+    score = min(100.0, score)
+    logger.debug(f"Trend score: {score:.1f}/100")
+    # Umbral: necesitamos ≥55 puntos para disparar (ajustable por aprendizaje)
+    threshold = 55.0 + g_learning_conf_penalty.get('trend', 0.0) * 0.3
+    return score >= threshold, score
+
 
 # ─── PREDICTOR TEMPORAL (timing) ────────────────────────────────────────────
 def _predict_next_event(
@@ -437,62 +476,104 @@ def update_high_range_search(bar_index: int):
         remaining = max(0, g_high_range_search['window'] - elapsed)
         g_high_range_search['remaining'] = remaining
         if remaining == 0:
-            logger.info("Búsqueda de rango alto fallida")
+            logger.info("Búsqueda de rango alto expirada sin señal")
             g_high_range_search = None
         return
 
-    avg9 = compute_average_interval(g_high_force_9_indices)
+    avg9  = compute_average_interval(g_high_force_9_indices)
     avg10 = compute_average_interval(g_high_force_10_indices)
 
+    # Elegir el objetivo con menor intervalo promedio (más frecuente)
     if avg9 is not None and avg10 is not None:
-        if avg9 < avg10:
-            target = 9; avg = avg9
-        elif avg10 < avg9:
-            target = 10; avg = avg10
-        else:
-            target = 9 if len(g_high_force_9_indices) >= len(g_high_force_10_indices) else 10
-            avg = avg9 if target == 9 else avg10
+        target, avg = (9, avg9) if avg9 <= avg10 else (10, avg10)
     elif avg9 is not None:
-        target = 9; avg = avg9
+        target, avg = 9, avg9
     elif avg10 is not None:
-        target = 10; avg = avg10
+        target, avg = 10, avg10
     else:
         return
 
-    if len(g_high_force_9_indices) < HIGH_RANGE_MIN_OCCURRENCES and len(g_high_force_10_indices) < HIGH_RANGE_MIN_OCCURRENCES:
+    if (len(g_high_force_9_indices) < HIGH_RANGE_MIN_OCCURRENCES and
+            len(g_high_force_10_indices) < HIGH_RANGE_MIN_OCCURRENCES):
         return
 
-    window = max(2, int(round(avg)) + 2)
+    # Ventana adaptativa: avg ± 1 desviación estándar
+    indices = g_high_force_9_indices if target == 9 else g_high_force_10_indices
+    if len(indices) >= 2:
+        diffs = [indices[i] - indices[i-1] for i in range(1, len(indices))]
+        mean_d = sum(diffs) / len(diffs)
+        std_d  = (sum((d - mean_d)**2 for d in diffs) / len(diffs)) ** 0.5
+        # La ventana cubre desde el ciclo promedio hasta +1σ
+        window = max(3, int(round(mean_d + std_d)))
+    else:
+        window = max(3, int(round(avg)) + 3)
+
     g_high_range_search = {
-        'target': target,
-        'expected_in': int(round(avg)),
-        'remaining': window,
+        'target':         target,
+        'expected_in':    int(round(avg)),
+        'remaining':      window,
         'created_at_bar': bar_index,
-        'window': window,
-        'avg': avg
+        'window':         window,
+        'avg':            avg,
     }
-    logger.info(f"Iniciada búsqueda rango alto {target} ventana {window}")
+    logger.info(f"Rango alto iniciado: target={target} avg={avg:.1f} ventana={window}")
 
 def check_high_range_signal(bar_index: int) -> Tuple[bool, float]:
+    """
+    Dispara señal de rango alto con confianza ponderada mejorada.
+    - Activa desde el 40% de la ventana consumida (antes era 50%)
+    - Confianza basada en: CV del intervalo + proximidad al ciclo esperado
+      + bonus por cantidad de ocurrencias históricas
+    """
     if not g_high_range_search:
         return False, 0.0
-    remaining = g_high_range_search['remaining']
-    window = g_high_range_search['window']
-    elapsed = bar_index - g_high_range_search['created_at_bar']
 
-    if remaining <= 3 and remaining > 0 and elapsed >= window * 0.5:
-        target = g_high_range_search['target']
-        indices = g_high_force_9_indices if target == 9 else g_high_force_10_indices
-        if len(indices) >= 3:
-            diffs = [indices[i] - indices[i-1] for i in range(1, len(indices))]
-            mean = sum(diffs) / len(diffs)
-            variance = sum((d - mean) ** 2 for d in diffs) / len(diffs)
-            std = variance ** 0.5
-            cv = std / mean if mean > 0 else 1.0
-            confidence = max(0, 100 * (1 - min(cv, 1.0)))
-            if confidence >= HIGH_RANGE_CONFIDENCE_THRESHOLD:
-                return True, confidence
+    remaining = g_high_range_search['remaining']
+    window    = g_high_range_search['window']
+    elapsed   = bar_index - g_high_range_search['created_at_bar']
+
+    # Activar cuando queden ≤40% de velas Y hayamos consumido ≥40% de la ventana
+    trigger_zone = remaining <= max(2, int(window * 0.40)) and elapsed >= window * 0.40
+
+    if not trigger_zone:
+        return False, 0.0
+
+    target  = g_high_range_search['target']
+    indices = g_high_force_9_indices if target == 9 else g_high_force_10_indices
+
+    if len(indices) < 2:
+        return False, 0.0
+
+    diffs  = [indices[i] - indices[i-1] for i in range(1, len(indices))]
+    mean_d = sum(diffs) / len(diffs)
+    var_d  = sum((d - mean_d)**2 for d in diffs) / len(diffs)
+    std_d  = var_d ** 0.5
+    cv     = std_d / mean_d if mean_d > 0 else 1.0
+
+    # Confianza base: regularidad del intervalo
+    regularity_score = max(0.0, 1.0 - min(cv, 1.0)) * 60.0
+
+    # Bonus de proximidad: cuánto nos acercamos al momento esperado
+    bars_since_last = bar_index - indices[-1] if indices else 0
+    proximity = 1.0 - abs(bars_since_last - mean_d) / (mean_d + 1)
+    proximity_score = max(0.0, proximity) * 25.0
+
+    # Bonus por cantidad de ocurrencias (más historia = más fiable)
+    history_bonus = min(15.0, (len(indices) - 2) * 3.0)
+
+    confidence = regularity_score + proximity_score + history_bonus
+    confidence = min(98.0, confidence)
+
+    # Aplicar penalización adaptativa de aprendizaje
+    penalty = g_learning_conf_penalty.get('high_range', 0.0)
+    effective_threshold = HIGH_RANGE_CONFIDENCE_THRESHOLD + penalty * 0.4
+
+    logger.debug(f"HighRange conf={confidence:.1f} umbral_adapt={effective_threshold:.1f} cv={cv:.2f} prox={proximity:.2f}")
+
+    if confidence >= effective_threshold:
+        return True, confidence
     return False, 0.0
+
 
 # ─── RANGO DE CUOTA (para 3x) ──────────────────────────────────────────────
 def derive_prediction(trigger: float, ts: float) -> str:
@@ -680,27 +761,29 @@ async def _send_signal_3x(trigger: float, attempt: int,
     )
     await broadcast_signal(txt)
 
-# Señales de tendencia y rango alto usan el formato básico (sin ETA ni confianza)
-async def _send_signal_trend(trigger: float, attempt: int, last_value: float):
+# Señales de tendencia y rango alto ahora muestran score/confianza
+async def _send_signal_trend(trigger: float, attempt: int, last_value: float, score: float = 0.0):
     hora = argentina_time()
     txt = (
-        f"<b>♦️ SEÑAL SPACEMAN — 🕐 {hora}</b>\n"
+        f"<b>📈 SEÑAL SPACEMAN — 🕐 {hora}</b>\n"
         f"<b>┄┄┄┄┄┄┄┄┄┄┄┄┄┄┄┄┄┄┄┄┄┄┄</b>\n"
         f"<b>🧨 ÚLTIMA CUOTA: {last_value:.2f}x</b>\n"
         f"<b>💠 OBJETIVO: {TARGET_2X:.2f}x</b>\n"
         f"<b>🛡️ SEGURO: {INSURANCE_2_0:.2f}x</b>\n"
+        f"<b>📊 SCORE TENDENCIA: {score:.0f}/100</b>\n"
         f"<b>🔄 INTENTO {attempt}/{MAX_ATTEMPTS}</b>"
     )
     await broadcast_signal(txt)
 
-async def _send_signal_high_range(trigger: float, attempt: int, target_label: str):
+async def _send_signal_high_range(trigger: float, attempt: int, target_label: str, conf: float = 0.0):
     hora = argentina_time()
     txt = (
-        f"<b>♦️ SEÑAL SPACEMAN — 🕐 {hora}</b>\n"
+        f"<b>🔮 SEÑAL SPACEMAN — 🕐 {hora}</b>\n"
         f"<b>┄┄┄┄┄┄┄┄┄┄┄┄┄┄┄┄┄┄┄┄┄┄┄</b>\n"
         f"<b>🧨 ÚLTIMA CUOTA: {trigger:.2f}x</b>\n"
         f"<b>💠 OBJETIVO: ≥{target_label}</b>\n"
         f"<b>🛡️ SEGURO: {INSURANCE_2_0:.2f}x</b>\n"
+        f"<b>💡 CONFIANZA: {conf:.0f}%</b>\n"
         f"<b>🔄 INTENTO {attempt}/{MAX_ATTEMPTS}</b>"
     )
     await broadcast_signal(txt)
@@ -903,15 +986,15 @@ async def process_multiplier(value: float, round_id: str):
     if g_trend_cooldown_mod == 0:
         elapsed_since = now_ts - g_last_trend_fire
         if elapsed_since >= TREND_COOLDOWN:
-            if check_trend_conditions():
-                # Solo disparar si la precisión reciente de tendencia es aceptable
+            trend_ok, trend_score = check_trend_conditions()
+            if trend_ok:
                 trend_acc = compute_recent_accuracy('trend', window=10)
                 if trend_acc >= 0.35 or len([r for r in g_recent_results if r['kind'] == 'trend']) < 5:
                     g_last_trend_fire = now_ts
                     g_trend_cooldown_mod = 8
                     active_signal = ActiveSignal('trend', value)
-                    logger.info(f"📈 SEÑAL TREND | trigger={value:.2f}x | acc_reciente={trend_acc:.0%}")
-                    await _send_signal_trend(value, 1, value)
+                    logger.info(f"📈 SEÑAL TREND | trigger={value:.2f}x | score={trend_score:.0f}/100 | acc_reciente={trend_acc:.0%}")
+                    await _send_signal_trend(value, 1, value, trend_score)
                     return
                 else:
                     logger.info(f"📈 Señal TREND bloqueada por baja precisión reciente: {trend_acc:.0%}")
@@ -928,7 +1011,7 @@ async def process_multiplier(value: float, round_id: str):
                 g_high_range_cooldown_mod = 10
                 active_signal = ActiveSignal('high_range', value)
                 logger.info(f"🔮 SEÑAL HIGH RANGE | target={target_label}, remaining={g_high_range_search['remaining']}, conf={conf:.1f}%")
-                await _send_signal_high_range(value, 1, target_label)
+                await _send_signal_high_range(value, 1, target_label, conf)
                 return
 
 # ─── WEBSOCKET ──────────────────────────────────────────────────────────────
@@ -1110,7 +1193,8 @@ async def cmd_predictor(message):
     else:
         info3 = f"⏳ Acumulando: <code>{ev3}/{MIN_EVENTS_3X}</code> eventos ≥3x"
 
-    trend_status = "✅ Activo" if check_trend_conditions() else "⏳ Inactivo"
+    trend_ok, trend_score = check_trend_conditions()
+    trend_status = f"✅ Activo ({trend_score:.0f}/100)" if trend_ok else f"⏳ Inactivo ({trend_score:.0f}/100)"
     last_trend_sec = int(time.time() - g_last_trend_fire) if g_last_trend_fire else 0
     trend_cooldown = max(0, TREND_COOLDOWN - last_trend_sec)
 
