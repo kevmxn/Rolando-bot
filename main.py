@@ -1,21 +1,24 @@
 #!/usr/bin/env python3
 """
-╔══════════════════════════════════════════════════╗
-║   SPACEMAN BOT — Sistema 2x por Tiempo          ║
-║   Señales: spaceman_2x_signal.html              ║
-║   Lógica: ventana ~20s antes del ETA promedio   ║
-║   Objetivo de apuesta: 3.00x (seguro a 2.00x)   ║
-╚══════════════════════════════════════════════════╝
+╔══════════════════════════════════════════════════════════╗
+║   SPACEMAN BOT — Triple Predictor                       ║
+║   • 2x  : predictor por timing (ventana avg_gap)        ║
+║   • 3x  : predictor por timing eventos ≥3x              ║
+║            (incluye rango de cuota derivado del hash)    ║
+║   Cada señal tiene 2 intentos                           ║
+║   Marcador diario: aciertos 2x                          ║
+╚══════════════════════════════════════════════════════════╝
 """
 
 import asyncio
+import hashlib
 import threading
 import json
 import logging
 import os
 import time
 from datetime import datetime, timedelta
-from typing import Optional, Tuple
+from typing import Optional
 from flask import Flask, request
 import websockets
 from telebot.async_telebot import AsyncTeleBot
@@ -38,54 +41,66 @@ CASINO_ID = "ppcdk00000005349"
 CURRENCY  = "BRL"
 GAME_ID   = 1301
 
-WIN_TARGET       = 2.00   # Umbral para registrar evento ≥2x (solo timing de entrada, no resuelve la apuesta)
-OBJECTIVE_TARGET = 3.00   # Objetivo real: victoria completa si resultado >= 3.00x
-INSURANCE_TARGET = 2.00   # Umbral de seguro: entre INSURANCE_TARGET y OBJECTIVE_TARGET se recupera parte (cubierto)
-INSURANCE_SPLIT  = 0.70   # Fracción de la apuesta destinada al seguro (cashea a 2x); el resto va al objetivo 3x
-MAX_COLS       = 8
-MAX_ATTS       = 1
-WINS_PER_CYCLE = 2
-BASE_BET       = 0.10
+# ── Umbrales ──────────────────────────────────────────────────────────────────
+TARGET_2X        = 2.00   # señal 2x: acierto si resultado ≥ 2x
+TARGET_3X        = 3.00   # señal 3x: objetivo principal
+INSURANCE_2X     = 2.00   # seguro 3x: si llega a 2x pero no a 3x → acierto igual
+MAX_ATTEMPTS     = 2      # intentos por señal (aplica a ambos tipos)
 
-# ─── SISTEMA 2X POR TIEMPO ────────────────────────────────────────────────────
-MIN_EVENTS_2X     = 15     # Mínimo de eventos ≥2x para evaluar señales
-SIGNAL_WINDOW_SEC = 20     # Ventana (segundos antes del ETA) para disparar señal
-MAX_EVENTS_2X     = 200    # Historial máximo de timestamps de eventos 2x
+# ── Predictor 2x ──────────────────────────────────────────────────────────────
+MIN_EVENTS_2X     = 15    # mínimo de eventos ≥2x para activar predictor
+SIGNAL_WINDOW_2X  = 20    # segundos antes del ETA para disparar señal 2x
+MAX_HIST_2X       = 200
 
-MAX_MULTS  = 400
-TRIM_MULTS = 300
-PERSIST_FILE = "spaceman_history.json"
+# ── Predictor 3x ──────────────────────────────────────────────────────────────
+# Usa eventos ≥3x (= 3x, 5x, 10x). Aprende el avg gap entre ellos.
+# Dispara señal en ventana ±10s alrededor del ETA exacto:
+#   → empieza 10s ANTES del ETA  (window_before=10)
+#   → cierra   10s DESPUÉS del ETA (window_after=10)
+MIN_EVENTS_3X      = 10   # mínimo de eventos ≥3x para activar predictor 3x
+SIGNAL_WINDOW_3X_B = 10   # segundos ANTES del ETA (before)
+SIGNAL_WINDOW_3X_A = 10   # segundos DESPUÉS del ETA (after)
+MAX_HIST_3X        = 150
+COOLDOWN_3X        = 45   # antiflood señales 3x
+
+# ── General ────────────────────────────────────────────────────────────────────
+SIGNAL_COOLDOWN_2X = 30
+MAX_MULTS          = 400
+TRIM_MULTS         = 300
+PERSIST_FILE       = "spaceman_history.json"
 
 # ─── ESTADO GLOBAL ────────────────────────────────────────────────────────────
-g_mults:    list  = []
-g_seen_ids: set   = set()
-g_positions: list = []
+g_mults:    list = []
+g_seen_ids: set  = set()
 
-# ─── ESTADO DEL SISTEMA 2X POR TIEMPO ────────────────────────────────────────
-g_events2x: list = []      # Timestamps (float) de cada ronda ≥ 2x
-g_gaps2x:   list = []      # Intervalos en segundos entre eventos consecutivos
-g_signal_armed: bool = False   # True cuando ya entramos en ventana de señal
-g_last_signal_fire: float = 0  # Timestamp del último disparo (antiflood 30s)
+# Historial de eventos por tier
+g_events2x:  list = []   # timestamps ≥2x
+g_gaps2x:    list = []
+g_events3x:  list = []   # timestamps ≥3x (incluye 5x, 10x)
+g_gaps3x:    list = []
 
-SIGNAL_COOLDOWN = 30    # Antiflood: segundos mínimos entre señales consecutivas
-g_cooldown_mod  = 0
+# Control de señal 2x
+g_armed2x:          bool  = False
+g_last_fire2x:      float = 0
+g_cooldown2x_mod:   int   = 0
 
-g_signal_state        = 'idle'
-g_signal_trigger_mult: float = 0.0
+# Control de señal 3x
+g_armed3x:          bool  = False
+g_last_fire3x:      float = 0
+g_cooldown3x_mod:   int   = 0
 
 g_all_chats: set = set()
 
-g_daily_wins:        int = 0
-g_daily_losses:      int = 0
-g_daily_covered:     int = 0
-g_daily_recovered:   float = 0.0
-g_daily_cycles_won:  int = 0
-g_daily_cycles_lost: int = 0
-g_daily_date:        str = ""
+# ─── MARCADOR DIARIO (estadísticas 2x solamente) ──────────────────────────────
+# Acierto = en cualquiera de los 2 intentos el resultado llegó ≥ 2x
+# (aplica tanto a señales 2x como a señales 3x con seguro)
+g_daily_hits:   int = 0
+g_daily_misses: int = 0
+g_daily_date:   str = ""
 g_scoreboard_msg_id: Optional[int] = None
 
 g_last_signal_msgs: dict = {}
-_persist_counter: int = 0
+_persist_counter:   int  = 0
 
 bot = AsyncTeleBot(BOT_TOKEN, parse_mode='HTML')
 _main_loop: asyncio.AbstractEventLoop = None
@@ -93,534 +108,463 @@ _main_loop: asyncio.AbstractEventLoop = None
 
 # ─── HORA ARGENTINA ───────────────────────────────────────────────────────────
 def argentina_time() -> str:
-    now_arg = datetime.utcnow() - timedelta(hours=3)
-    return now_arg.strftime("%H:%M")
+    return (datetime.utcnow() - timedelta(hours=3)).strftime("%H:%M")
 
 
 # ─── BROADCAST ────────────────────────────────────────────────────────────────
-async def broadcast(msg: str, parse_mode: str = 'HTML'):
+async def broadcast(msg: str):
     try:
-        await bot.send_message(CHANNEL_ID, msg, parse_mode=parse_mode)
+        await bot.send_message(CHANNEL_ID, msg, parse_mode='HTML')
     except Exception as e:
-        logger.warning(f"Error enviando al canal: {e}")
+        logger.warning(f"broadcast error: {e}")
 
 
-async def broadcast_signal(msg: str, parse_mode: str = 'HTML'):
+async def broadcast_signal(msg: str):
     global g_last_signal_msgs
     g_last_signal_msgs = {}
     try:
-        sent = await bot.send_message(CHANNEL_ID, msg, parse_mode=parse_mode)
+        sent = await bot.send_message(CHANNEL_ID, msg, parse_mode='HTML')
         g_last_signal_msgs[CHANNEL_ID] = sent.message_id
-        logger.info(f"✅ Señal enviada al canal — msg_id: {sent.message_id}")
+        logger.info(f"✅ Señal enviada msg_id={sent.message_id}")
     except Exception as e:
-        logger.warning(f"Error enviando señal: {e}")
+        logger.warning(f"broadcast_signal error: {e}")
 
 
-async def delete_last_signal():
-    msg_id = g_last_signal_msgs.get(CHANNEL_ID)
-    if msg_id:
-        try:
-            await bot.delete_message(CHANNEL_ID, msg_id)
-            logger.info(f"🗑️ Señal borrada (msg_id: {msg_id})")
-        except Exception as e:
-            logger.warning(f"No se pudo borrar: {e}")
-    g_last_signal_msgs.clear()
-
-
-
-# ─── SISTEMA 2X POR TIEMPO (portado de spaceman_2x_signal.html) ───────────────
+# ─── UTILIDADES ───────────────────────────────────────────────────────────────
 def avg_sec(lst: list) -> Optional[float]:
-    """Promedio de una lista de floats. Retorna None si está vacía."""
     return sum(lst) / len(lst) if lst else None
 
 
-def check_2x_timing_signal() -> bool:
-    """
-    Replica la lógica de update2xPredictor() del HTML.
-    Retorna True si el tiempo transcurrido desde el último evento 2x
-    está dentro de la ventana de disparo (avgGap - SIGNAL_WINDOW_SEC).
-    Requisitos:
-      - Al menos MIN_EVENTS_2X eventos ≥ 2x registrados
-      - Al menos 3 intervalos calculados
-      - El elapsed >= avgGap - SIGNAL_WINDOW_SEC
-    """
-    if len(g_events2x) < MIN_EVENTS_2X:
-        return False
-    gaps = g_gaps2x
-    if len(gaps) < 3:
-        return False
-    avg_gap = avg_sec(gaps)
-    if avg_gap is None or avg_gap <= 0:
-        return False
-    last_event = g_events2x[-1]
-    elapsed = time.time() - last_event
-    eta = avg_gap - elapsed
-    # Disparar cuando estamos dentro de la ventana de SIGNAL_WINDOW_SEC segundos
-    in_window = 0 <= eta <= SIGNAL_WINDOW_SEC
-    logger.debug(
-        f"2xTimer | avg={avg_gap:.1f}s elapsed={elapsed:.1f}s eta={eta:.1f}s "
-        f"window={in_window} events={len(g_events2x)}"
-    )
-    return in_window
-
-
-def register_event_2x(ts: float):
-    """Registra un nuevo evento ≥ 2x y actualiza los intervalos."""
-    global g_events2x, g_gaps2x
-    if g_events2x:
-        gap = ts - g_events2x[-1]
+def _register_event(ts: float, events: list, gaps: list, max_hist: int):
+    """Registra timestamp y calcula gap; mantiene historial acotado."""
+    if events:
+        gap = ts - events[-1]
         if gap > 0:
-            g_gaps2x.append(gap)
-    g_events2x.append(ts)
-    # Mantener historial acotado
-    if len(g_events2x) > MAX_EVENTS_2X:
-        g_events2x = g_events2x[-MAX_EVENTS_2X:]
-    if len(g_gaps2x) > MAX_EVENTS_2X:
-        g_gaps2x = g_gaps2x[-MAX_EVENTS_2X:]
+            gaps.append(gap)
+    events.append(ts)
+    if len(events) > max_hist:
+        del events[:-max_hist]
+    if len(gaps) > max_hist:
+        del gaps[:-max_hist]
 
 
-def quota_stats_text(events: int, gaps: list) -> str:
-    """Texto informativo del estado del predictor 2x."""
-    if events < MIN_EVENTS_2X:
-        return f"📡 <i>Acumulando datos... ({events}/{MIN_EVENTS_2X} eventos ≥2x)</i>\n"
+def _in_signal_window(events: list, gaps: list, min_events: int,
+                      window_before: float = 20.0,
+                      window_after: float = 0.0) -> tuple:
+    """
+    Retorna (in_window: bool, eta_s: float, avg_gap: float, confidence: float).
+
+    Dos modos según los parámetros:
+      • Señal 2x  → window_before=20, window_after=0
+            dispara cuando  0 <= eta <= 20s  (antes del ETA)
+      • Señal 3x  → window_before=10, window_after=10
+            dispara cuando  -10s <= eta <= +10s  (±10s alrededor del ETA exacto)
+            es decir: empieza 10s antes y cierra 10s después del ETA.
+    """
+    if len(events) < min_events or len(gaps) < 3:
+        return False, 0.0, 0.0, 0.0
     avg = avg_sec(gaps)
-    if not avg:
-        return "📡 <i>Sin intervalos calculados aún.</i>\n"
-    last_gap = gaps[-1] if gaps else 0
-    return (f"📈 <b>Predictor 2x por Tiempo</b>\n"
-            f"⏱ Intervalo promedio: <code>{avg:.1f}s</code>\n"
-            f"⏱ Último intervalo: <code>{last_gap:.1f}s</code>\n"
-            f"📊 Eventos ≥2x: <code>{events}</code>\n")
+    if not avg or avg <= 0:
+        return False, 0.0, 0.0, 0.0
+    elapsed = time.time() - events[-1]
+    eta = avg - elapsed          # positivo = faltan segundos; negativo = ya pasó el ETA
+    in_win = -window_after <= eta <= window_before
+    # regularidad / confianza
+    mean     = avg
+    variance = sum((g - mean) ** 2 for g in gaps) / len(gaps)
+    cv       = (variance ** 0.5) / mean if mean else 1.0
+    regularity = max(0.0, 1.0 - cv)
+    proximity  = 1.0 - abs(min(1.0, elapsed / avg) - 1.0)
+    confidence = min(98.0, proximity * 60 + regularity * 40)
+    return in_win, eta, avg, confidence
 
 
-# ─── PERSISTENCIA ─────────────────────────────────────────────────────────────
-def save_mults_to_disk():
-    try:
-        payload = {
-            'mults': [{'id': m['id'], 'value': m['value'], 'ts': m['ts']} for m in g_mults],
-            'events2x': g_events2x,
-            'gaps2x': g_gaps2x,
-            'daily_wins': g_daily_wins,
-            'daily_losses': g_daily_losses,
-            'daily_covered': g_daily_covered,
-            'daily_recovered': g_daily_recovered,
-            'daily_cycles_won': g_daily_cycles_won,
-            'daily_cycles_lost': g_daily_cycles_lost,
-            'daily_date': g_daily_date,
-        }
-        tmp = PERSIST_FILE + ".tmp"
-        with open(tmp, 'w') as f:
-            json.dump(payload, f)
-        os.replace(tmp, PERSIST_FILE)
-    except Exception as e:
-        logger.warning(f"No se pudo guardar historial: {e}")
-
-
-def load_mults_from_disk():
-    global g_mults, g_events2x, g_gaps2x
-    global g_daily_wins, g_daily_losses, g_daily_covered, g_daily_recovered, g_daily_date
-    global g_daily_cycles_won, g_daily_cycles_lost
-    if not os.path.exists(PERSIST_FILE):
-        logger.info("Sin historial previo")
-        return
-    try:
-        with open(PERSIST_FILE) as f:
-            data = json.load(f)
-        loaded_mults = data.get('mults', [])
-        if len(loaded_mults) > MAX_MULTS:
-            loaded_mults = loaded_mults[-TRIM_MULTS:]
-        g_mults[:] = loaded_mults
-        for m in g_mults:
-            g_seen_ids.add(str(m['id']))
-        # Restaurar timing 2x
-        g_events2x[:] = data.get('events2x', [])[-MAX_EVENTS_2X:]
-        g_gaps2x[:]   = data.get('gaps2x', [])[-MAX_EVENTS_2X:]
-        saved_date = data.get('daily_date', '')
-        today_arg = (datetime.utcnow() - timedelta(hours=3)).strftime("%Y-%m-%d")
-        if saved_date == today_arg:
-            g_daily_wins = data.get('daily_wins', 0)
-            g_daily_losses = data.get('daily_losses', 0)
-            g_daily_covered = data.get('daily_covered', 0)
-            g_daily_recovered = data.get('daily_recovered', 0.0)
-            g_daily_cycles_won = data.get('daily_cycles_won', 0)
-            g_daily_cycles_lost = data.get('daily_cycles_lost', 0)
-            g_daily_date = saved_date
-        else:
-            g_daily_wins = g_daily_losses = g_daily_cycles_won = g_daily_cycles_lost = 0
-            g_daily_covered = 0
-            g_daily_recovered = 0.0
-            g_daily_date = today_arg
-        logger.info(f"Historial cargado: {len(g_mults)} mults | {len(g_events2x)} eventos2x")
-    except Exception as e:
-        logger.warning(f"Error cargando: {e}")
-
-
-# ─── DETECCIÓN DE SEÑALES (VB4 runPredictor — 5 checks, señal si ≥3) ─────────
-
-# ─── SESIÓN GLOBAL ────────────────────────────────────────────────────────────
-class GlobalSession:
-    IDLE, EVALUATING, DONE = 'idle', 'evaluating', 'done'
-
-    def __init__(self, carry_fichas: list = None):
-        self.base_bet = BASE_BET
-        self.state = self.IDLE
-        self.col = 1
-        self.attempt = 1
-        self.lost = 0.0
-        self.cur_bet = BASE_BET
-        self.entries_in_cycle = 0
-        self.wins_in_cycle = 0
-        self.entries = 0
-        self.wins = 0
-        self.losses = 0
-        self.created = datetime.now()
-        self.signal_trigger_mult = 0.0
-        self.attempt1_result_value = 0.0
-        self.fichas = carry_fichas if carry_fichas is not None else []
-        self._cur_ficha = None
-        self.col_history: list = []  # 'win'/'covered'/'loss' por cada entrada del ciclo actual (orden cronológico)
-        self.recovered_in_cycle: float = 0.0  # $ recuperados por el seguro a 2x en este ciclo
-
-    def start_ficha(self):
-        self._cur_ficha = {'n': len(self.fichas) + 1,
-                           **{f'c{i}': 0.0 for i in range(1, 13)},
-                           'result': None, 'ts': argentina_time()}
-
-    def on_result(self, value: float) -> tuple:
-        """
-        Resuelve la apuesta dividida en dos patas:
-          - Seguro (INSURANCE_SPLIT de la apuesta): cashea fijo en INSURANCE_TARGET (2x)
-          - Objetivo (resto): cashea en OBJECTIVE_TARGET (3x)
-        Resultado:
-          - value >= 3.00x  -> victoria completa (resetea martingala)
-          - 2.00x <= value < 3.00x -> "cubierto": se recupera la pata del seguro,
-            pero para el ciclo/martingala escala exactamente igual que una derrota
-          - value < 2.00x   -> derrota completa, no se recupera nada
-        Retorna (tipo, bet, recovered) donde tipo ∈
-          {'win','cycle_win','covered','new_col','cycle_loss'}
-        """
-        self.entries += 1
-        self.entries_in_cycle += 1
-        prev_bet = self.cur_bet
-        prev_col = self.col
-        if self._cur_ficha:
-            self._cur_ficha[f'c{prev_col}'] = self._cur_ficha.get(f'c{prev_col}', 0.0) + prev_bet
-
-        insurance_amt = prev_bet * INSURANCE_SPLIT
-        objective_amt = prev_bet - insurance_amt
-
-        if value >= OBJECTIVE_TARGET:
-            recovered = insurance_amt * INSURANCE_TARGET + objective_amt * value
-            self.wins += 1
-            self.wins_in_cycle += 1
-            self.col_history.append('win')
-            self.lost = 0.0
-            self.cur_bet = self.base_bet
-            self.col = 1
-            self.attempt = 1
-            if self._cur_ficha:
-                self._cur_ficha['result'] = 'win'
-                self.fichas.append(self._cur_ficha)
-                self._cur_ficha = None
-            if len(self.fichas) > 100:
-                self.fichas = self.fichas[-100:]
-            if self.wins_in_cycle >= WINS_PER_CYCLE:
-                self.state = self.DONE
-                return ('cycle_win', prev_bet, recovered)
-            self.state = self.IDLE
-            return ('win', prev_bet, recovered)
-
-        # No llegó al objetivo (3x) -> derrota para la progresión de la martingala,
-        # aunque si llegó al seguro (>=2x) se recupera parte del capital.
-        covered = value >= INSURANCE_TARGET
-        recovered = insurance_amt * INSURANCE_TARGET if covered else 0.0
-
-        self.losses += 1
-        self.col_history.append('covered' if covered else 'loss')
-        self.recovered_in_cycle += recovered
-        self.lost += prev_bet          # escala IGUAL que una derrota total (sin descontar lo recuperado)
-        self.cur_bet = self.lost + self.base_bet
-        self.col += 1
-        if self.entries_in_cycle >= MAX_COLS:
-            if self._cur_ficha:
-                self._cur_ficha['result'] = 'loss'
-                self.fichas.append(self._cur_ficha)
-                self._cur_ficha = None
-            if len(self.fichas) > 100:
-                self.fichas = self.fichas[-100:]
-            self.state = self.DONE
-            return ('cycle_loss', prev_bet, recovered)
-        self.state = self.IDLE
-        return ('covered' if covered else 'new_col', prev_bet, recovered)
-
-    def status_short(self) -> str:
-        estado = {self.IDLE: "⏳ Esperando señal", self.EVALUATING: "⚡ Evaluando", self.DONE: "✅ Ciclo finalizado"}.get(self.state, "—")
-        return (f"📡 Estado: {estado}\n"
-                f"🎯 Ciclo: <code>{self.wins_in_cycle}/{WINS_PER_CYCLE}</code> victorias | <code>{self.entries_in_cycle}/{MAX_COLS}</code> entradas\n"
-                f"📍 Col: <code>{self.col}/{MAX_COLS}</code>\n"
-                f"💵 Próxima apuesta: <code>${self.cur_bet:.2f}</code>\n"
-                f"🛡️ Recuperado por seguro (ciclo): <code>${self.recovered_in_cycle:.2f}</code>\n"
-                f"📈 G/P sesión: <code>{self.wins}/{self.losses}</code>")
-
-
-g_session = GlobalSession()
-
-def reset_global_session():
-    global g_session
-    old_fichas = list(g_session.fichas)
-    g_session = GlobalSession(carry_fichas=old_fichas)
-    logger.info("🔄 Sesión reiniciada — fichas preservadas")
-
-
-# ─── PROCESADOR DE MULTIPLICADORES (sistema 2x por tiempo) ────────────────────
-async def process_multiplier(value: float, round_id: str):
-    global g_signal_state, g_signal_trigger_mult
-    global g_mults, g_seen_ids
-    global g_session, g_cooldown_mod, _persist_counter
-    global g_signal_armed, g_last_signal_fire
-
-    logger.info(f"🎲 {value:.2f}x | ID: {round_id} | Señal: {g_signal_state}")
-
-    _check_daily_reset()
-
-    # ── Fase 1: Evaluar resultado pendiente ──────────────────────────────────
-    if g_signal_state == 'evaluating' and g_session.state == GlobalSession.EVALUATING:
-        tipo, bet, recovered = g_session.on_result(value)
-        await _dispatch_result(value, tipo, bet, recovered, attempt_num=g_session.attempt)
-        g_signal_state = 'idle'
-        g_signal_armed = False
-        g_cooldown_mod = max(g_cooldown_mod, 2)
-
-    g_cooldown_mod = max(0, g_cooldown_mod - 1)
-
-    # ── Fase 2: Registrar multiplicador ──────────────────────────────────────
-    now_ts = time.time()
-    g_mults.append({'id': round_id, 'value': value, 'ts': now_ts})
-    if len(g_mults) >= MAX_MULTS:
-        g_mults[:] = g_mults[-TRIM_MULTS:]
-        save_mults_to_disk()
+# ─── RANGO DE CUOTA (derivePrediction del HTML) ───────────────────────────────
+def derive_prediction(trigger: float, ts: float) -> str:
+    """
+    Replica derivePrediction() del HTML usando SHA-256.
+    Retorna una string con el rango estimado de cuota, p.ej. '3.0x – 3.5x'.
+    Solo se usa en señales 3x para darle contexto al usuario.
+    """
+    sec_str = str(int(ts))[-4:]
+    raw = f"{trigger:.2f}|{sec_str}|3x"
+    hex_digest = hashlib.sha256(raw.encode()).hexdigest()
+    n = int(hex_digest[:8], 16)
+    r = (n % 1000) / 10.0   # 0.0 – 99.9
+    if r < 20:
+        coef = 3.0 + (int(r / 5)) * 0.5          # 3.0 – 4.5
+    elif r < 45:
+        coef = 5.0 + (int((r - 20) / 5)) * 1.0   # 5.0 – 9.0
+    elif r < 70:
+        coef = 10.0 + (int((r - 45) / 5)) * 2.0  # 10.0 – 20.0
+    elif r < 90:
+        coef = 20.0 + (int((r - 70) / 5)) * 5.0  # 20.0 – 40.0
     else:
-        _persist_counter += 1
-        if _persist_counter >= 10:
-            _persist_counter = 0
-            save_mults_to_disk()
+        coef = 50.0 + (int((r - 90) / 5)) * 10.0 # 50.0+
+    # El rango es ±20% del coef estimado
+    lo = max(3.0, coef * 0.8)
+    hi = coef * 1.2
+    return f"{lo:.1f}x – {hi:.1f}x"
 
-    if len(g_seen_ids) > 2000:
-        oldest = sorted(g_seen_ids)[:1000]
-        for oid in oldest:
-            g_seen_ids.discard(oid)
 
-    # ── Fase 3: Registrar evento ≥ 2x ────────────────────────────────────────
-    if value >= WIN_TARGET:
-        register_event_2x(now_ts)
-        # Si había señal armada → resetear (ya llegó el 2x, ciclo reinicia)
-        if g_signal_armed:
-            g_signal_armed = False
-            logger.info(f"🔄 Señal armada reseteada — llegó {value:.2f}x")
+# ─── ESTADO DE SEÑAL ACTIVA ───────────────────────────────────────────────────
+class ActiveSignal:
+    """Una señal activa con hasta MAX_ATTEMPTS intentos."""
+    def __init__(self, kind: str, trigger: float):
+        self.kind    = kind    # '2x' o '3x'
+        self.trigger = trigger
+        self.attempt = 1
 
-    # ── Fase 4: Detectar ventana de señal 2x ─────────────────────────────────
-    if (g_signal_state == 'idle'
-            and g_session.state == GlobalSession.IDLE
-            and g_cooldown_mod == 0):
 
-        in_window = check_2x_timing_signal()
+active_signal: Optional[ActiveSignal] = None
 
-        if in_window and not g_signal_armed:
-            # Entrar en ventana → armar señal
-            elapsed_since_fire = now_ts - g_last_signal_fire
-            if elapsed_since_fire >= SIGNAL_COOLDOWN:
-                g_signal_armed = True
-                g_last_signal_fire = now_ts
-                g_signal_state = 'evaluating'
-                g_signal_trigger_mult = value
-                g_session.signal_trigger_mult = value
-                g_session.state = GlobalSession.EVALUATING
-                g_cooldown_mod = 6
-                if g_session.col == 1:
-                    g_session.start_ficha()
-                avg_gap = avg_sec(g_gaps2x)
-                eta_s = max(0, round((avg_gap or 0) - (now_ts - (g_events2x[-1] if g_events2x else now_ts))))
-                logger.info(f"🎯 SEÑAL 2x TIEMPO | Trigger: {value:.2f}x | ETA ~{eta_s}s | "
-                            f"Eventos: {len(g_events2x)} | AvgGap: {avg_gap:.1f}s")
-                await _send_signal(value)
-            else:
-                logger.debug(f"⏳ En ventana pero cooldown ({elapsed_since_fire:.0f}s/{SIGNAL_COOLDOWN}s)")
-
-        elif not in_window and g_signal_armed:
-            # Salió de ventana sin disparo → resetear armado
-            g_signal_armed = False
+def _clear_signal():
+    global active_signal, g_armed2x, g_armed3x
+    active_signal = None
+    g_armed2x = False
+    g_armed3x = False
 
 
 # ─── MARCADOR DIARIO ──────────────────────────────────────────────────────────
 def _check_daily_reset():
-    global g_daily_wins, g_daily_losses, g_daily_covered, g_daily_recovered
-    global g_daily_cycles_won, g_daily_cycles_lost, g_daily_date, g_scoreboard_msg_id
-    now_arg = datetime.utcnow() - timedelta(hours=3)
-    today = now_arg.strftime("%Y-%m-%d")
+    global g_daily_hits, g_daily_misses, g_daily_date, g_scoreboard_msg_id
+    today = (datetime.utcnow() - timedelta(hours=3)).strftime("%Y-%m-%d")
     if today != g_daily_date:
-        g_daily_wins = g_daily_losses = g_daily_cycles_won = g_daily_cycles_lost = 0
-        g_daily_covered = 0
-        g_daily_recovered = 0.0
+        g_daily_hits = g_daily_misses = 0
         g_daily_date = today
         g_scoreboard_msg_id = None
-        logger.info(f"📅 Marcador reseteado para {today}")
+        logger.info(f"📅 Marcador reseteado → {today}")
 
 
 async def _broadcast_scoreboard():
     global g_scoreboard_msg_id
-    total_sig = g_daily_wins + g_daily_losses
-    pct_sig = (g_daily_wins / total_sig * 100) if total_sig > 0 else 0.0
-    total_cyc = g_daily_cycles_won + g_daily_cycles_lost
-    pct_cyc = (g_daily_cycles_won / total_cyc * 100) if total_cyc > 0 else 0.0
-    hora = argentina_time()
-    txt = (f"<b>📆 MARCADOR DEL DÍA — 🕐 {hora}</b>\n"
-           f"<b>┄┄┄┄┄┄┄┄┄┄┄┄┄┄┄┄┄┄┄┄┄┄┄</b>\n"
-           f"<b>✅ GANADAS ≥3.00x: {g_daily_wins}</b>\n"
-           f"<b>❌ PERDIDAS: {g_daily_losses}</b>\n"
-           f"<b>🛡️ GANADAS CON SEGURO: {g_daily_covered}</b>\n"
-           f"<b>📈 ACIERTO: {pct_sig:.1f}%</b>\n"
-           f"<b>┄┄┄┄┄┄┄┄┄┄┄┄┄┄┄┄┄┄┄┄┄┄┄</b>\n"
-           f"<b>🔄 SESION {MAX_COLS} entradas · {WINS_PER_CYCLE} victorias</b>\n"
-           f"<b>✅ GANADAS: {g_daily_cycles_won}</b>\n"
-           f"<b>❌ PERDIDAS: {g_daily_cycles_lost}</b>\n"
-           f"<b>📈 ACIERTO: {pct_cyc:.1f}%</b>")
+    total = g_daily_hits + g_daily_misses
+    pct   = (g_daily_hits / total * 100) if total else 0.0
+    hora  = argentina_time()
+    txt = (
+        f"<b>📆 MARCADOR DEL DÍA — 🕐 {hora}</b>\n"
+        f"<b>┄┄┄┄┄┄┄┄┄┄┄┄┄┄┄┄┄┄┄┄┄┄┄</b>\n"
+        f"<b>✅ ACIERTOS ≥2x: {g_daily_hits}</b>\n"
+        f"<b>❌ FALLOS: {g_daily_misses}</b>\n"
+        f"<b>📈 PRECISIÓN: {pct:.1f}%</b>\n"
+        f"<b>┄┄┄┄┄┄┄┄┄┄┄┄┄┄┄┄┄┄┄┄┄┄┄</b>\n"
+        f"<i>Acierto = ≥2x en cualquier intento</i>"
+    )
     if g_scoreboard_msg_id:
         try:
             await bot.delete_message(CHANNEL_ID, g_scoreboard_msg_id)
-        except:
+        except Exception:
             pass
         g_scoreboard_msg_id = None
     sent = await bot.send_message(CHANNEL_ID, txt, parse_mode='HTML')
     g_scoreboard_msg_id = sent.message_id
 
 
-# ─── MENSAJERÍA ───────────────────────────────────────────────────────────────
-def render_gestion_bar(history: list, total: int, pending: bool = False) -> str:
-    """
-    Construye la barra de 'Nivel de Gestión' con el historial real de la sesión.
-    🟢 = entrada ganada (>=3x) · 🟡 = cubierta por el seguro (2x-3x, cuenta como derrota) ·
-    🔴 = entrada perdida (<2x) · 🔵 = entrada en curso (pendiente) · ⚫ = aún no jugada
-    """
-    icon_map = {'win': '🟢', 'covered': '🟡', 'loss': '🔴'}
-    chars = [icon_map.get(r, '🔴') for r in history]
-    if pending:
-        chars.append('🔵')
-    if len(chars) < total:
-        chars.extend(['⚫'] * (total - len(chars)))
-    else:
-        chars = chars[:total]
-    return ''.join(chars)
+# ─── PERSISTENCIA ─────────────────────────────────────────────────────────────
+def save_to_disk():
+    global _persist_counter
+    try:
+        payload = {
+            'mults':       [{'id': m['id'], 'value': m['value'], 'ts': m['ts']} for m in g_mults],
+            'events2x':    g_events2x, 'gaps2x': g_gaps2x,
+            'events3x':    g_events3x, 'gaps3x': g_gaps3x,
+            'daily_hits':  g_daily_hits,
+            'daily_misses':g_daily_misses,
+            'daily_date':  g_daily_date,
+        }
+        tmp = PERSIST_FILE + ".tmp"
+        with open(tmp, 'w') as f:
+            json.dump(payload, f)
+        os.replace(tmp, PERSIST_FILE)
+    except Exception as e:
+        logger.warning(f"save error: {e}")
 
 
-async def _send_signal(trigger: float):
+def load_from_disk():
+    global g_mults, g_events2x, g_gaps2x, g_events3x, g_gaps3x
+    global g_daily_hits, g_daily_misses, g_daily_date
+    if not os.path.exists(PERSIST_FILE):
+        return
+    try:
+        with open(PERSIST_FILE) as f:
+            data = json.load(f)
+        loaded = data.get('mults', [])
+        if len(loaded) > MAX_MULTS:
+            loaded = loaded[-TRIM_MULTS:]
+        g_mults[:] = loaded
+        for m in g_mults:
+            g_seen_ids.add(str(m['id']))
+        g_events2x[:] = data.get('events2x', [])[-MAX_HIST_2X:]
+        g_gaps2x[:]   = data.get('gaps2x',   [])[-MAX_HIST_2X:]
+        g_events3x[:] = data.get('events3x', [])[-MAX_HIST_3X:]
+        g_gaps3x[:]   = data.get('gaps3x',   [])[-MAX_HIST_3X:]
+        today = (datetime.utcnow() - timedelta(hours=3)).strftime("%Y-%m-%d")
+        if data.get('daily_date', '') == today:
+            g_daily_hits   = data.get('daily_hits',   0)
+            g_daily_misses = data.get('daily_misses', 0)
+            g_daily_date   = today
+        else:
+            g_daily_hits = g_daily_misses = 0
+            g_daily_date = today
+        logger.info(f"Cargado: {len(g_mults)} mults | {len(g_events2x)} ev2x | {len(g_events3x)} ev3x")
+    except Exception as e:
+        logger.warning(f"load error: {e}")
+
+
+# ─── MENSAJES DE SEÑAL ────────────────────────────────────────────────────────
+async def _send_signal_2x(trigger: float, attempt: int,
+                          avg_gap: float, eta_s: float, conf: float):
     hora = argentina_time()
-    col = g_session.col
-    ents = g_session.entries_in_cycle + 1
-    wins = g_session.wins_in_cycle
-    gestion_bar = render_gestion_bar(g_session.col_history, MAX_COLS, pending=True)
-    avg_gap = avg_sec(g_gaps2x)
     eventos = len(g_events2x)
-    logger.info(f"📤 Señal 2x | Col{col} | Entrada {ents}/{MAX_COLS} | Ciclo {wins}/{WINS_PER_CYCLE} | AvgGap:{avg_gap:.1f}s")
-    txt = (f"<b>🆔 ENTRADA SPACEMAN — 🕐 {hora}</b>\n"
-           f"<b>┄┄┄┄┄┄┄┄┄┄┄┄┄┄┄┄┄┄┄┄┄┄┄</b>\n"
-           f"<b>⏱ ÚLTIMA CUOTA: {trigger:.2f}x</b>\n"
-           f"<b>🎯 OBJECTIVO: {OBJECTIVE_TARGET:.2f}x</b>\n"
-           f"<b>🛡️ SEGURO: {INSURANCE_TARGET:.2f}x</b>\n"
-           f"<b>┄┄┄┄┄┄┄┄┄┄┄┄┄┄┄┄┄┄┄┄┄┄┄</b>\n"
-           f"<b>💎GESTION DE ENTRADAS:</b>\n"
-           f"<b>{gestion_bar}</b>")
+    logger.info(f"📤 Señal 2x intento {attempt} | trigger={trigger:.2f}x")
+    txt = (
+        f"<b>🆔 SEÑAL 2x SPACEMAN — 🕐 {hora}</b>\n"
+        f"<b>┄┄┄┄┄┄┄┄┄┄┄┄┄┄┄┄┄┄┄┄┄┄┄</b>\n"
+        f"<b>⏱ ÚLTIMA CUOTA: {trigger:.2f}x</b>\n"
+        f"<b>🎯 OBJETIVO: {TARGET_2X:.2f}x</b>\n"
+        f"<b>🛡️ SEGURO: {INSURANCE_2X:.2f}x</b>\n"
+        f"<b>⏳ ETA próximo 2x: ~{eta_s:.0f}s</b>\n"
+        f"<b>📊 Confianza: {conf:.0f}%</b>\n"
+        f"<b>🔄 Intento {attempt}/{MAX_ATTEMPTS}</b>"
+    )
     await broadcast_signal(txt)
 
 
-async def _dispatch_result(value: float, tipo: str, bet: float, recovered: float, attempt_num: int):
-    global g_session, g_daily_wins, g_daily_losses, g_daily_covered, g_daily_recovered
-    global g_daily_cycles_won, g_daily_cycles_lost
+async def _send_signal_3x(trigger: float, attempt: int,
+                          avg_gap: float, eta_s: float,
+                          conf: float, coef_range: str):
     hora = argentina_time()
-    if tipo == 'win':
-        g_daily_wins += 1
-        txt = f"<b>✅ GANAMOS {value:.2f}x — 🕐 {hora}</b>"
-        await broadcast(txt)
-        await _broadcast_scoreboard()
-    elif tipo == 'cycle_win':
-        g_daily_wins += 1
-        g_daily_cycles_won += 1
-        wins = g_session.wins_in_cycle
-        wins_bar = '🟢' * wins
-        txt = (f"<b>✅ GANAMOS {value:.2f}x — 🕐 {hora}</b>\n"
-               f"<b>💎 SESION {wins}/{WINS_PER_CYCLE} VICTORIAS {wins_bar}</b>")
-        await broadcast(txt)
-        await _broadcast_scoreboard()
-        reset_global_session()
-    elif tipo == 'covered':
-        g_daily_losses += 1
-        g_daily_covered += 1
-        g_daily_recovered += recovered
-        col = g_session.col
-        txt = (f"<b>🛡️ CUBIERTO SEGURO {value:.2f}x — 🕐 {hora}</b>\n")
-        await broadcast(txt)
-        await _broadcast_scoreboard()
-    elif tipo == 'new_col':
-        g_daily_losses += 1
-        col = g_session.col
-        txt = f"<b>❌ PERDIMOS {value:.2f}x — 🕐 {hora}</b>"
-        await broadcast(txt)
-        await _broadcast_scoreboard()
-    elif tipo == 'cycle_loss':
-        g_daily_losses += 1
-        g_daily_cycles_lost += 1
-        if recovered > 0:
-            g_daily_covered += 1
-            g_daily_recovered += recovered
-            txt = (f"<b>🛡️ CUBIERTO SEGURO {value:.2f}x — 🕐 {hora}</b>\n"
-                   f"<b>💎 SESION FINALIZADO 😭</b>")
-        else:
-            txt = (f"<b>❌ PERDIMOS {value:.2f}x — 🕐 {hora}</b>\n"
-                   f"<b>💎 SESION FINALIZADO 😭</b>")
-        await broadcast(txt)
-        await _broadcast_scoreboard()
-        reset_global_session()
+    eventos = len(g_events3x)
+    # eta_s puede ser negativo (ya pasó el ETA) o positivo (aún falta)
+    eta_abs = abs(eta_s)
+    if eta_s > 0:
+        eta_txt = f"en ~{eta_abs:.0f}s"
+    elif eta_s < -1:
+        eta_txt = f"hace {eta_abs:.0f}s (ventana +{SIGNAL_WINDOW_3X_A}s)"
     else:
-        logger.warning(f"Resultado inesperado: {tipo}")
+        eta_txt = "¡AHORA!"
+    logger.info(f"📤 Señal 3x intento {attempt} | trigger={trigger:.2f}x | rango={coef_range} | eta={eta_s:.1f}s")
+    txt = (
+        f"<b>🚀 SEÑAL 3x SPACEMAN — 🕐 {hora}</b>\n"
+        f"<b>┄┄┄┄┄┄┄┄┄┄┄┄┄┄┄┄┄┄┄┄┄┄┄</b>\n"
+        f"<b>⏱ ÚLTIMA CUOTA ≥3x: {trigger:.2f}x</b>\n"
+        f"<b>🎯 OBJETIVO: {TARGET_3X:.2f}x</b>\n"
+        f"<b>🛡️ SEGURO: {INSURANCE_2X:.2f}x</b>\n"
+        f"<b>📈 RANGO ESTIMADO: {coef_range}</b>\n"
+        f"<b>⏳ ETA próximo ≥3x: {eta_txt}</b>\n"
+        f"<b>🪟 VENTANA: ±{SIGNAL_WINDOW_3X_B}s del ETA</b>\n"
+        f"<b>📊 Confianza: {conf:.0f}% | Eventos: {eventos}</b>\n"
+        f"<b>🔄 Intento {attempt}/{MAX_ATTEMPTS}</b>"
+    )
+    await broadcast_signal(txt)
 
 
-# ─── WEBSOCKET ───────────────────────────────────────────────────────────────
+async def _send_hit(value: float, attempt: int, kind: str):
+    hora = argentina_time()
+    if value >= TARGET_3X:
+        emoji, label = "✅", f"GANAMOS {value:.2f}x"
+    else:
+        emoji, label = "🛡️", f"SEGURO ACTIVADO {value:.2f}x"
+    txt = (
+        f"<b>{emoji} {label} — 🕐 {hora}</b>\n"
+        f"<b>Señal {kind.upper()} · Intento {attempt}/{MAX_ATTEMPTS}</b>"
+    )
+    await broadcast(txt)
+
+
+async def _send_miss(value: float, attempt: int, kind: str, last: bool):
+    hora = argentina_time()
+    if last:
+        txt = (
+            f"<b>❌ PERDIMOS {value:.2f}x — 🕐 {hora}</b>\n"
+            f"<b>Señal {kind.upper()} · Intento {attempt}/{MAX_ATTEMPTS} — Señal fallida 😭</b>"
+        )
+    else:
+        txt = (
+            f"<b>❌ {value:.2f}x — 🕐 {hora}</b>\n"
+            f"<b>Señal {kind.upper()} · Intento {attempt}/{MAX_ATTEMPTS} fallido → preparando intento {attempt+1}...</b>"
+        )
+    await broadcast(txt)
+
+
+# ─── PROCESADOR DE MULTIPLICADORES ────────────────────────────────────────────
+async def process_multiplier(value: float, round_id: str):
+    global active_signal
+    global g_armed2x, g_last_fire2x, g_cooldown2x_mod
+    global g_armed3x, g_last_fire3x, g_cooldown3x_mod
+    global g_mults, g_seen_ids, _persist_counter
+    global g_daily_hits, g_daily_misses
+
+    logger.info(f"🎲 {value:.2f}x | ID:{round_id} | señal:{active_signal.kind if active_signal else 'idle'}")
+
+    _check_daily_reset()
+
+    # ── Fase 1: Resolver señal activa ─────────────────────────────────────────
+    if active_signal is not None:
+        sig  = active_signal
+        kind = sig.kind
+        att  = sig.attempt
+
+        # ¿Acierto? Para señal 2x: ≥2x. Para señal 3x: ≥2x (seguro) o ≥3x.
+        hit = value >= INSURANCE_2X   # mismo umbral para ambas señales
+
+        if hit:
+            g_daily_hits += 1
+            await _send_hit(value, att, kind)
+            await _broadcast_scoreboard()
+            save_to_disk()
+            _clear_signal()
+            g_cooldown2x_mod = max(g_cooldown2x_mod, 3)
+            g_cooldown3x_mod = max(g_cooldown3x_mod, 3)
+        else:
+            if att < MAX_ATTEMPTS:
+                sig.attempt += 1
+                await _send_miss(value, att, kind, last=False)
+                # No se borra la señal; el siguiente round será el intento 2
+            else:
+                g_daily_misses += 1
+                await _send_miss(value, att, kind, last=True)
+                await _broadcast_scoreboard()
+                save_to_disk()
+                _clear_signal()
+            g_cooldown2x_mod = max(g_cooldown2x_mod, 2)
+            g_cooldown3x_mod = max(g_cooldown3x_mod, 2)
+
+    g_cooldown2x_mod = max(0, g_cooldown2x_mod - 1)
+    g_cooldown3x_mod = max(0, g_cooldown3x_mod - 1)
+
+    # ── Fase 2: Registrar multiplicador ───────────────────────────────────────
+    now_ts = time.time()
+    g_mults.append({'id': round_id, 'value': value, 'ts': now_ts})
+    if len(g_mults) >= MAX_MULTS:
+        g_mults[:] = g_mults[-TRIM_MULTS:]
+        save_to_disk()
+    else:
+        _persist_counter += 1
+        if _persist_counter >= 10:
+            _persist_counter = 0
+            save_to_disk()
+
+    if len(g_seen_ids) > 2000:
+        for oid in sorted(g_seen_ids)[:1000]:
+            g_seen_ids.discard(oid)
+
+    # ── Fase 3: Registrar eventos por tier ────────────────────────────────────
+    if value >= 2.0:
+        _register_event(now_ts, g_events2x, g_gaps2x, MAX_HIST_2X)
+        if g_armed2x:
+            g_armed2x = False
+            logger.debug(f"Señal 2x reseteada — llegó {value:.2f}x")
+
+    if value >= 3.0:
+        _register_event(now_ts, g_events3x, g_gaps3x, MAX_HIST_3X)
+        if g_armed3x:
+            g_armed3x = False
+            logger.debug(f"Señal 3x reseteada — llegó {value:.2f}x")
+
+    # ── Fase 4: Disparar señal (solo si no hay señal activa) ──────────────────
+    if active_signal is not None:
+        return   # ya hay señal activa esperando
+
+    # ── 4a. Señal 3x (tiene prioridad si el predictor está listo) ─────────────
+    if g_cooldown3x_mod == 0:
+        in_win3, eta3, avg3, conf3 = _in_signal_window(
+            g_events3x, g_gaps3x, MIN_EVENTS_3X,
+            window_before=SIGNAL_WINDOW_3X_B,
+            window_after=SIGNAL_WINDOW_3X_A,
+        )
+        if in_win3 and not g_armed3x:
+            elapsed_since = now_ts - g_last_fire3x
+            if elapsed_since >= COOLDOWN_3X:
+                g_armed3x      = True
+                g_last_fire3x  = now_ts
+                g_cooldown3x_mod = 8
+                coef_range = derive_prediction(value, now_ts)
+                active_signal = ActiveSignal('3x', value)
+                logger.info(
+                    f"🎯 SEÑAL 3x | trigger={value:.2f}x | ETA~{eta3:.0f}s | "
+                    f"avg={avg3:.1f}s | conf={conf3:.0f}% | rango={coef_range}"
+                )
+                await _send_signal_3x(value, 1, avg3, eta3, conf3, coef_range)
+                return
+        elif not in_win3 and g_armed3x:
+            g_armed3x = False
+
+    # ── 4b. Señal 2x ──────────────────────────────────────────────────────────
+    if g_cooldown2x_mod == 0:
+        in_win2, eta2, avg2, conf2 = _in_signal_window(
+            g_events2x, g_gaps2x, MIN_EVENTS_2X,
+            window_before=SIGNAL_WINDOW_2X,
+            window_after=0.0,
+        )
+        if in_win2 and not g_armed2x:
+            elapsed_since = now_ts - g_last_fire2x
+            if elapsed_since >= SIGNAL_COOLDOWN_2X:
+                g_armed2x      = True
+                g_last_fire2x  = now_ts
+                g_cooldown2x_mod = 6
+                active_signal = ActiveSignal('2x', value)
+                logger.info(
+                    f"🎯 SEÑAL 2x | trigger={value:.2f}x | ETA~{eta2:.0f}s | "
+                    f"avg={avg2:.1f}s | conf={conf2:.0f}%"
+                )
+                await _send_signal_2x(value, 1, avg2, eta2, conf2)
+                return
+        elif not in_win2 and g_armed2x:
+            g_armed2x = False
+
+
+# ─── WEBSOCKET ────────────────────────────────────────────────────────────────
 async def ws_collector():
     last_value = None
     while True:
         try:
-            async with websockets.connect(WS_URL, ping_interval=30, ping_timeout=10, close_timeout=10) as ws:
-                subscribe_msg = {"type": "subscribe", "casinoId": CASINO_ID, "currency": CURRENCY, "key": [GAME_ID]}
-                await ws.send(json.dumps(subscribe_msg))
+            async with websockets.connect(
+                WS_URL, ping_interval=30, ping_timeout=10, close_timeout=10
+            ) as ws:
+                await ws.send(json.dumps({
+                    "type": "subscribe", "casinoId": CASINO_ID,
+                    "currency": CURRENCY, "key": [GAME_ID]
+                }))
                 logger.info("✅ Suscrito a Spaceman WebSocket")
-                async for raw_msg in ws:
+                async for raw in ws:
                     try:
-                        data = json.loads(raw_msg)
-                        game_results = data.get('gameResult', [])
-                        if not game_results:
+                        data = json.loads(raw)
+                        gr   = data.get('gameResult', [])
+                        if not gr:
                             continue
-                        first = game_results[0]
+                        first = gr[0]
                         value = float(first.get('result', 0))
                         if value <= 0:
                             continue
-                        round_id = str(first.get('roundId') or first.get('gameRoundId') or first.get('id') or f"{value}_{int(time.time()*1000)}")
-                        if round_id in g_seen_ids or value == last_value:
+                        rid = str(
+                            first.get('roundId') or first.get('gameRoundId') or
+                            first.get('id') or f"{value}_{int(time.time()*1000)}"
+                        )
+                        if rid in g_seen_ids or value == last_value:
                             continue
-                        g_seen_ids.add(round_id)
+                        g_seen_ids.add(rid)
                         last_value = value
-                        await process_multiplier(value, round_id)
+                        await process_multiplier(value, rid)
                     except Exception as e:
-                        logger.debug(f"Error procesando mensaje: {e}")
+                        logger.debug(f"msg error: {e}")
         except Exception as e:
-            logger.error(f"WebSocket error: {e}")
+            logger.error(f"WS error: {e}")
         await asyncio.sleep(5)
 
 
-# ─── FLASK KEEP-ALIVE ────────────────────────────────────────────────────────
+# ─── FLASK ────────────────────────────────────────────────────────────────────
 flask_app = Flask(__name__)
 
 @flask_app.route('/')
 def home():
-    return f"🤖 SpacemanBot ACTIVO | Datos: {len(g_mults)}/400 | Sesión: {g_session.state} | Señal: {g_signal_state}", 200
+    sig = active_signal
+    sig_info = f"{sig.kind} intento {sig.attempt}" if sig else "idle"
+    return (
+        f"🤖 SpacemanBot | mults:{len(g_mults)} | señal:{sig_info} | "
+        f"ev2x:{len(g_events2x)} ev3x:{len(g_events3x)} | "
+        f"✅{g_daily_hits} ❌{g_daily_misses}"
+    ), 200
 
 @flask_app.route('/ping')
 def ping():
@@ -640,14 +584,21 @@ def webhook():
 
 @flask_app.route('/stats')
 def stats_route():
-    last5 = [f"{m['value']:.2f}x" for m in g_mults[-5:]] if g_mults else []
-    avg = avg_sec(g_gaps2x)
-    return {"status": "ok", "mults_collected": len(g_mults), "signal_state": g_signal_state,
-            "events_2x": len(g_events2x), "avg_gap_sec": round(avg, 1) if avg else None,
-            "session_state": g_session.state, "session_col": g_session.col,
-            "wins": g_session.wins, "losses": g_session.losses,
-            "recovered_in_cycle": round(g_session.recovered_in_cycle, 2),
-            "last_5": last5}
+    avg2 = avg_sec(g_gaps2x)
+    avg3 = avg_sec(g_gaps3x)
+    total = g_daily_hits + g_daily_misses
+    return {
+        "status": "ok",
+        "mults": len(g_mults),
+        "signal": active_signal.kind if active_signal else None,
+        "events_2x": len(g_events2x),
+        "avg_gap_2x_s": round(avg2, 1) if avg2 else None,
+        "events_3x": len(g_events3x),
+        "avg_gap_3x_s": round(avg3, 1) if avg3 else None,
+        "daily_hits": g_daily_hits,
+        "daily_misses": g_daily_misses,
+        "accuracy_pct": round(g_daily_hits / total * 100, 1) if total else None,
+    }
 
 def run_flask():
     port = int(os.environ.get('PORT', 8080))
@@ -669,56 +620,29 @@ async def self_ping_loop():
             logger.warning(f"Self-ping falló: {e}")
 
 
-# ─── COMANDOS DE TELEGRAM ─────────────────────────────────────────────────────
+# ─── COMANDOS TELEGRAM ────────────────────────────────────────────────────────
 @bot.message_handler(commands=['start'])
 async def cmd_start(message):
     name = message.from_user.first_name or "usuario"
     g_all_chats.add(message.chat.id)
-    stats_blk = quota_stats_text(len(g_events2x), g_gaps2x)
-    data_info = f"📡 <code>{len(g_mults)}/400</code> multiplicadores" if g_mults else "📡 Recopilando datos..."
+    avg2 = avg_sec(g_gaps2x)
+    avg3 = avg_sec(g_gaps3x)
+    ev2  = len(g_events2x)
+    ev3  = len(g_events3x)
+    info2 = f"<code>{avg2:.1f}s</code> avg ({ev2} eventos)" if avg2 else f"<code>{ev2}/{MIN_EVENTS_2X}</code> eventos"
+    info3 = f"<code>{avg3:.1f}s</code> avg ({ev3} eventos)" if avg3 else f"<code>{ev3}/{MIN_EVENTS_3X}</code> eventos"
     await bot.reply_to(message,
         f"🚀 <b>¡Bienvenido {name}!</b>\n\n"
         "━━━━━━━━━━━━━━━━━━━━━━━\n"
-        "🤖 <b>Bot de Señales Spaceman</b>\n"
-        f"📊 Sistema 2x por Tiempo | Objetivo: <code>{OBJECTIVE_TARGET:.2f}x</code> · Seguro: <code>{INSURANCE_TARGET:.2f}x</code>\n"
-        f"🛡️ Reparto: <code>{INSURANCE_SPLIT*100:.0f}%</code> seguro / <code>{(1-INSURANCE_SPLIT)*100:.0f}%</code> objetivo\n"
-        f"🔄 Gestión: <code>{MAX_COLS}</code> Entradas × <code>{WINS_PER_CYCLE}</code> Victorias/Ciclo\n"
-        f"💵 Apuesta base fija: <code>${BASE_BET:.2f}</code>\n"
-        "━━━━━━━━━━━━━━━━━━━━━━━\n"
-        f"{data_info}\n\n{stats_blk}\n"
-        "✅ <b>¡Registrado!</b>\n<i>Las señales se envían cuando una cuota ≥2x cae en la ventana de tiempo. "
-        "Si el resultado no llega a 3x pero sí a 2x, el seguro recupera parte del capital (queda como 🟡 cubierto).</i>",
-        parse_mode='HTML')
-
-
-@bot.message_handler(commands=['estadisticas'])
-async def cmd_estadisticas(message):
-    g_all_chats.add(message.chat.id)
-    s = g_session
-    trend = quota_stats_text(len(g_events2x), g_gaps2x)
-    fichas_recientes = s.fichas[-15:]
-    if fichas_recientes:
-        lineas = []
-        for f in fichas_recientes:
-            total = sum(f.get(f'c{i}', 0.0) for i in range(1, 13))
-            net = BASE_BET if f['result'] == 'win' else -total
-            res = "✅" if f['result'] == 'win' else "❌"
-            hora_f = f.get('ts', '--:--')
-            partes = [f"C{i}:${f.get(f'c{i}',0.0):.2f}" for i in range(1,13) if f.get(f'c{i}',0.0)>0]
-            cols_txt = " ".join(partes) if partes else "—"
-            net_txt = f"+${net:.2f}" if net >= 0 else f"-${abs(net):.2f}"
-            lineas.append(f"{res} #{f['n']} {hora_f} | {cols_txt} | {net_txt}")
-        fichas_txt = "\n".join(lineas)
-        total_fichas = len(s.fichas)
-        wins_f = sum(1 for f in s.fichas if f['result'] == 'win')
-        loss_f = total_fichas - wins_f
-        resumen = f"Total fichas: <code>{total_fichas}</code> | ✅ <code>{wins_f}</code> | ❌ <code>{loss_f}</code>"
-    else:
-        fichas_txt = "<i>Sin fichas registradas aún.</i>"
-        resumen = "Total fichas: <code>0</code>"
-    await bot.reply_to(message,
-        f"📊 <b>ESTADÍSTICAS DEL BOT</b>\n━━━━━━━━━━━━━━━━━━━━━━━\n{s.status_short()}\n━━━━━━━━━━━━━━━━━━━━━━━\n"
-        f"<b>Últimas fichas (C1 a C12):</b>\n{fichas_txt}\n━━━━━━━━━━━━━━━━━━━━━━━\n{resumen}\n━━━━━━━━━━━━━━━━━━━━━━━\n{trend}",
+        "🤖 <b>Bot de Señales Spaceman — Triple Predictor</b>\n\n"
+        f"🔵 <b>Señal 2x</b> · Objetivo ≥<code>2.00x</code>\n"
+        f"   Predictor timing: {info2}\n\n"
+        f"🚀 <b>Señal 3x</b> · Objetivo ≥<code>3.00x</code> · Seguro <code>2.00x</code>\n"
+        f"   Predictor timing (eventos ≥3x): {info3}\n"
+        f"   + Rango de cuota estimado por hash\n\n"
+        f"🔄 Cada señal tiene <code>{MAX_ATTEMPTS}</code> intentos\n"
+        f"✅ Acierto = ≥2x en cualquier intento\n"
+        "━━━━━━━━━━━━━━━━━━━━━━━",
         parse_mode='HTML')
 
 
@@ -726,39 +650,76 @@ async def cmd_estadisticas(message):
 async def cmd_predictor(message):
     g_all_chats.add(message.chat.id)
     hora = argentina_time()
-    eventos = len(g_events2x)
-    avg = avg_sec(g_gaps2x)
-    if eventos < MIN_EVENTS_2X:
-        await bot.reply_to(message,
-            f"📡 <b>PREDICTOR 2x — 🕐 {hora}</b>\n"
-            f"━━━━━━━━━━━━━━━━━━━━━━━\n"
-            f"⏳ Acumulando datos: <code>{eventos}/{MIN_EVENTS_2X}</code> eventos ≥2x",
-            parse_mode='HTML')
-        return
-    last_event = g_events2x[-1] if g_events2x else 0
-    elapsed = time.time() - last_event
-    eta = max(0, (avg or 0) - elapsed)
-    last_gap = g_gaps2x[-1] if g_gaps2x else 0
-    txt = (f"📡 <b>PREDICTOR 2x — 🕐 {hora}</b>\n"
-           f"━━━━━━━━━━━━━━━━━━━━━━━\n"
-           f"⏱ Intervalo promedio: <code>{avg:.1f}s</code>\n"
-           f"⏱ Último intervalo: <code>{last_gap:.1f}s</code>\n"
-           f"⏱ Transcurrido: <code>{elapsed:.1f}s</code>\n"
-           f"🎯 ETA próximo 2x: <code>~{eta:.0f}s</code>\n"
-           f"📊 Eventos ≥2x: <code>{eventos}</code>\n"
-           f"🪟 Ventana de señal: <code>{SIGNAL_WINDOW_SEC}s</code>")
-    await bot.reply_to(message, txt, parse_mode='HTML')
+    now  = time.time()
+
+    # 2x
+    ev2  = len(g_events2x)
+    avg2 = avg_sec(g_gaps2x)
+    if avg2 and ev2 >= MIN_EVENTS_2X:
+        el2  = now - g_events2x[-1] if g_events2x else 0
+        eta2 = max(0, avg2 - el2)
+        gaps = g_gaps2x
+        mean = avg2
+        cv2  = (sum((g-mean)**2 for g in gaps)/len(gaps))**0.5 / mean if mean else 1
+        reg2 = max(0, 1-cv2)
+        info2 = (f"⏱ Avg gap: <code>{avg2:.1f}s</code> | Transcurrido: <code>{el2:.1f}s</code>\n"
+                 f"   ETA: <code>~{eta2:.0f}s</code> | Regularidad: <code>{reg2*100:.0f}%</code>")
+    else:
+        info2 = f"⏳ Acumulando: <code>{ev2}/{MIN_EVENTS_2X}</code> eventos ≥2x"
+
+    # 3x
+    ev3  = len(g_events3x)
+    avg3 = avg_sec(g_gaps3x)
+    if avg3 and ev3 >= MIN_EVENTS_3X:
+        el3  = now - g_events3x[-1] if g_events3x else 0
+        eta3 = max(0, avg3 - el3)
+        gaps3= g_gaps3x
+        mean3= avg3
+        cv3  = (sum((g-mean3)**2 for g in gaps3)/len(gaps3))**0.5 / mean3 if mean3 else 1
+        reg3 = max(0, 1-cv3)
+        info3 = (f"⏱ Avg gap: <code>{avg3:.1f}s</code> | Transcurrido: <code>{el3:.1f}s</code>\n"
+                 f"   ETA: <code>~{eta3:.0f}s</code> | Regularidad: <code>{reg3*100:.0f}%</code>")
+    else:
+        info3 = f"⏳ Acumulando: <code>{ev3}/{MIN_EVENTS_3X}</code> eventos ≥3x"
+
+    await bot.reply_to(message,
+        f"📡 <b>PREDICTORES — 🕐 {hora}</b>\n"
+        "━━━━━━━━━━━━━━━━━━━━━━━\n"
+        f"🔵 <b>Predictor 2x</b>\n{info2}\n\n"
+        f"🚀 <b>Predictor 3x (eventos ≥3x)</b>\n{info3}\n"
+        "━━━━━━━━━━━━━━━━━━━━━━━",
+        parse_mode='HTML')
+
+
+@bot.message_handler(commands=['estadisticas'])
+async def cmd_estadisticas(message):
+    g_all_chats.add(message.chat.id)
+    hora  = argentina_time()
+    total = g_daily_hits + g_daily_misses
+    pct   = (g_daily_hits / total * 100) if total else 0.0
+    sig   = active_signal
+    sig_txt = f"<code>{sig.kind}</code> · intento {sig.attempt}/{MAX_ATTEMPTS}" if sig else "<code>idle</code>"
+    await bot.reply_to(message,
+        f"📊 <b>ESTADÍSTICAS — 🕐 {hora}</b>\n"
+        "━━━━━━━━━━━━━━━━━━━━━━━\n"
+        f"✅ Aciertos ≥2x hoy: <code>{g_daily_hits}</code>\n"
+        f"❌ Fallos hoy: <code>{g_daily_misses}</code>\n"
+        f"📈 Precisión: <code>{pct:.1f}%</code>\n"
+        f"📡 Señal activa: {sig_txt}\n"
+        f"📦 Eventos 2x: <code>{len(g_events2x)}</code> | 3x: <code>{len(g_events3x)}</code>\n"
+        "━━━━━━━━━━━━━━━━━━━━━━━",
+        parse_mode='HTML')
 
 
 # ─── MAIN ─────────────────────────────────────────────────────────────────────
 async def main_async():
     global _main_loop
     _main_loop = asyncio.get_running_loop()
-    logger.info("🤖 Iniciando SpacemanBot (Sistema 2x por Tiempo)...")
-    load_mults_from_disk()
+    logger.info("🤖 Iniciando SpacemanBot (Triple Predictor 2x/3x)...")
+    load_from_disk()
     await bot.set_my_commands([
-        types.BotCommand('predictor', '📡 Estado del predictor 2x'),
-        types.BotCommand('estadisticas', '📊 Estadísticas de la sesión'),
+        types.BotCommand('predictor',    '📡 Estado de los predictores'),
+        types.BotCommand('estadisticas', '📊 Estadísticas del día'),
     ])
     asyncio.create_task(ws_collector())
     asyncio.create_task(self_ping_loop())
@@ -767,11 +728,11 @@ async def main_async():
         await bot.remove_webhook()
         await asyncio.sleep(1)
         await bot.set_webhook(url=f"{render_url}/webhook")
-        logger.info(f"✅ Webhook configurado: {render_url}/webhook")
+        logger.info(f"✅ Webhook: {render_url}/webhook")
         while True:
             await asyncio.sleep(3600)
     else:
-        logger.warning("⚠️ Usando polling (desarrollo local)")
+        logger.warning("⚠️ Usando polling (dev local)")
         await bot.infinity_polling(skip_pending=True)
 
 
