@@ -36,10 +36,10 @@ logger = logging.getLogger(__name__)
 BOT_TOKEN  = os.environ.get("BOT_TOKEN", os.environ.get("TELEGRAM_TOKEN", "8620810853:AAHw-3JXcQt7Oz6Qcdv16Yt6JBG9m05UyYo"))
 CHAT_ID    = int(os.environ.get("CHAT_ID", "-1003274770136"))
 
-WS_URL    = "wss://cgp.pragmaticplaylive.net/ws"
+WS_URL    = os.environ.get("WS_URL", "wss://dga.pragmaticplaylive.net/ws")
 CASINO_ID = os.environ.get("CASINO_ID", "ppcdk00000005349")
 CURRENCY  = os.environ.get("CURRENCY", "BRL")
-GAME_ID   = os.environ.get("GAME_ID", "1301")
+GAME_ID   = int(os.environ.get("GAME_ID", "1301"))
 
 # Zona horaria Argentina
 def argentina_time() -> str:
@@ -185,6 +185,7 @@ def build_trend_message(stats: dict) -> str:
     else:
         header = f"🔴 TENDENCIA DESFAVORABLE — {now}"
         mark2  = "❌"
+    icon2 = "🟡"
 
     below2_mark = "✅" if below2_ok else "❌"
 
@@ -193,7 +194,7 @@ def build_trend_message(stats: dict) -> str:
         f"━━━━━━━━━━━━━━━━━━━━━━━\n"
         f"📈 Análisis últimos {stats['total']} multiplicadores\n"
         f"🔵 1.00-1.99x = {stats['below2']} — {stats['pct_below2']:.2f}%{below2_mark}\n"
-        f"🟡 2.00-4.99x = {stats['two_to_five']} — {stats['pct_2to5']:.2f}%{mark2}\n"
+        f"{icon2} 2.00-4.99x = {stats['two_to_five']} — {stats['pct_2to5']:.2f}%{mark2}\n"
         f"🆔 ({last5_str})"
     )
 
@@ -201,9 +202,9 @@ def build_trend_message(stats: dict) -> str:
 def build_signal_message() -> str:
     return (
         "✅<b>ENTRADA CONFIRMADA</b>✅\n\n"
-        f"👉<b>INGRESAR DESPUÉS: {CASHOUT_TRIGGER:.2f}x</b>\n"
-        f"💰<b>RETIRAR EN: {CASHOUT_TARGET:.2f}x</b>\n\n"
-        f"🔁<b>MÁXIMO {MAX_GALES} GALES</b>"
+        f"👉<b> INGRESAR DESPUÉS: {CASHOUT_TRIGGER:.2f}x</b>\n"
+        f"💰<b> RETIRAR EN: {CASHOUT_TARGET:.2f}x</b>\n\n"
+        f"🔁 <b>MÁXIMO {MAX_GALES} GALES</b>"
     )
 
 def build_win_message(result: float) -> str:
@@ -396,6 +397,13 @@ async def ws_loop():
             await asyncio.sleep(RECONNECT_DELAY)
 
 # ─── FLASK ROUTES ─────────────────────────────────────────────────────────────
+@flask_app.route('/')
+def home():
+    stats = get_stats()
+    sig = 'activa' if signal_active else 'idle'
+    tend = '🟢' if stats['favorable'] else '🔴'
+    return f"🤖 SpacemanBot | historial:{len(history)} | señal:{sig} | tendencia:{tend}", 200
+
 @flask_app.route('/webhook', methods=['POST'])
 def webhook():
     try:
