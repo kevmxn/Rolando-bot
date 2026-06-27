@@ -301,7 +301,7 @@ def build_signal_message(last_value: float = None, attempt: int = 1) -> str:
         "<b>✅ ENTRADA CONFIRMADA ✅</b>\n\n"
         f"<b>👉 INGRESAR DESPUÉS: {last_value:.2f}x</b>\n"
         f"<b>💰 RETIRAR EN: {CASHOUT_TARGET:.2f}x</b>\n\n"
-        f"{footer}"
+        f"{footer}\n"
     )
 
 def build_win_message(result: float) -> str:
