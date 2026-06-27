@@ -1,4 +1,4 @@
-#!/usr/bin/env python3
+en el#!/usr/bin/env python3
 """
 SPACEMAN 2x Signal Bot — Telegram + Render
 - WebSocket Pragmatic Play (Spaceman/Aviator)
@@ -47,9 +47,9 @@ def argentina_time() -> str:
     return (datetime.utcnow() - timedelta(hours=3)).strftime("%H:%M")
 
 # Umbrales de filtro (últimos 100 multiplicadores)
-UMBRAL_BELOW2  = 53
-UMBRAL_2TO5    = 27
-HISTORY_MAX    = 100
+UMBRAL_BELOW2  = 52.01
+UMBRAL_2TO5    = 27.99
+HISTORY_MAX    = 150
 
 # Estrategia 2x
 CASHOUT_TARGET  = 2.00
@@ -275,7 +275,7 @@ def build_trend_message(stats: dict) -> str:
 
     return (
         f"{header}\n"
-        f"<b>━━━━━━━━━━━━━━━━━━━━━━━</b>\n"
+        f"<b>━━━━━━━━━━━━━━━━━━━━━━━━━━</b>\n"
         f"<b>📈 Análisis últimos {stats['total']} multiplicadores</b>\n"
         f"<b>🔵 1.00-1.99x = {stats['below2']} — {stats['pct_below2']:.2f}%{below2_mark}</b>\n"
         f"<b>🟡 2.00-4.99x = {stats['two_to_five']} — {stats['pct_2to5']:.2f}%{mark2}</b>\n"
@@ -293,9 +293,9 @@ def build_signal_message(last_value: float = None, attempt: int = 1) -> str:
         last_value = CASHOUT_TRIGGER
 
     if attempt == 1:
-        footer = f"🔁 <b>MÁXIMO {MAX_GALES} GALES</b>"
+        footer = f"🔁 <b>MÁXIMO {MAX_GALES} GALES</b>\n"
     else:
-        footer = "🔁 <b>SEGUNDA OPORTUNIDAD</b>"
+        footer = "🔁 <b>SEGUNDA OPORTUNIDAD</b>\n"
 
     return (
         "<b>✅ ENTRADA CONFIRMADA ✅</b>\n\n"
