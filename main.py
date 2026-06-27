@@ -102,9 +102,11 @@ def save_state():
         "signal_lost":      str(signal_lost),
         "trend_msg_id":     str(trend_msg_id) if trend_msg_id is not None else "",
         "stats_msg_id":     str(stats_msg_id) if stats_msg_id is not None else "",
+        "signal_msg_id":    str(signal_msg_id) if signal_msg_id is not None else "",
         "last_result":      str(last_result) if last_result is not None else "",
         "daily_wins":       str(daily_wins),
         "daily_losses":     str(daily_losses),
+        "daily_col_losses": str(daily_col_losses),
         "consecutive_wins": str(consecutive_wins),
     }
     try:
@@ -123,8 +125,8 @@ def save_state():
 def load_state():
     """Carga variables de estado desde la tabla `state`."""
     global signal_active, signal_attempt, signal_col, signal_lost
-    global trend_msg_id, stats_msg_id, last_result
-    global daily_wins, daily_losses, consecutive_wins
+    global trend_msg_id, stats_msg_id, signal_msg_id, last_result
+    global daily_wins, daily_losses, daily_col_losses, consecutive_wins
 
     try:
         con = _db()
@@ -140,10 +142,13 @@ def load_state():
         trend_msg_id     = int(_tid) if _tid else None
         _sid             = d.get("stats_msg_id", "")
         stats_msg_id     = int(_sid) if _sid else None
+        _smid            = d.get("signal_msg_id", "")
+        signal_msg_id    = int(_smid) if _smid else None
         _lr              = d.get("last_result", "")
         last_result      = float(_lr) if _lr else None
         daily_wins       = int(d.get("daily_wins", "0"))
         daily_losses     = int(d.get("daily_losses", "0"))
+        daily_col_losses = int(d.get("daily_col_losses", "0"))
         consecutive_wins = int(d.get("consecutive_wins", "0"))
 
         logger.info(f"Estado cargado desde SQLite | señal_activa={signal_active} col={signal_col}")
@@ -191,12 +196,14 @@ signal_base_bet = 10.0
 
 trend_msg_id: Optional[int]  = None
 stats_msg_id: Optional[int]  = None
+signal_msg_id: Optional[int] = None   # mensaje de señal activa (para editar)
 last_result: Optional[float] = None
 
 hist_loaded = False
 
 daily_wins: int       = 0
-daily_losses: int     = 0
+daily_losses: int     = 0      # ciclos completos de 3 cols perdidos
+daily_col_losses: int = 0      # columnas individuales perdidas
 consecutive_wins: int = 0
 
 # ─── Bot + Flask ───────────────────────────────────────────────────────────────
@@ -276,20 +283,25 @@ def build_trend_message(stats: dict) -> str:
     )
 
 # ─── MENSAJES DE SEÑAL ────────────────────────────────────────────────────────
-def build_signal_message(last_value: float = None) -> str:
+def build_signal_message(last_value: float = None, attempt: int = 1) -> str:
+    """
+    Intento 1 → formato original con MÁXIMO N GALES.
+    Intento 2 → mismo header pero con SEGUNDA OPORTUNIDAD.
+    En ambos casos last_value es la última cuota registrada.
+    """
     if last_value is None:
         last_value = CASHOUT_TRIGGER
+
+    if attempt == 1:
+        footer = f"🔁 <b>MÁXIMO {MAX_GALES} GALES</b>"
+    else:
+        footer = "🔁 <b>SEGUNDA OPORTUNIDAD</b>"
+
     return (
         "<b>✅ ENTRADA CONFIRMADA ✅</b>\n\n"
         f"<b>👉 INGRESAR DESPUÉS: {last_value:.2f}x</b>\n"
         f"<b>💰 RETIRAR EN: {CASHOUT_TARGET:.2f}x</b>\n\n"
-        f"<b>🔁 MÁXIMO {MAX_GALES} GALES</b>"
-    )
-
-def build_gale_message(col: int, attempt: int) -> str:
-    return (
-        f"<b>🔄 GALE — Col {col} · Intento {attempt}</b>\n"
-        f"<b>💰 RETIRAR EN: {CASHOUT_TARGET:.2f}x</b>"
+        f"{footer}"
     )
 
 def build_win_message(result: float) -> str:
@@ -307,10 +319,11 @@ def build_loss_message(result: float) -> str:
 
 
 def build_stats_message() -> str:
-    total_ops = daily_wins + daily_losses
+    total_ops = daily_wins + daily_losses + daily_col_losses
     win_pct   = (daily_wins / total_ops * 100) if total_ops > 0 else 0.0
+    losses_txt = daily_losses + daily_col_losses  # total de señales perdidas
     return (
-        f"🚀 <b>Resultado del día ✅ {daily_wins} ⭕ {daily_losses}</b>\n"
+        f"🚀 <b>Resultado del día ✅ {daily_wins} ⭕ {losses_txt}</b>\n"
         f"💎 <b>Acertamos el {win_pct:.2f}% de las veces</b>\n"
         f"📈 <b>¡Tenemos {consecutive_wins} victorias consecutivas!</b>"
     )
@@ -363,8 +376,8 @@ async def process_new_value(value: float, silent: bool = False):
                     col == MAX_COLS → perdida total → idle + stats
     """
     global signal_active, signal_attempt, signal_col, signal_lost
-    global trend_msg_id, stats_msg_id, last_result, history
-    global daily_wins, daily_losses, consecutive_wins
+    global trend_msg_id, stats_msg_id, signal_msg_id, last_result, history
+    global daily_wins, daily_losses, daily_col_losses, consecutive_wins
 
     # ── Actualizar historial en memoria y SQLite ──
     history.append(value)
@@ -391,6 +404,7 @@ async def process_new_value(value: float, silent: bool = False):
             signal_attempt = 1
             signal_col     = 1
             signal_lost    = 0.0
+            signal_msg_id  = None
             daily_wins    += 1
             consecutive_wins += 1
             save_state()
@@ -404,12 +418,22 @@ async def process_new_value(value: float, silent: bool = False):
             )
 
             if signal_attempt < (MAX_GALES + 1):
-                # Hay gale disponible en esta columna
+                # Hay gale disponible en esta columna → editar mensaje de señal
                 signal_attempt += 1
                 signal_lost    += 1
                 save_state()
                 logger.info(f"↩️  Gale {signal_attempt} en col {signal_col} — esperando próxima ronda")
-                await send_message(build_gale_message(signal_col, signal_attempt))
+                new_text = build_signal_message(
+                    last_value=value, attempt=signal_attempt
+                )
+                if signal_msg_id:
+                    ok = await edit_message(signal_msg_id, new_text)
+                    if not ok:
+                        signal_msg_id = await send_message(new_text)
+                        save_state()
+                else:
+                    signal_msg_id = await send_message(new_text)
+                    save_state()
 
             else:
                 # Agotamos gales en la columna actual
@@ -417,6 +441,7 @@ async def process_new_value(value: float, silent: bool = False):
                 signal_lost    += 1
                 completed_col   = signal_col
                 signal_col     += 1
+                daily_col_losses += 1   # contar la columna como pérdida individual
 
                 if signal_col > MAX_COLS:
                     # ── Perdimos las 3 columnas ──
@@ -424,6 +449,7 @@ async def process_new_value(value: float, silent: bool = False):
                     signal_active  = False
                     signal_col     = 1
                     signal_lost    = 0.0
+                    signal_msg_id  = None
                     daily_losses  += 1
                     consecutive_wins = 0
                     save_state()
@@ -436,20 +462,22 @@ async def process_new_value(value: float, silent: bool = False):
                         f"Col {completed_col} agotada → esperando nueva señal para Col {signal_col}"
                     )
                     signal_active = False   # idle hasta nueva señal
+                    signal_msg_id = None
                     save_state()
                     await send_message(build_loss_message(value))
+                    await send_stats_update()
 
         return  # No procesar tendencia ni nueva señal en la misma cuota
 
     # ── Detectar nueva señal ───────────────────────────────────────────────────
-    # Si signal_col > 1 el ciclo está en curso; la señal reanuda la siguiente columna
     vals = list(history)
     if check_signal_2x(vals):
         signal_active  = True
         signal_attempt = 1
         last_value     = vals[-1] if vals else CASHOUT_TRIGGER
+        text           = build_signal_message(last_value=last_value, attempt=1)
+        signal_msg_id  = await send_message(text)
         save_state()
-        await send_message(build_signal_message(last_value=last_value))
         logger.info(
             f"SEÑAL 2x enviada | pct<2={get_stats()['pct_below2']:.1f}% "
             f"2-5={get_stats()['pct_2to5']:.1f}% | col={signal_col}"
