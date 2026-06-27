@@ -33,8 +33,8 @@ logging.basicConfig(
 logger = logging.getLogger(__name__)
 
 # ─── CONFIG ───────────────────────────────────────────────────────────────────
-BOT_TOKEN  = os.environ.get("BOT_TOKEN", os.environ.get("TELEGRAM_TOKEN", "8620810853:AAHw-3JXcQt7Oz6Qcdv16Yt6JBG9m05UyYo"))
-CHAT_ID    = int(os.environ.get("CHAT_ID", "-1003274770136"))
+BOT_TOKEN  = os.environ.get("BOT_TOKEN", "8889373350:AAFU7R1ENyANVR-DiZbBMbeyAHZOi9DLlXY")
+CHAT_ID    = int(os.environ.get("CHAT_ID", "-1003815888467"))
 
 WS_URL    = os.environ.get("WS_URL", "wss://dga.pragmaticplaylive.net/ws")
 CASINO_ID = os.environ.get("CASINO_ID", "ppcdk00000005349")
@@ -69,11 +69,19 @@ signal_base_bet = 10.0 # apuesta base
 # Mensaje de tendencia (para editar/eliminar)
 trend_msg_id: Optional[int] = None
 
+# Mensaje de estadísticas (para editar/eliminar)
+stats_msg_id: Optional[int] = None
+
 # Última cuota registrada (evita duplicados)
 last_result: Optional[float] = None
 
 # Historial cargado
 hist_loaded = False
+
+# Contadores de victorias y pérdidas del día
+daily_wins: int = 0
+daily_losses: int = 0
+consecutive_wins: int = 0
 
 # Contador para persistencia
 _persist_counter: int = 0
@@ -98,7 +106,11 @@ def save_to_disk():
             "signal_col": signal_col,
             "signal_lost": signal_lost,
             "trend_msg_id": trend_msg_id,
+            "stats_msg_id": stats_msg_id,
             "last_result": last_result,
+            "daily_wins": daily_wins,
+            "daily_losses": daily_losses,
+            "consecutive_wins": consecutive_wins,
         }
         with open(PERSIST_FILE, 'w') as f:
             json.dump(data, f)
@@ -108,7 +120,7 @@ def save_to_disk():
         logger.warning(f"Error guardando estado: {e}")
 
 def load_from_disk():
-    global history, signal_active, signal_attempt, signal_col, signal_lost, trend_msg_id, last_result
+    global history, signal_active, signal_attempt, signal_col, signal_lost, trend_msg_id, stats_msg_id, last_result, daily_wins, daily_losses, consecutive_wins
     try:
         if os.path.exists(PERSIST_FILE):
             with open(PERSIST_FILE, 'r') as f:
@@ -119,7 +131,11 @@ def load_from_disk():
             signal_col = data.get("signal_col", 1)
             signal_lost = data.get("signal_lost", 0.0)
             trend_msg_id = data.get("trend_msg_id")
+            stats_msg_id = data.get("stats_msg_id")
             last_result = data.get("last_result")
+            daily_wins = data.get("daily_wins", 0)
+            daily_losses = data.get("daily_losses", 0)
+            consecutive_wins = data.get("consecutive_wins", 0)
             logger.info(f"Estado cargado desde disco: {len(history)} valores")
     except Exception as e:
         logger.warning(f"Error cargando estado: {e}")
@@ -174,16 +190,16 @@ def get_stats() -> dict:
 def build_trend_message(stats: dict) -> str:
     now  = argentina_time()
     last5 = list(history)[-5:][::-1] if history else []
-    last5_str = ", ".join(f"{v:.2f}x" for v in last5) if last5 else "—"
+    last5_str = " | ".join(f"{v:.2f}x" for v in last5) if last5 else "—"
 
     below2_ok = stats["pct_below2"] < UMBRAL_BELOW2
     two5_ok   = stats["pct_2to5"]   > UMBRAL_2TO5
 
     if stats["favorable"]:
-        header = f"🟢 TENDENCIA FAVORABLE — {now}"
+        header = f"🟢 <b>TENDENCIA FAVORABLE — {now}</b>"
         mark2  = "✅"
     else:
-        header = f"🔴 TENDENCIA DESFAVORABLE — {now}"
+        header = f"🔴 <b>TENDENCIA DESFAVORABLE — {now}</b>"
         mark2  = "❌"
     icon2 = "🟡"
 
@@ -191,32 +207,45 @@ def build_trend_message(stats: dict) -> str:
 
     return (
         f"{header}\n"
-        f"━━━━━━━━━━━━━━━━━━━━━━━\n"
-        f"📈 Análisis últimos {stats['total']} multiplicadores\n"
-        f"🔵 1.00-1.99x = {stats['below2']} — {stats['pct_below2']:.2f}%{below2_mark}\n"
-        f"{icon2} 2.00-4.99x = {stats['two_to_five']} — {stats['pct_2to5']:.2f}%{mark2}\n"
-        f"🆔 ({last5_str})"
+        f"<b>━━━━━━━━━━━━━━━━━━━━━━━</b>\n"
+        f"<b>📈 Análisis últimos {stats['total']} multiplicadores</b>\n"
+        f"<b>🔵 1.00-1.99x = {stats['below2']} — {stats['pct_below2']:.2f}%{below2_mark}</b>\n"
+        f"<b>{icon2} 2.00-4.99x = {stats['two_to_five']} — {stats['pct_2to5']:.2f}%{mark2}</b>\n"
+        f"<b>🆔 ({last5_str})</b>"
     )
 
 # ─── MENSAJES DE SEÑAL ────────────────────────────────────────────────────────
 def build_signal_message() -> str:
     return (
-        "✅<b>ENTRADA CONFIRMADA</b>✅\n\n"
-        f"👉<b> INGRESAR DESPUÉS: {CASHOUT_TRIGGER:.2f}x</b>\n"
-        f"💰<b> RETIRAR EN: {CASHOUT_TARGET:.2f}x</b>\n\n"
-        f"🔁 <b>MÁXIMO {MAX_GALES} GALES</b>"
+        "<b>✅ ENTRADA CONFIRMADA ✅</b>\n\n"
+        f"<b>👉 INGRESAR DESPUÉS: {CASHOUT_TRIGGER:.2f}x</b>\n"
+        f"<b>💰 RETIRAR EN: {CASHOUT_TARGET:.2f}x</b>\n\n"
+        f"<b>🔁 MÁXIMO {MAX_GALES} GALES</b>"
     )
 
 def build_win_message(result: float) -> str:
     return (
-        "🍀🍀🍀 GANAMOS!!! 🍀🍀🍀\n"
-        f"✅ Resultado: {result:.2f}x"
+        "<b>🍀🍀🍀 GANAMOS!!! 🍀🍀🍀</b>\n"
+        f"<b>✅ Resultado: {result:.2f}</b>"
     )
 
 def build_loss_message(result: float) -> str:
     return (
-        "🔴 PERDIMOS!!! 🔴\n"
-        f"❌ Resultado: {result:.2f}x"
+        "<b>🔴 PERDIMOS!!! 🔴</b>\n"
+        f"<b>❌ Resultado: {result:.2f}</b>"
+    )
+
+def build_stats_message() -> str:
+    """Construye el mensaje de estadísticas del día."""
+    total_operations = daily_wins + daily_losses
+    win_percentage = 0.0
+    if total_operations > 0:
+        win_percentage = (daily_wins / total_operations) * 100
+    
+    return (
+        f"🚀 <b>Resultado del día ✅ {daily_wins} ⭕ {daily_losses}</b>\n"
+        f"💎 <b>Acertamos el {win_percentage:.2f}% de las veces</b>\n"
+        f"📈 <b>¡Tenemos {consecutive_wins} victorias consecutivas!</b>"
     )
 
 # ─── LÓGICA DE SEÑALES — EMA cruce ───────────────────────────────────────────
@@ -256,7 +285,8 @@ def check_signal_2x(vals: List[float]) -> bool:
 async def process_new_value(value: float, silent: bool = False):
     """Llamado con cada nueva cuota en vivo."""
     global signal_active, signal_attempt, signal_col, signal_lost
-    global trend_msg_id, last_result, history
+    global trend_msg_id, stats_msg_id, last_result, history
+    global daily_wins, daily_losses, consecutive_wins
 
     history.append(value)
     if len(history) > HISTORY_MAX:
@@ -277,8 +307,18 @@ async def process_new_value(value: float, silent: bool = False):
             signal_attempt = 1
             signal_col     = 1
             signal_lost    = 0.0
+            
+            # Actualizar estadísticas
+            daily_wins += 1
+            consecutive_wins += 1
+            
             await send_message(build_win_message(value))
             logger.info(f"GANAMOS {value:.2f}x en intento {signal_attempt} col {signal_col}")
+            
+            # Eliminar mensaje de estadísticas anterior y enviar uno nuevo
+            if stats_msg_id:
+                await delete_message(stats_msg_id)
+            stats_msg_id = await send_message(build_stats_message())
         else:
             # PERDIMOS este intento
             if signal_attempt < (MAX_GALES + 1):
@@ -297,8 +337,18 @@ async def process_new_value(value: float, silent: bool = False):
                     signal_active  = False
                     signal_col     = 1
                     signal_lost    = 0.0
+                    
+                    # Actualizar estadísticas
+                    daily_losses += 1
+                    consecutive_wins = 0
+                    
                     await send_message(build_loss_message(value))
                     logger.info(f"PERDIMOS {value:.2f}x — 3 columnas agotadas")
+                    
+                    # Eliminar mensaje de estadísticas anterior y enviar uno nuevo
+                    if stats_msg_id:
+                        await delete_message(stats_msg_id)
+                    stats_msg_id = await send_message(build_stats_message())
                 else:
                     logger.info(f"Col {signal_col - 1} agotada → esperando señal en Col {signal_col}")
                     signal_active = False
