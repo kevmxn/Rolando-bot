@@ -46,8 +46,8 @@ def argentina_time() -> str:
     return (datetime.utcnow() - timedelta(hours=3)).strftime("%H:%M")
 
 # Umbrales de filtro (últimos 100 multiplicadores)
-UMBRAL_BELOW2  = 52   # <2x debe ser MENOR a este %
-UMBRAL_2TO5    = 28   # 2-5x debe ser MAYOR a este %
+UMBRAL_BELOW2  = 53   # <2x debe ser MENOR a este %
+UMBRAL_2TO5    = 27   # 2-5x debe ser MAYOR a este %
 HISTORY_MAX    = 100
 
 # Estrategia 2x
@@ -190,7 +190,7 @@ def get_stats() -> dict:
 def build_trend_message(stats: dict) -> str:
     now  = argentina_time()
     last5 = list(history)[-5:][::-1] if history else []
-    last5_str = " | ".join(f"{v:.2f}x" for v in last5) if last5 else "—"
+    last5_str = ", ".join(f"{v:.2f}x" for v in last5) if last5 else "—"
 
     below2_ok = stats["pct_below2"] < UMBRAL_BELOW2
     two5_ok   = stats["pct_2to5"]   > UMBRAL_2TO5
@@ -247,6 +247,22 @@ def build_stats_message() -> str:
         f"💎 <b>Acertamos el {win_percentage:.2f}% de las veces</b>\n"
         f"📈 <b>¡Tenemos {consecutive_wins} victorias consecutivas!</b>"
     )
+
+async def send_stats_update():
+    """Envía actualización de estadísticas SOLO si no hay señal activa."""
+    global stats_msg_id
+    
+    # ⚠️ PROTECCIÓN: No actualizar estadísticas si hay señal activa
+    if signal_active:
+        logger.warning("⚠️ Intento de actualizar estadísticas con señal activa — rechazado")
+        return
+    
+    # Eliminar mensaje anterior si existe
+    if stats_msg_id:
+        await delete_message(stats_msg_id)
+    
+    # Enviar mensaje nuevo
+    stats_msg_id = await send_message(build_stats_message())
 
 # ─── LÓGICA DE SEÑALES — EMA cruce ───────────────────────────────────────────
 def calc_ema(values: List[float], period: int) -> List[float]:
@@ -315,10 +331,8 @@ async def process_new_value(value: float, silent: bool = False):
             await send_message(build_win_message(value))
             logger.info(f"GANAMOS {value:.2f}x en intento {signal_attempt} col {signal_col}")
             
-            # Eliminar mensaje de estadísticas anterior y enviar uno nuevo
-            if stats_msg_id:
-                await delete_message(stats_msg_id)
-            stats_msg_id = await send_message(build_stats_message())
+            # Enviar estadísticas (con protección: solo si no hay señal activa)
+            await send_stats_update()
         else:
             # PERDIMOS este intento
             if signal_attempt < (MAX_GALES + 1):
@@ -345,10 +359,8 @@ async def process_new_value(value: float, silent: bool = False):
                     await send_message(build_loss_message(value))
                     logger.info(f"PERDIMOS {value:.2f}x — 3 columnas agotadas")
                     
-                    # Eliminar mensaje de estadísticas anterior y enviar uno nuevo
-                    if stats_msg_id:
-                        await delete_message(stats_msg_id)
-                    stats_msg_id = await send_message(build_stats_message())
+                    # Enviar estadísticas (con protección: solo si no hay señal activa)
+                    await send_stats_update()
                 else:
                     logger.info(f"Col {signal_col - 1} agotada → esperando señal en Col {signal_col}")
                     signal_active = False
