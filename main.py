@@ -1,24 +1,24 @@
 #!/usr/bin/env python3
 """
-AVIATOR 2x Signal Bot — Telegram + Render
-Basado en versionanterior.py (estructura probada en Render)
+SPACEMAN 2x Signal Bot — Telegram + Render
 - WebSocket Pragmatic Play (Spaceman/Aviator)
 - Filtro de señales: <2x < 51% AND 2-5x > 29% (últimos 100)
 - Gestión Martingale 2×3: C1, C2, C3 · máx 1 gale por columna
 - Mensaje de tendencia cada nueva cuota (elimina el anterior)
 - No envía tendencia cuando hay señal activa
 - Flask + AsyncTeleBot + Webhook (compatible Render)
+- Persistencia: SQLite (reemplaza JSON)
+- Fix: señales huérfanas eliminadas
 """
 
 import asyncio
-import hashlib
+import sqlite3
 import threading
 import json
 import logging
 import os
-import time
 from datetime import datetime, timedelta
-from typing import Optional, List, Tuple
+from typing import Optional, List
 from flask import Flask, request
 import websockets
 from telebot.async_telebot import AsyncTeleBot
@@ -41,108 +41,171 @@ CASINO_ID = os.environ.get("CASINO_ID", "ppcdk00000005349")
 CURRENCY  = os.environ.get("CURRENCY", "BRL")
 GAME_ID   = int(os.environ.get("GAME_ID", "1301"))
 
-# Zona horaria Argentina
+DB_FILE = os.environ.get("DB_FILE", "spaceman.db")
+
 def argentina_time() -> str:
     return (datetime.utcnow() - timedelta(hours=3)).strftime("%H:%M")
 
 # Umbrales de filtro (últimos 100 multiplicadores)
-UMBRAL_BELOW2  = 53   # <2x debe ser MENOR a este %
-UMBRAL_2TO5    = 27   # 2-5x debe ser MAYOR a este %
+UMBRAL_BELOW2  = 53
+UMBRAL_2TO5    = 27
 HISTORY_MAX    = 100
 
 # Estrategia 2x
-CASHOUT_TRIGGER = 1.27   # entrada después de este multiplicador
-CASHOUT_TARGET  = 2.00   # retirar en
-MAX_GALES       = 1      # máximo 1 gale (2 intentos por columna)
-MAX_COLS        = 3      # C1, C2, C3
+CASHOUT_TARGET  = 2.00
+MAX_GALES       = 1
+MAX_COLS        = 3
 
-# ─── ESTADO GLOBAL ──────────────────────────────────────────────────────────
-history: list = []
+# ─── SQLITE — ESQUEMA ─────────────────────────────────────────────────────────
+def db_init():
+    """Crea tablas si no existen."""
+    con = sqlite3.connect(DB_FILE)
+    cur = con.cursor()
+    cur.executescript("""
+        CREATE TABLE IF NOT EXISTS history (
+            id        INTEGER PRIMARY KEY AUTOINCREMENT,
+            value     REAL    NOT NULL,
+            created   TEXT    NOT NULL DEFAULT (datetime('now'))
+        );
 
-# Señal activa
-signal_active   = False
-signal_attempt  = 1    # 1 = intento principal, 2 = gale
-signal_col      = 1    # columna actual 1..3
-signal_lost     = 0.0  # acumulado perdido en este ciclo
-signal_base_bet = 10.0 # apuesta base
+        CREATE TABLE IF NOT EXISTS state (
+            key   TEXT PRIMARY KEY,
+            value TEXT
+        );
+    """)
+    con.commit()
+    con.close()
 
-# Mensaje de tendencia (para editar/eliminar)
-trend_msg_id: Optional[int] = None
+def _db():
+    """Conexión SQLite con row_factory."""
+    con = sqlite3.connect(DB_FILE)
+    con.row_factory = sqlite3.Row
+    return con
 
-# Mensaje de estadísticas (para editar/eliminar)
-stats_msg_id: Optional[int] = None
+# ─── PERSISTENCIA — ESTADO ────────────────────────────────────────────────────
+_STATE_KEYS = [
+    "signal_active", "signal_attempt", "signal_col", "signal_lost",
+    "trend_msg_id", "stats_msg_id", "last_result",
+    "daily_wins", "daily_losses", "consecutive_wins",
+]
 
-# Última cuota registrada (evita duplicados)
-last_result: Optional[float] = None
+def save_state():
+    """Guarda todas las variables de estado en la tabla `state`."""
+    global signal_active, signal_attempt, signal_col, signal_lost
+    global trend_msg_id, stats_msg_id, last_result
+    global daily_wins, daily_losses, consecutive_wins
 
-# Historial cargado
-hist_loaded = False
-
-# Contadores de victorias y pérdidas del día
-daily_wins: int = 0
-daily_losses: int = 0
-consecutive_wins: int = 0
-
-# Contador para persistencia
-_persist_counter: int = 0
-PERSIST_FILE = "spaceman_history.json"
-
-# Variables para asyncio y threading
-bot = AsyncTeleBot(BOT_TOKEN, parse_mode='HTML')
-_main_loop: asyncio.AbstractEventLoop = None
-
-# ─── FLASK APP ────────────────────────────────────────────────────────────────
-flask_app = Flask(__name__)
-
-# ─── PERSISTENCIA ─────────────────────────────────────────────────────────────
-def save_to_disk():
-    global _persist_counter
+    values = {
+        "signal_active":    str(int(signal_active)),
+        "signal_attempt":   str(signal_attempt),
+        "signal_col":       str(signal_col),
+        "signal_lost":      str(signal_lost),
+        "trend_msg_id":     str(trend_msg_id) if trend_msg_id is not None else "",
+        "stats_msg_id":     str(stats_msg_id) if stats_msg_id is not None else "",
+        "last_result":      str(last_result) if last_result is not None else "",
+        "daily_wins":       str(daily_wins),
+        "daily_losses":     str(daily_losses),
+        "consecutive_wins": str(consecutive_wins),
+    }
     try:
-        _persist_counter += 1
-        data = {
-            "history": list(history)[-HISTORY_MAX:],
-            "signal_active": signal_active,
-            "signal_attempt": signal_attempt,
-            "signal_col": signal_col,
-            "signal_lost": signal_lost,
-            "trend_msg_id": trend_msg_id,
-            "stats_msg_id": stats_msg_id,
-            "last_result": last_result,
-            "daily_wins": daily_wins,
-            "daily_losses": daily_losses,
-            "consecutive_wins": consecutive_wins,
-        }
-        with open(PERSIST_FILE, 'w') as f:
-            json.dump(data, f)
-        if _persist_counter % 50 == 0:
-            logger.debug(f"Guardado en disco (contador={_persist_counter})")
+        con = _db()
+        cur = con.cursor()
+        cur.executemany(
+            "INSERT INTO state(key,value) VALUES(?,?) "
+            "ON CONFLICT(key) DO UPDATE SET value=excluded.value",
+            list(values.items())
+        )
+        con.commit()
+        con.close()
     except Exception as e:
         logger.warning(f"Error guardando estado: {e}")
 
-def load_from_disk():
-    global history, signal_active, signal_attempt, signal_col, signal_lost, trend_msg_id, stats_msg_id, last_result, daily_wins, daily_losses, consecutive_wins
+def load_state():
+    """Carga variables de estado desde la tabla `state`."""
+    global signal_active, signal_attempt, signal_col, signal_lost
+    global trend_msg_id, stats_msg_id, last_result
+    global daily_wins, daily_losses, consecutive_wins
+
     try:
-        if os.path.exists(PERSIST_FILE):
-            with open(PERSIST_FILE, 'r') as f:
-                data = json.load(f)
-            history = data.get("history", [])
-            signal_active = data.get("signal_active", False)
-            signal_attempt = data.get("signal_attempt", 1)
-            signal_col = data.get("signal_col", 1)
-            signal_lost = data.get("signal_lost", 0.0)
-            trend_msg_id = data.get("trend_msg_id")
-            stats_msg_id = data.get("stats_msg_id")
-            last_result = data.get("last_result")
-            daily_wins = data.get("daily_wins", 0)
-            daily_losses = data.get("daily_losses", 0)
-            consecutive_wins = data.get("consecutive_wins", 0)
-            logger.info(f"Estado cargado desde disco: {len(history)} valores")
+        con = _db()
+        rows = con.execute("SELECT key, value FROM state").fetchall()
+        con.close()
+        d = {r["key"]: r["value"] for r in rows}
+
+        signal_active    = bool(int(d.get("signal_active", "0")))
+        signal_attempt   = int(d.get("signal_attempt", "1"))
+        signal_col       = int(d.get("signal_col", "1"))
+        signal_lost      = float(d.get("signal_lost", "0.0"))
+        _tid             = d.get("trend_msg_id", "")
+        trend_msg_id     = int(_tid) if _tid else None
+        _sid             = d.get("stats_msg_id", "")
+        stats_msg_id     = int(_sid) if _sid else None
+        _lr              = d.get("last_result", "")
+        last_result      = float(_lr) if _lr else None
+        daily_wins       = int(d.get("daily_wins", "0"))
+        daily_losses     = int(d.get("daily_losses", "0"))
+        consecutive_wins = int(d.get("consecutive_wins", "0"))
+
+        logger.info(f"Estado cargado desde SQLite | señal_activa={signal_active} col={signal_col}")
     except Exception as e:
         logger.warning(f"Error cargando estado: {e}")
 
+# ─── PERSISTENCIA — HISTORIAL ─────────────────────────────────────────────────
+def save_value(value: float):
+    """Inserta un valor en la tabla history y poda los más viejos."""
+    try:
+        con = _db()
+        con.execute("INSERT INTO history(value) VALUES(?)", (value,))
+        # Mantener solo los últimos HISTORY_MAX registros
+        con.execute("""
+            DELETE FROM history WHERE id NOT IN (
+                SELECT id FROM history ORDER BY id DESC LIMIT ?
+            )
+        """, (HISTORY_MAX,))
+        con.commit()
+        con.close()
+    except Exception as e:
+        logger.warning(f"Error insertando en history: {e}")
+
+def load_history() -> List[float]:
+    """Carga los últimos HISTORY_MAX valores ordenados (más antiguo primero)."""
+    try:
+        con = _db()
+        rows = con.execute(
+            "SELECT value FROM history ORDER BY id DESC LIMIT ?", (HISTORY_MAX,)
+        ).fetchall()
+        con.close()
+        return [r["value"] for r in reversed(rows)]
+    except Exception as e:
+        logger.warning(f"Error cargando history: {e}")
+        return []
+
+# ─── ESTADO GLOBAL ────────────────────────────────────────────────────────────
+history: List[float] = []
+
+signal_active   = False
+signal_attempt  = 1
+signal_col      = 1
+signal_lost     = 0.0
+signal_base_bet = 10.0
+
+trend_msg_id: Optional[int]  = None
+stats_msg_id: Optional[int]  = None
+last_result: Optional[float] = None
+
+hist_loaded = False
+
+daily_wins: int       = 0
+daily_losses: int     = 0
+consecutive_wins: int = 0
+
+# ─── Bot + Flask ───────────────────────────────────────────────────────────────
+bot = AsyncTeleBot(BOT_TOKEN, parse_mode='HTML')
+_main_loop: asyncio.AbstractEventLoop = None
+flask_app = Flask(__name__)
+
 # ─── TELEGRAM HELPERS ─────────────────────────────────────────────────────────
 async def send_message(text: str, parse_mode: str = "HTML") -> Optional[int]:
-    """Envía mensaje y devuelve message_id."""
     try:
         msg = await bot.send_message(CHAT_ID, text, parse_mode=parse_mode)
         return msg.message_id
@@ -168,12 +231,11 @@ async def delete_message(msg_id: int) -> bool:
 
 # ─── ANÁLISIS DE TENDENCIA ────────────────────────────────────────────────────
 def get_stats() -> dict:
-    """Estadísticas de los últimos 100 multiplicadores."""
     total = len(history)
     if total == 0:
         return {"total": 0, "below2": 0, "two_to_five": 0,
                 "pct_below2": 0.0, "pct_2to5": 0.0, "favorable": False}
-    below2     = sum(1 for v in history if v < 2.00)
+    below2      = sum(1 for v in history if v < 2.00)
     two_to_five = sum(1 for v in history if 2.00 <= v < 5.00)
     pct_below2  = (below2 / total) * 100
     pct_2to5    = (two_to_five / total) * 100
@@ -188,8 +250,8 @@ def get_stats() -> dict:
     }
 
 def build_trend_message(stats: dict) -> str:
-    now  = argentina_time()
-    last5 = list(history)[-5:][::-1] if history else []
+    now    = argentina_time()
+    last5  = list(history)[-5:][::-1] if history else []
     last5_str = ", ".join(f"{v:.2f}x" for v in last5) if last5 else "—"
 
     below2_ok = stats["pct_below2"] < UMBRAL_BELOW2
@@ -201,7 +263,6 @@ def build_trend_message(stats: dict) -> str:
     else:
         header = f"🔴 <b>TENDENCIA DESFAVORABLE — {now}</b>"
         mark2  = "❌"
-    icon2 = "🟡"
 
     below2_mark = "✅" if below2_ok else "❌"
 
@@ -210,22 +271,14 @@ def build_trend_message(stats: dict) -> str:
         f"<b>━━━━━━━━━━━━━━━━━━━━━━━</b>\n"
         f"<b>📈 Análisis últimos {stats['total']} multiplicadores</b>\n"
         f"<b>🔵 1.00-1.99x = {stats['below2']} — {stats['pct_below2']:.2f}%{below2_mark}</b>\n"
-        f"<b>{icon2} 2.00-4.99x = {stats['two_to_five']} — {stats['pct_2to5']:.2f}%{mark2}</b>\n"
+        f"<b>🟡 2.00-4.99x = {stats['two_to_five']} — {stats['pct_2to5']:.2f}%{mark2}</b>\n"
         f"<b>🆔 ({last5_str})</b>"
     )
 
 # ─── MENSAJES DE SEÑAL ────────────────────────────────────────────────────────
 def build_signal_message(last_value: float = None) -> str:
-    """
-    Construye el mensaje de la señal.
-    
-    Args:
-        last_value: Último multiplicador antes de la señal (para mostrar dinámicamente)
-    """
-    # Si no se proporciona, usar el valor constante
     if last_value is None:
         last_value = CASHOUT_TRIGGER
-    
     return (
         "<b>✅ ENTRADA CONFIRMADA ✅</b>\n\n"
         f"<b>👉 INGRESAR DESPUÉS: {last_value:.2f}x</b>\n"
@@ -233,209 +286,194 @@ def build_signal_message(last_value: float = None) -> str:
         f"<b>🔁 MÁXIMO {MAX_GALES} GALES</b>"
     )
 
+def build_gale_message(col: int, attempt: int) -> str:
+    return (
+        f"<b>🔄 GALE — Col {col} · Intento {attempt}</b>\n"
+        f"<b>💰 RETIRAR EN: {CASHOUT_TARGET:.2f}x</b>"
+    )
+
 def build_win_message(result: float) -> str:
     return (
         "<b>🍀🍀🍀 GANAMOS!!! 🍀🍀🍀</b>\n"
-        f"<b>✅ Resultado: {result:.2f}</b>"
+        f"<b>✅ Resultado: {result:.2f}x</b>"
     )
 
 def build_loss_message(result: float) -> str:
     return (
         "<b>🔴 PERDIMOS!!! 🔴</b>\n"
-        f"<b>❌ Resultado: {result:.2f}</b>"
+        f"<b>❌ Resultado: {result:.2f}x</b>"
     )
 
+
+
 def build_stats_message() -> str:
-    """Construye el mensaje de estadísticas del día."""
-    total_operations = daily_wins + daily_losses
-    win_percentage = 0.0
-    if total_operations > 0:
-        win_percentage = (daily_wins / total_operations) * 100
-    
+    total_ops = daily_wins + daily_losses
+    win_pct   = (daily_wins / total_ops * 100) if total_ops > 0 else 0.0
     return (
         f"🚀 <b>Resultado del día ✅ {daily_wins} ⭕ {daily_losses}</b>\n"
-        f"💎 <b>Acertamos el {win_percentage:.2f}% de las veces</b>\n"
+        f"💎 <b>Acertamos el {win_pct:.2f}% de las veces</b>\n"
         f"📈 <b>¡Tenemos {consecutive_wins} victorias consecutivas!</b>"
     )
 
 async def send_stats_update():
-    """Envía actualización de estadísticas SOLO si no hay señal activa."""
     global stats_msg_id
-    
-    # ⚠️ PROTECCIÓN: No actualizar estadísticas si hay señal activa
     if signal_active:
-        logger.warning("⚠️ Intento de actualizar estadísticas con señal activa — rechazado")
         return
-    
-    # Eliminar mensaje anterior si existe
     if stats_msg_id:
         await delete_message(stats_msg_id)
-    
-    # Enviar mensaje nuevo
     stats_msg_id = await send_message(build_stats_message())
 
 # ─── LÓGICA DE SEÑALES — EMA cruce ───────────────────────────────────────────
 def calc_ema(values: List[float], period: int) -> List[float]:
     if not values:
         return []
-    k = 2 / (period + 1)
+    k   = 2 / (period + 1)
     ema = [values[0]]
     for v in values[1:]:
         ema.append(v * k + ema[-1] * (1 - k))
     return ema
 
 def check_signal_2x(vals: List[float]) -> bool:
-    """
-    Detecta señal 2x:
-    Cruce alcista EMA4 sobre EMA20 + filtro de porcentajes.
-    """
     if len(vals) < 20:
         return False
-
     stats = get_stats()
     if not stats["favorable"]:
         return False
-
     ema4_series  = calc_ema(vals, 4)
     ema20_series = calc_ema(vals, 20)
-
-    cur_ema4  = ema4_series[-1]
-    cur_ema20 = ema20_series[-1]
-    prev_ema4  = ema4_series[-2] if len(ema4_series) > 1 else cur_ema4
+    cur_ema4   = ema4_series[-1]
+    cur_ema20  = ema20_series[-1]
+    prev_ema4  = ema4_series[-2]  if len(ema4_series)  > 1 else cur_ema4
     prev_ema20 = ema20_series[-2] if len(ema20_series) > 1 else cur_ema20
+    return (prev_ema4 <= prev_ema20) and (cur_ema4 > cur_ema20)
 
-    crossed = (prev_ema4 <= prev_ema20) and (cur_ema4 > cur_ema20)
-    return crossed
-
-# ─── PROCESAMIENTO DE CADA NUEVA CUOTA ────────────────────────────────────────
+# ─── PROCESAMIENTO DE CADA NUEVA CUOTA ───────────────────────────────────────
 async def process_new_value(value: float, silent: bool = False):
-    """Llamado con cada nueva cuota en vivo."""
+    """
+    Llamado con cada nueva cuota en vivo.
+    MÁQUINA DE ESTADOS:
+        idle  → detectar señal → activo (intento 1)
+        activo:
+            win  → idle + stats
+            loss:
+                attempt < MAX_GALES+1 → gale (attempt++)
+                attempt == MAX_GALES+1:
+                    col < MAX_COLS → siguiente columna (col++, signal_active=False,
+                                      espera nueva señal para col siguiente)
+                    col == MAX_COLS → perdida total → idle + stats
+    """
     global signal_active, signal_attempt, signal_col, signal_lost
     global trend_msg_id, stats_msg_id, last_result, history
     global daily_wins, daily_losses, consecutive_wins
 
+    # ── Actualizar historial en memoria y SQLite ──
     history.append(value)
     if len(history) > HISTORY_MAX:
         history = history[-HISTORY_MAX:]
+    save_value(value)
 
     if silent:
-        return   # cargando historial, no enviar nada
+        return
 
-    logger.info(f"Nueva cuota: {value:.2f}x | historial: {len(history)} | señal_activa: {signal_active}")
+    logger.info(
+        f"Nueva cuota: {value:.2f}x | historial: {len(history)} "
+        f"| señal_activa: {signal_active} | col: {signal_col} | intento: {signal_attempt}"
+    )
 
-    # ── VERIFICACIÓN DE RECUPERACIÓN: Señal huérfana (bot reinició mientras había señal activa) ──
-    # Esto detecta si una señal se quedó activa sin resolverse
-    if signal_active and value > 0:
-        # Si la cuota es viable para resolver (> 1.00), usarla para resolver la señal pendiente
-        logger.warning(f"⚠️ RECUPERACIÓN: Señal huérfana detectada. Resolviendo con valor {value:.2f}x")
-        # El código continúa y resolverá la señal naturalmente en la sección "Resolver señal activa"
-
-    # ── Resolver señal activa ──
+    # ── Resolver señal activa ──────────────────────────────────────────────────
     if signal_active:
         win = value >= CASHOUT_TARGET
 
         if win:
-            # GANAMOS en cualquier intento
+            # ── GANAMOS ──
+            logger.info(f"✅ GANAMOS {value:.2f}x en intento {signal_attempt} col {signal_col}")
             signal_active  = False
             signal_attempt = 1
             signal_col     = 1
             signal_lost    = 0.0
-            
-            # Actualizar estadísticas
-            daily_wins += 1
+            daily_wins    += 1
             consecutive_wins += 1
-            
-            try:
-                await send_message(build_win_message(value))
-                logger.info(f"✅ GANAMOS {value:.2f}x en intento {signal_attempt} col {signal_col}")
-            except Exception as e:
-                logger.error(f"❌ Error enviando mensaje de victoria: {e}")
-            
-            try:
-                # Enviar estadísticas (con protección: solo si no hay señal activa)
-                await send_stats_update()
-            except Exception as e:
-                logger.error(f"❌ Error enviando estadísticas después de victoria: {e}")
-            
-            # Guardar estado
-            save_to_disk()
+            save_state()
+            await send_message(build_win_message(value))
+            await send_stats_update()
+
         else:
-            # PERDIMOS este intento
+            # ── PERDIMOS este intento ──
+            logger.info(
+                f"❌ Perdido {value:.2f}x | intento {signal_attempt}/{MAX_GALES+1} col {signal_col}/{MAX_COLS}"
+            )
+
             if signal_attempt < (MAX_GALES + 1):
-                # Hay gale disponible
+                # Hay gale disponible en esta columna
                 signal_attempt += 1
-                signal_lost += 1
-                logger.info(f"PERDIDO intento {signal_attempt - 1}, esperando gale...")
+                signal_lost    += 1
+                save_state()
+                logger.info(f"↩️  Gale {signal_attempt} en col {signal_col} — esperando próxima ronda")
+                await send_message(build_gale_message(signal_col, signal_attempt))
+
             else:
-                # Agotamos gales en esta columna
-                signal_attempt = 1
-                signal_col += 1
-                signal_lost += 1
+                # Agotamos gales en la columna actual
+                signal_attempt  = 1
+                signal_lost    += 1
+                completed_col   = signal_col
+                signal_col     += 1
 
                 if signal_col > MAX_COLS:
-                    # Perdimos las 3 columnas
+                    # ── Perdimos las 3 columnas ──
+                    logger.info(f"❌ PERDIMOS — 3 columnas agotadas")
                     signal_active  = False
                     signal_col     = 1
                     signal_lost    = 0.0
-                    
-                    # Actualizar estadísticas
-                    daily_losses += 1
+                    daily_losses  += 1
                     consecutive_wins = 0
-                    
-                    try:
-                        await send_message(build_loss_message(value))
-                        logger.info(f"❌ PERDIMOS {value:.2f}x — 3 columnas agotadas")
-                    except Exception as e:
-                        logger.error(f"❌ Error enviando mensaje de pérdida: {e}")
-                    
-                    try:
-                        # Enviar estadísticas (con protección: solo si no hay señal activa)
-                        await send_stats_update()
-                    except Exception as e:
-                        logger.error(f"❌ Error enviando estadísticas después de pérdida: {e}")
-                    
-                    # Guardar estado
-                    save_to_disk()
+                    save_state()
+                    await send_message(build_loss_message(value))
+                    await send_stats_update()
+
                 else:
-                    logger.info(f"Col {signal_col - 1} agotada → esperando señal en Col {signal_col}")
-                    signal_active = False
+                    # ── Pasamos a siguiente columna; esperamos nueva señal ──
+                    logger.info(
+                        f"Col {completed_col} agotada → esperando nueva señal para Col {signal_col}"
+                    )
+                    signal_active = False   # idle hasta nueva señal
+                    save_state()
+                    await send_message(build_loss_message(value))
 
-        save_to_disk()
-        return
+        return  # No procesar tendencia ni nueva señal en la misma cuota
 
-    # ── Verificar si hay nueva señal ──
+    # ── Detectar nueva señal ───────────────────────────────────────────────────
+    # Si signal_col > 1 el ciclo está en curso; la señal reanuda la siguiente columna
     vals = list(history)
     if check_signal_2x(vals):
         signal_active  = True
         signal_attempt = 1
-        # Obtener el último multiplicador para mostrar en la señal
-        last_value = vals[-1] if vals else CASHOUT_TRIGGER
+        last_value     = vals[-1] if vals else CASHOUT_TRIGGER
+        save_state()
         await send_message(build_signal_message(last_value=last_value))
-        logger.info(f"SEÑAL 2x enviada | pct<2={get_stats()['pct_below2']:.1f}% 2-5={get_stats()['pct_2to5']:.1f}%")
-        # Eliminar tendencia si había
+        logger.info(
+            f"SEÑAL 2x enviada | pct<2={get_stats()['pct_below2']:.1f}% "
+            f"2-5={get_stats()['pct_2to5']:.1f}% | col={signal_col}"
+        )
         if trend_msg_id:
             await delete_message(trend_msg_id)
             trend_msg_id = None
-        save_to_disk()
+            save_state()
         return
 
-    # ── Enviar/actualizar mensaje de tendencia ──
+    # ── Mensaje de tendencia ───────────────────────────────────────────────────
     stats = get_stats()
     if len(history) < 10:
-        save_to_disk()
         return
 
     trend_text = build_trend_message(stats)
-
     if trend_msg_id:
         ok = await edit_message(trend_msg_id, trend_text)
         if not ok:
-            # Fue borrado externamente, reenviar
             trend_msg_id = await send_message(trend_text)
+            save_state()
     else:
         trend_msg_id = await send_message(trend_text)
-
-    save_to_disk()
+        save_state()
 
 # ─── WEBSOCKET — PRAGMATIC PLAY ──────────────────────────────────────────────
 async def ws_loop():
@@ -451,12 +489,11 @@ async def ws_loop():
                 ping_timeout=10,
                 close_timeout=5,
             ) as ws:
-                # Suscribirse
                 sub = {
-                    "type": "subscribe",
+                    "type":     "subscribe",
                     "casinoId": CASINO_ID,
                     "currency": CURRENCY,
-                    "key": [GAME_ID],
+                    "key":      [GAME_ID],
                 }
                 await ws.send(json.dumps(sub))
                 logger.info(f"Suscrito a game {GAME_ID}")
@@ -476,7 +513,9 @@ async def ws_loop():
                         hist = list(reversed(game_results))
                         logger.info(f"Cargando historial WS: {len(hist)} rondas")
                         for item in hist:
-                            val = item.get("result") or item.get("multiplier") or item.get("crashPoint")
+                            val = (item.get("result")
+                                   or item.get("multiplier")
+                                   or item.get("crashPoint"))
                             if val is not None:
                                 await process_new_value(float(val), silent=True)
                         hist_loaded = True
@@ -499,8 +538,8 @@ async def ws_loop():
 @flask_app.route('/')
 def home():
     stats = get_stats()
-    sig = 'activa' if signal_active else 'idle'
-    tend = '🟢' if stats['favorable'] else '🔴'
+    sig   = 'activa' if signal_active else 'idle'
+    tend  = '🟢' if stats['favorable'] else '🔴'
     return f"🤖 SpacemanBot | historial:{len(history)} | señal:{sig} | tendencia:{tend}", 200
 
 @flask_app.route('/webhook', methods=['POST'])
@@ -517,27 +556,29 @@ def webhook():
 def health():
     stats = get_stats()
     return {
-        "status": "ok",
+        "status":        "ok",
         "history_count": len(history),
         "signal_active": signal_active,
-        "favorable": stats["favorable"],
-        "pct_below2": round(stats["pct_below2"], 2),
-        "pct_2to5": round(stats["pct_2to5"], 2),
+        "signal_col":    signal_col,
+        "signal_attempt": signal_attempt,
+        "favorable":     stats["favorable"],
+        "pct_below2":    round(stats["pct_below2"], 2),
+        "pct_2to5":      round(stats["pct_2to5"], 2),
     }, 200
 
 @flask_app.route('/ping')
 def ping():
     return 'pong', 200
 
-# ─── TELEGRAM COMMANDS ─────────────────────────────────────────────────────────
+# ─── TELEGRAM COMMANDS ────────────────────────────────────────────────────────
 @bot.message_handler(commands=['start'])
 async def cmd_start(message):
-    name = message.from_user.first_name or "usuario"
+    name  = message.from_user.first_name or "usuario"
     stats = get_stats()
     await bot.reply_to(message,
         f"🚀 <b>¡Bienvenido {name}!</b>\n\n"
         "━━━━━━━━━━━━━━━━━━━━━━━\n"
-        "🤖 <b>AVIATOR BOT 2x</b>\n\n"
+        "🤖 <b>SPACEMAN BOT 2x</b>\n\n"
         f"🔵 <b>Señal 2x (EMA Cruce)</b>\n"
         f"   Objetivo: ≥ {CASHOUT_TARGET:.2f}x\n"
         f"   Entrada: Después de {CASHOUT_TRIGGER:.2f}x\n"
@@ -553,9 +594,12 @@ async def cmd_start(message):
 
 @bot.message_handler(commands=['stats'])
 async def cmd_stats(message):
-    stats = get_stats()
-    hora = argentina_time()
-    sig_txt = f"Intento {signal_attempt}/{MAX_GALES + 1} Col {signal_col}/{MAX_COLS}" if signal_active else "Idle"
+    stats   = get_stats()
+    hora    = argentina_time()
+    sig_txt = (
+        f"Intento {signal_attempt}/{MAX_GALES+1} Col {signal_col}/{MAX_COLS}"
+        if signal_active else "Idle"
+    )
     await bot.reply_to(message,
         f"📊 <b>ESTADÍSTICAS — {hora}</b>\n"
         "━━━━━━━━━━━━━━━━━━━━━━━\n"
@@ -564,10 +608,11 @@ async def cmd_stats(message):
         f"🟡 2-5x: {stats['two_to_five']} ({stats['pct_2to5']:.1f}%)\n"
         f"📈 Tendencia: {'🟢 FAVORABLE' if stats['favorable'] else '🔴 DESFAVORABLE'}\n"
         f"📡 Señal: <code>{sig_txt}</code>\n"
+        f"✅ Wins hoy: {daily_wins} | ❌ Losses: {daily_losses}\n"
         "━━━━━━━━━━━━━━━━━━━━━━━",
         parse_mode='HTML')
 
-# ─── ASYNCIO + FLASK ──────────────────────────────────────────────────────────
+# ─── ASYNCIO LOOP ─────────────────────────────────────────────────────────────
 async def self_ping_loop():
     render_url = os.environ.get('RENDER_EXTERNAL_URL', '')
     if not render_url:
@@ -585,24 +630,31 @@ async def self_ping_loop():
 async def main_async():
     global _main_loop
     _main_loop = asyncio.get_running_loop()
-    logger.info("🤖 Iniciando AVIATOR BOT 2x...")
-    load_from_disk()
-    
+
+    logger.info("🤖 Iniciando SPACEMAN BOT 2x...")
+    db_init()
+    load_state()
+
+    # Recuperar historial desde SQLite (sin recontar señales huérfanas)
+    loaded = load_history()
+    if loaded:
+        history.extend(loaded)
+        logger.info(f"Historial cargado desde SQLite: {len(history)} valores")
+
     await bot.set_my_commands([
         types.BotCommand('start', '🤖 Información del bot'),
         types.BotCommand('stats', '📊 Estadísticas'),
     ])
-    
+
     asyncio.create_task(ws_loop())
     asyncio.create_task(self_ping_loop())
-    
+
     render_url = os.environ.get('RENDER_EXTERNAL_URL', '').rstrip('/')
     if render_url:
         await bot.remove_webhook()
         await asyncio.sleep(1)
         await bot.set_webhook(url=f"{render_url}/webhook")
         logger.info(f"✅ Webhook: {render_url}/webhook")
-        # Mantener asyncio activo
         while True:
             await asyncio.sleep(3600)
     else:
@@ -615,6 +667,5 @@ def run_flask():
 
 # ─── MAIN ─────────────────────────────────────────────────────────────────────
 if __name__ == '__main__':
-    # Mensaje de inicio
     threading.Thread(target=run_flask, daemon=True).start()
     asyncio.run(main_async())
