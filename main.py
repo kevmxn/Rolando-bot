@@ -215,10 +215,20 @@ def build_trend_message(stats: dict) -> str:
     )
 
 # ─── MENSAJES DE SEÑAL ────────────────────────────────────────────────────────
-def build_signal_message() -> str:
+def build_signal_message(last_value: float = None) -> str:
+    """
+    Construye el mensaje de la señal.
+    
+    Args:
+        last_value: Último multiplicador antes de la señal (para mostrar dinámicamente)
+    """
+    # Si no se proporciona, usar el valor constante
+    if last_value is None:
+        last_value = CASHOUT_TRIGGER
+    
     return (
         "<b>✅ ENTRADA CONFIRMADA ✅</b>\n\n"
-        f"<b>👉 INGRESAR DESPUÉS: {CASHOUT_TRIGGER:.2f}x</b>\n"
+        f"<b>👉 INGRESAR DESPUÉS: {last_value:.2f}x</b>\n"
         f"<b>💰 RETIRAR EN: {CASHOUT_TARGET:.2f}x</b>\n\n"
         f"<b>🔁 MÁXIMO {MAX_GALES} GALES</b>"
     )
@@ -398,7 +408,9 @@ async def process_new_value(value: float, silent: bool = False):
     if check_signal_2x(vals):
         signal_active  = True
         signal_attempt = 1
-        await send_message(build_signal_message())
+        # Obtener el último multiplicador para mostrar en la señal
+        last_value = vals[-1] if vals else CASHOUT_TRIGGER
+        await send_message(build_signal_message(last_value=last_value))
         logger.info(f"SEÑAL 2x enviada | pct<2={get_stats()['pct_below2']:.1f}% 2-5={get_stats()['pct_2to5']:.1f}%")
         # Eliminar tendencia si había
         if trend_msg_id:
