@@ -47,8 +47,8 @@ def argentina_time() -> str:
     return (datetime.utcnow() - timedelta(hours=3)).strftime("%H:%M")
 
 # Umbrales de filtro (últimos 100 multiplicadores)
-UMBRAL_BELOW2  = 52.01
-UMBRAL_2TO5    = 27.99
+UMBRAL_BELOW2  = 51.01
+UMBRAL_2TO5    = 28.99
 HISTORY_MAX    = 150
 
 # Estrategia 2x
@@ -536,8 +536,11 @@ async def ws_loop():
                     if not game_results:
                         continue
 
-                    # Primer mensaje: historial grande
+                    # ── Historial inicial: primer mensaje con múltiples rondas ──
+                    # El servidor envía el array completo (más antiguo primero).
+                    # Lo procesamos silenciosamente solo si aún no cargamos historial.
                     if not hist_loaded and len(game_results) > 1:
+                        # El servidor envía del más reciente al más antiguo → invertir
                         hist = list(reversed(game_results))
                         logger.info(f"Cargando historial WS: {len(hist)} rondas")
                         for item in hist:
@@ -546,16 +549,48 @@ async def ws_loop():
                                    or item.get("crashPoint"))
                             if val is not None:
                                 await process_new_value(float(val), silent=True)
+                        # Guardar el resultado más reciente para evitar duplicado
+                        newest = game_results[0]
+                        last_result = (newest.get("result")
+                                       or newest.get("multiplier")
+                                       or newest.get("crashPoint"))
                         hist_loaded = True
-                        logger.info("Historial cargado — en vivo")
+                        logger.info(f"Historial cargado ({len(hist)} rondas) — en vivo")
                         continue
 
-                    # Mensaje en vivo: resultado único
-                    result = game_results[0].get("result")
-                    if result is not None and result != last_result:
-                        last_result = result
+                    # ── Mensaje en vivo: puede traer 1 o más resultados ──
+                    # Tomamos todos los que sean nuevos (el [0] es el más reciente)
+                    for item in game_results:
+                        val = (item.get("result")
+                               or item.get("multiplier")
+                               or item.get("crashPoint"))
+                        if val is None:
+                            continue
+                        val = float(val)
+                        if val == last_result:
+                            # Llegamos al punto que ya conocemos; detener
+                            break
+                        # Registrar en orden cronológico (el array viene más reciente primero)
+                        # Acumulamos nuevos y luego los procesamos del más antiguo al más nuevo
+                        pass
+
+                    # Re-iterar en orden cronológico (más antiguo primero)
+                    nuevos = []
+                    for item in game_results:
+                        val = (item.get("result")
+                               or item.get("multiplier")
+                               or item.get("crashPoint"))
+                        if val is None:
+                            continue
+                        val = float(val)
+                        if val == last_result:
+                            break
+                        nuevos.append(val)
+
+                    for val in reversed(nuevos):
+                        last_result = val
                         hist_loaded = True
-                        await process_new_value(float(result), silent=False)
+                        await process_new_value(val, silent=False)
 
         except Exception as e:
             logger.error(f"WS error: {e} — reconectando en {RECONNECT_DELAY}s")
