@@ -1,4 +1,4 @@
-en el#!/usr/bin/env python3
+#!/usr/bin/env python3
 """
 SPACEMAN 2x Signal Bot — Telegram + Render
 - WebSocket Pragmatic Play (Spaceman/Aviator)
