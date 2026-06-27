@@ -47,7 +47,7 @@ def argentina_time() -> str:
     return (datetime.utcnow() - timedelta(hours=3)).strftime("%H:%M")
 
 # Umbrales de filtro (últimos 100 multiplicadores)
-UMBRAL_BELOW2  = 51.01
+UMBRAL_BELOW2  = 51.51
 UMBRAL_2TO5    = 28.49
 HISTORY_MAX    = 150
 
