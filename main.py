@@ -47,8 +47,8 @@ def argentina_time() -> str:
     return (datetime.utcnow() - timedelta(hours=3)).strftime("%H:%M")
 
 # Umbrales de filtro (últimos 100 multiplicadores)
-UMBRAL_BELOW2  = 52.51
-UMBRAL_2TO5    = 28.49
+UMBRAL_BELOW2  = 51.51
+UMBRAL_2TO5    = 27.99
 HISTORY_MAX    = 150
 
 # Estrategia 2x
@@ -199,7 +199,6 @@ stats_msg_id: Optional[int]  = None
 signal_msg_id: Optional[int] = None   # mensaje de señal activa (para editar)
 last_result: Optional[float] = None
 
-hist_loaded = False
 
 daily_wins: int       = 0
 daily_losses: int     = 0      # ciclos completos de 3 cols perdidos
@@ -301,7 +300,7 @@ def build_signal_message(last_value: float = None, attempt: int = 1) -> str:
         "<b>✅ ENTRADA CONFIRMADA ✅</b>\n\n"
         f"<b>👉 INGRESAR DESPUÉS: {last_value:.2f}x</b>\n"
         f"<b>💰 RETIRAR EN: {CASHOUT_TARGET:.2f}x</b>\n\n"
-        f"{footer}\n"
+        f"{footer}"
     )
 
 def build_win_message(result: float) -> str:
@@ -505,18 +504,8 @@ async def process_new_value(value: float, silent: bool = False):
 
 # ─── WEBSOCKET — PRAGMATIC PLAY ──────────────────────────────────────────────
 async def ws_loop():
-    global hist_loaded, last_result
+    global last_result
     RECONNECT_DELAY = 5
-
-    def _get_key(item: dict):
-        """Clave única de ronda: roundId si existe, sino el valor como string."""
-        rid = (item.get("roundId") or item.get("gameRoundId")
-               or item.get("id") or item.get("round"))
-        if rid is not None:
-            return str(rid)
-        val = (item.get("result") or item.get("multiplier")
-               or item.get("crashPoint"))
-        return str(val) if val is not None else None
 
     def _get_val(item: dict):
         v = (item.get("result") or item.get("multiplier")
@@ -541,8 +530,6 @@ async def ws_loop():
                 await ws.send(json.dumps(sub))
                 logger.info(f"Suscrito a game {GAME_ID}")
 
-                seen: set = set()   # claves ya procesadas en esta conexión
-
                 async for raw in ws:
                     try:
                         data = json.loads(raw)
@@ -553,37 +540,15 @@ async def ws_loop():
                     if not game_results:
                         continue
 
-                    # ── Historial inicial: primer mensaje ──
-                    if not hist_loaded:
-                        hist = list(reversed(game_results))   # más antiguo primero
-                        logger.info(f"Cargando historial WS: {len(hist)} rondas")
-                        for item in hist:
-                            val = _get_val(item)
-                            key = _get_key(item)
-                            if val is not None and key is not None:
-                                seen.add(key)
-                                await process_new_value(val, silent=True)
-                        newest = game_results[0]
-                        last_result = _get_val(newest)
-                        hist_loaded = True
-                        logger.info(f"Historial cargado ({len(hist)} rondas) — en vivo")
+                    # Solo el resultado más reciente (gameResults[0])
+                    val = _get_val(game_results[0])
+                    if val is None or val == last_result:
                         continue
-
-                    # ── En vivo: solo gameResults[0] (el más reciente) ──
-                    newest = game_results[0]
-                    key = _get_key(newest)
-                    val = _get_val(newest)
-                    if val is None or key is None:
-                        continue
-                    if key in seen:
-                        continue   # ronda ya procesada, ignorar
-                    seen.add(key)
                     last_result = val
                     await process_new_value(val, silent=False)
 
         except Exception as e:
             logger.error(f"WS error: {e} — reconectando en {RECONNECT_DELAY}s")
-            hist_loaded = False
             await asyncio.sleep(RECONNECT_DELAY)
 
 # ─── FLASK ROUTES ─────────────────────────────────────────────────────────────
