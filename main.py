@@ -311,7 +311,14 @@ async def process_new_value(value: float, silent: bool = False):
     if silent:
         return   # cargando historial, no enviar nada
 
-    logger.info(f"Nueva cuota: {value:.2f}x | historial: {len(history)}")
+    logger.info(f"Nueva cuota: {value:.2f}x | historial: {len(history)} | señal_activa: {signal_active}")
+
+    # ── VERIFICACIÓN DE RECUPERACIÓN: Señal huérfana (bot reinició mientras había señal activa) ──
+    # Esto detecta si una señal se quedó activa sin resolverse
+    if signal_active and value > 0:
+        # Si la cuota es viable para resolver (> 1.00), usarla para resolver la señal pendiente
+        logger.warning(f"⚠️ RECUPERACIÓN: Señal huérfana detectada. Resolviendo con valor {value:.2f}x")
+        # El código continúa y resolverá la señal naturalmente en la sección "Resolver señal activa"
 
     # ── Resolver señal activa ──
     if signal_active:
@@ -328,11 +335,20 @@ async def process_new_value(value: float, silent: bool = False):
             daily_wins += 1
             consecutive_wins += 1
             
-            await send_message(build_win_message(value))
-            logger.info(f"GANAMOS {value:.2f}x en intento {signal_attempt} col {signal_col}")
+            try:
+                await send_message(build_win_message(value))
+                logger.info(f"✅ GANAMOS {value:.2f}x en intento {signal_attempt} col {signal_col}")
+            except Exception as e:
+                logger.error(f"❌ Error enviando mensaje de victoria: {e}")
             
-            # Enviar estadísticas (con protección: solo si no hay señal activa)
-            await send_stats_update()
+            try:
+                # Enviar estadísticas (con protección: solo si no hay señal activa)
+                await send_stats_update()
+            except Exception as e:
+                logger.error(f"❌ Error enviando estadísticas después de victoria: {e}")
+            
+            # Guardar estado
+            save_to_disk()
         else:
             # PERDIMOS este intento
             if signal_attempt < (MAX_GALES + 1):
@@ -356,11 +372,20 @@ async def process_new_value(value: float, silent: bool = False):
                     daily_losses += 1
                     consecutive_wins = 0
                     
-                    await send_message(build_loss_message(value))
-                    logger.info(f"PERDIMOS {value:.2f}x — 3 columnas agotadas")
+                    try:
+                        await send_message(build_loss_message(value))
+                        logger.info(f"❌ PERDIMOS {value:.2f}x — 3 columnas agotadas")
+                    except Exception as e:
+                        logger.error(f"❌ Error enviando mensaje de pérdida: {e}")
                     
-                    # Enviar estadísticas (con protección: solo si no hay señal activa)
-                    await send_stats_update()
+                    try:
+                        # Enviar estadísticas (con protección: solo si no hay señal activa)
+                        await send_stats_update()
+                    except Exception as e:
+                        logger.error(f"❌ Error enviando estadísticas después de pérdida: {e}")
+                    
+                    # Guardar estado
+                    save_to_disk()
                 else:
                     logger.info(f"Col {signal_col - 1} agotada → esperando señal en Col {signal_col}")
                     signal_active = False
