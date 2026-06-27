@@ -47,7 +47,7 @@ def argentina_time() -> str:
     return (datetime.utcnow() - timedelta(hours=3)).strftime("%H:%M")
 
 # Umbrales de filtro (últimos 100 multiplicadores)
-UMBRAL_BELOW2  = 51.51
+UMBRAL_BELOW2  = 52.51
 UMBRAL_2TO5    = 28.49
 HISTORY_MAX    = 150
 
@@ -508,6 +508,21 @@ async def ws_loop():
     global hist_loaded, last_result
     RECONNECT_DELAY = 5
 
+    def _get_key(item: dict):
+        """Clave única de ronda: roundId si existe, sino el valor como string."""
+        rid = (item.get("roundId") or item.get("gameRoundId")
+               or item.get("id") or item.get("round"))
+        if rid is not None:
+            return str(rid)
+        val = (item.get("result") or item.get("multiplier")
+               or item.get("crashPoint"))
+        return str(val) if val is not None else None
+
+    def _get_val(item: dict):
+        v = (item.get("result") or item.get("multiplier")
+             or item.get("crashPoint"))
+        return float(v) if v is not None else None
+
     while True:
         try:
             logger.info(f"Conectando WebSocket: {WS_URL}")
@@ -526,6 +541,8 @@ async def ws_loop():
                 await ws.send(json.dumps(sub))
                 logger.info(f"Suscrito a game {GAME_ID}")
 
+                seen: set = set()   # claves ya procesadas en esta conexión
+
                 async for raw in ws:
                     try:
                         data = json.loads(raw)
@@ -536,38 +553,33 @@ async def ws_loop():
                     if not game_results:
                         continue
 
-                    # ── Historial inicial: primer mensaje con múltiples rondas ──
+                    # ── Historial inicial: primer mensaje ──
                     if not hist_loaded:
                         hist = list(reversed(game_results))   # más antiguo primero
                         logger.info(f"Cargando historial WS: {len(hist)} rondas")
                         for item in hist:
-                            val = (item.get("result")
-                                   or item.get("multiplier")
-                                   or item.get("crashPoint"))
-                            if val is not None:
-                                await process_new_value(float(val), silent=True)
-                        # El [0] es el más reciente; lo guardamos para deduplicar en vivo
+                            val = _get_val(item)
+                            key = _get_key(item)
+                            if val is not None and key is not None:
+                                seen.add(key)
+                                await process_new_value(val, silent=True)
                         newest = game_results[0]
-                        last_result = float(
-                            newest.get("result")
-                            or newest.get("multiplier")
-                            or newest.get("crashPoint")
-                        )
+                        last_result = _get_val(newest)
                         hist_loaded = True
                         logger.info(f"Historial cargado ({len(hist)} rondas) — en vivo")
                         continue
 
-                    # ── Mensajes en vivo: solo gameResults[0] (el más reciente) ──
+                    # ── En vivo: solo gameResults[0] (el más reciente) ──
                     newest = game_results[0]
-                    val = (newest.get("result")
-                           or newest.get("multiplier")
-                           or newest.get("crashPoint"))
-                    if val is None:
+                    key = _get_key(newest)
+                    val = _get_val(newest)
+                    if val is None or key is None:
                         continue
-                    val = float(val)
-                    if val != last_result:
-                        last_result = val
-                        await process_new_value(val, silent=False)
+                    if key in seen:
+                        continue   # ronda ya procesada, ignorar
+                    seen.add(key)
+                    last_result = val
+                    await process_new_value(val, silent=False)
 
         except Exception as e:
             logger.error(f"WS error: {e} — reconectando en {RECONNECT_DELAY}s")
