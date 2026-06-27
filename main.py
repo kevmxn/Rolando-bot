@@ -48,7 +48,7 @@ def argentina_time() -> str:
 
 # Umbrales de filtro (últimos 100 multiplicadores)
 UMBRAL_BELOW2  = 51.01
-UMBRAL_2TO5    = 28.99
+UMBRAL_2TO5    = 28.49
 HISTORY_MAX    = 150
 
 # Estrategia 2x
@@ -537,11 +537,8 @@ async def ws_loop():
                         continue
 
                     # ── Historial inicial: primer mensaje con múltiples rondas ──
-                    # El servidor envía el array completo (más antiguo primero).
-                    # Lo procesamos silenciosamente solo si aún no cargamos historial.
-                    if not hist_loaded and len(game_results) > 1:
-                        # El servidor envía del más reciente al más antiguo → invertir
-                        hist = list(reversed(game_results))
+                    if not hist_loaded:
+                        hist = list(reversed(game_results))   # más antiguo primero
                         logger.info(f"Cargando historial WS: {len(hist)} rondas")
                         for item in hist:
                             val = (item.get("result")
@@ -549,47 +546,27 @@ async def ws_loop():
                                    or item.get("crashPoint"))
                             if val is not None:
                                 await process_new_value(float(val), silent=True)
-                        # Guardar el resultado más reciente para evitar duplicado
+                        # El [0] es el más reciente; lo guardamos para deduplicar en vivo
                         newest = game_results[0]
-                        last_result = (newest.get("result")
-                                       or newest.get("multiplier")
-                                       or newest.get("crashPoint"))
+                        last_result = float(
+                            newest.get("result")
+                            or newest.get("multiplier")
+                            or newest.get("crashPoint")
+                        )
                         hist_loaded = True
                         logger.info(f"Historial cargado ({len(hist)} rondas) — en vivo")
                         continue
 
-                    # ── Mensaje en vivo: puede traer 1 o más resultados ──
-                    # Tomamos todos los que sean nuevos (el [0] es el más reciente)
-                    for item in game_results:
-                        val = (item.get("result")
-                               or item.get("multiplier")
-                               or item.get("crashPoint"))
-                        if val is None:
-                            continue
-                        val = float(val)
-                        if val == last_result:
-                            # Llegamos al punto que ya conocemos; detener
-                            break
-                        # Registrar en orden cronológico (el array viene más reciente primero)
-                        # Acumulamos nuevos y luego los procesamos del más antiguo al más nuevo
-                        pass
-
-                    # Re-iterar en orden cronológico (más antiguo primero)
-                    nuevos = []
-                    for item in game_results:
-                        val = (item.get("result")
-                               or item.get("multiplier")
-                               or item.get("crashPoint"))
-                        if val is None:
-                            continue
-                        val = float(val)
-                        if val == last_result:
-                            break
-                        nuevos.append(val)
-
-                    for val in reversed(nuevos):
+                    # ── Mensajes en vivo: solo gameResults[0] (el más reciente) ──
+                    newest = game_results[0]
+                    val = (newest.get("result")
+                           or newest.get("multiplier")
+                           or newest.get("crashPoint"))
+                    if val is None:
+                        continue
+                    val = float(val)
+                    if val != last_result:
                         last_result = val
-                        hist_loaded = True
                         await process_new_value(val, silent=False)
 
         except Exception as e:
