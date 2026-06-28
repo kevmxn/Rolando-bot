@@ -1,11 +1,17 @@
 #!/usr/bin/env python3
 """
-SPACEMAN Dual Signal Bot — Telegram + Render
-- Canal 2x  : señales 2.00x — gráfico moderado (3 condiciones EMA)
-- Canal 1.5x: señales 1.50x — gráfico moderado (3 condiciones EMA)
-- Ambos canales comparten WebSocket y historial, token/chat independientes
-- Gestión Martingale C1/C2/C3 · máx 1 gale por columna, por canal
-- Persistencia SQLite · Reset estadísticas 00:00 Colombia
+SPACEMAN Dual Signal Bot — Telegram + Render  [v7 — 2025-06-30]
+─────────────────────────────────────────────────────────────────
+Canal 2x  : señales 2.00x — gráfico moderado (3 condiciones EMA)
+  C1 : EMA8 cruza EMA20 hacia arriba (posiciones acumuladas)
+  C2 : Patrón W en posiciones con pos > ema4/8/20
+  C3 : Patrón W cuotas reales — ALTA CONFIANZA (herencia 6_27, 81% efectividad)
+       5 sub-condiciones AND: dos_altas + valle_previo + cruce_raw(EMA4/EMA20)
+       + alineacion_total(pos>e4>e8>e20) + pendiente_pos positiva
+Canal 1.5x: señales 1.50x — gráfico moderado (3 condiciones EMA, sin cambio)
+Ambos canales comparten WebSocket e historial · token/chat independientes
+Gestión Martingale C1/C2/C3 · máx 1 gale por columna, por canal
+Persistencia SQLite · Reset estadísticas 00:00 Colombia
 """
 
 import asyncio
@@ -53,7 +59,7 @@ def colombia_time() -> str:
 
 # ─── UMBRALES COMPARTIDOS ─────────────────────────────────────────────────────
 UMBRAL_BELOW2      = 51.51   # canal 2x: <2x debe ser < este %
-UMBRAL_2TO5        = 28.99   # canal 2x: 2-5x debe ser > este %
+UMBRAL_2TO5        = 27.99   # canal 2x: 2-5x debe ser > este %
 UMBRAL_BELOW2_150  = 54.01   # canal 1.5x: <2x debe ser < este %
 UMBRAL_2TO5_150    = 25.99  # canal 1.5x: 2-5x debe ser > este %
 HISTORY_MAX        = 150
@@ -392,12 +398,46 @@ def _ema_components(vals: List[float]):
         ema4_series[-2],  ema8_series[-2],  ema20_series[-2],
     )
 
+def _ema4_ema20_cross(vals: List[float]) -> bool:
+    """
+    Lógica de cruce EMA4/EMA20 sobre valores CRUDOS (igual que main_6_27).
+    Era la estrategia original con 81% de efectividad.
+    Devuelve True cuando EMA4 cruza EMA20 hacia arriba.
+    """
+    if len(vals) < 20:
+        return False
+    k4  = 2 / (4  + 1)
+    k20 = 2 / (20 + 1)
+    ema4  = [vals[0]]
+    ema20 = [vals[0]]
+    for v in vals[1:]:
+        ema4.append(v  * k4  + ema4[-1]  * (1 - k4))
+        ema20.append(v * k20 + ema20[-1] * (1 - k20))
+    prev_e4  = ema4[-2]
+    cur_e4   = ema4[-1]
+    prev_e20 = ema20[-2]
+    cur_e20  = ema20[-1]
+    return (prev_e4 <= prev_e20) and (cur_e4 > cur_e20)
+
 def check_signal_2x(vals: List[float]) -> bool:
     """
-    3 condiciones gráfico moderado — alerta 2.00:
-    C1: EMA8 cruza EMA20 hacia arriba
+    3 condiciones gráfico moderado — alerta 2.00.
+    TODAS requieren cruce EMA4/EMA20 sobre valores crudos (herencia 6_27, 81%).
+    El cruce raw actúa como filtro base compartido: si no hay cruce, ninguna
+    condición dispara.
+
+    C1: EMA8 cruza EMA20 hacia arriba (posiciones acumuladas)
+        + cruce EMA4/EMA20 raw confirmado
+
     C2: Patrón W en últimas 3 posiciones con pos > ema4/8/20
-    C3: Dos cuotas >= 2x consecutivas (la anterior < 2x) con ema4 > ema8 > ema20
+        + cruce EMA4/EMA20 raw confirmado
+
+    C3: Patrón W cuotas reales — ALTA CONFIANZA (herencia 6_27):
+        — dos cuotas consecutivas >=2x
+        — valle previo: al menos 1 de (vals[-3], vals[-4]) < 2x
+        — cruce EMA4/EMA20 raw confirmado
+        — cur_pos > e4 > e8 > e20 (alineación total)
+        — pendiente positiva en posiciones
     """
     if not get_stats()["favorable"]:
         return False
@@ -406,18 +446,39 @@ def check_signal_2x(vals: List[float]) -> bool:
         return False
     positions, _, ema8_s, ema20_s, cur_pos, cur_e4, cur_e8, cur_e20, prev_e4, prev_e8, prev_e20 = r
 
-    cond1 = (prev_e8 <= prev_e20) and (cur_e8 > cur_e20)
+    # ── Filtro base compartido: cruce EMA4/EMA20 sobre valores crudos (6_27) ──
+    cruce_raw = _ema4_ema20_cross(vals)
 
+    # ── C1: EMA8 cruza EMA20 hacia arriba (posiciones) + cruce raw ───────────
+    cond1 = cruce_raw and (prev_e8 <= prev_e20) and (cur_e8 > cur_e20)
+
+    # ── C2: Patrón W en posiciones con confirmación EMA + cruce raw ──────────
     cond2 = False
-    if len(positions) >= 3:
+    if cruce_raw and len(positions) >= 3:
         a, b, c = positions[-3], positions[-2], positions[-1]
-        if abs(a - c) <= 1 and b > a and cur_pos > cur_e4 and cur_pos > cur_e8 and cur_pos > cur_e20:
+        if (abs(a - c) <= 1 and b > a
+                and cur_pos > cur_e4 and cur_pos > cur_e8 and cur_pos > cur_e20):
             cond2 = True
 
+    # ── C3: Patrón W cuotas reales — ALTA CONFIANZA (herencia 6_27) ──────────
     cond3 = False
-    if (len(vals) >= 2 and vals[-1] >= 2.00 and vals[-2] >= 2.00 and
-            cur_e4 > cur_e8 and cur_e8 > cur_e20):
-        if len(vals) < 3 or vals[-3] < 2.00:
+    if len(vals) >= 4:
+        v1, v2, v3, v4 = vals[-4], vals[-3], vals[-2], vals[-1]
+
+        # Sub-1: Dos cuotas consecutivas >=2x (la W actual)
+        dos_altas = (v3 >= 2.00 and v4 >= 2.00)
+
+        # Sub-2: Valle previo confirmado — al menos 1 de las 2 anteriores <2x
+        valle_previo = (v1 < 2.00 or v2 < 2.00)
+
+        # Sub-3: EMA4 cruza EMA20 sobre valores crudos (lógica exacta del 6_27)
+        # Sub-4: Posición acumulada por encima de TODAS las EMAs
+        alineacion_total = (cur_pos > cur_e4 and cur_e4 > cur_e8 and cur_e8 > cur_e20)
+
+        # Sub-5: Pendiente de posiciones positiva — la W está escalando
+        pendiente_pos = (len(positions) >= 3 and positions[-1] > positions[-3])
+
+        if dos_altas and valle_previo and cruce_raw and alineacion_total and pendiente_pos:
             cond3 = True
 
     return cond1 or cond2 or cond3
@@ -483,7 +544,8 @@ def build_signal_msg_2x(last_value: float, attempt: int) -> str:
         f"<b>💰 RETIRAR EN: {CASHOUT_TARGET_2X:.2f}x</b>\n\n"
         f"{footer}\n"
         f"{col_label}\n\n"
-        f"<i>🔞 +18 | Apueste con Responsabilidad</i>\n \n"
+        f"<i>🔞 +18 | Apueste con Responsabilidad</i>\n"
+        f"   "
     )
 
 def build_win_msg_2x(result: float) -> str:
@@ -518,7 +580,8 @@ def build_signal_msg_150(last_value: float, attempt: int) -> str:
         f"<b>💰 RETIRAR EN: {CASHOUT_TARGET_150:.2f}x</b>\n\n"
         f"{footer}\n"
         f"{col_label}\n\n"
-        f"<i>🔞 +18 | Apueste con Responsabilidad</i>\n \n"
+        f"<i>🔞 +18 | Apueste con Responsabilidad</i>\n"
+        f"    "
     )
 
 def build_win_msg_150(result: float) -> str:
