@@ -3,8 +3,8 @@
 SPACEMAN Dual Signal Bot — Telegram + Render  [v7 — 2025-06-30]
 ─────────────────────────────────────────────────────────────────
 Canal 2x  : señales 2.00x — gráfico moderado (3 condiciones EMA)
-  C1 : EMA8 cruza EMA20 hacia arriba (posiciones acumuladas)
-  C2 : Patrón W en posiciones con pos > ema4/8/20
+  C1 : EMA4/EMA20 raw (6_27) OR EMA8/EMA20 posiciones (6_31) — basta una
+  C2 : EMA4/EMA20 raw (6_27) OR Patrón W posiciones (6_31) — basta una
   C3 : Patrón W cuotas reales — ALTA CONFIANZA (herencia 6_27, 81% efectividad)
        5 sub-condiciones AND: dos_altas + valle_previo + cruce_raw(EMA4/EMA20)
        + alineacion_total(pos>e4>e8>e20) + pendiente_pos positiva
@@ -434,15 +434,14 @@ def _ema4_ema20_cross(vals: List[float]) -> bool:
 def check_signal_2x(vals: List[float]) -> bool:
     """
     3 condiciones gráfico moderado — alerta 2.00.
-    TODAS requieren cruce EMA4/EMA20 sobre valores crudos (herencia 6_27, 81%).
-    El cruce raw actúa como filtro base compartido: si no hay cruce, ninguna
-    condición dispara.
 
-    C1: EMA8 cruza EMA20 hacia arriba (posiciones acumuladas)
-        + cruce EMA4/EMA20 raw confirmado
+    C1: basta UNA de las dos estrategias (OR):
+        — Estrategia A (6_27): EMA4 cruza EMA20 hacia arriba sobre valores crudos
+        — Estrategia B (6_31): EMA8 cruza EMA20 hacia arriba sobre posiciones acumuladas
 
-    C2: Patrón W en últimas 3 posiciones con pos > ema4/8/20
-        + cruce EMA4/EMA20 raw confirmado
+    C2: basta UNA de las dos estrategias (OR):
+        — Estrategia A (6_27): EMA4 cruza EMA20 raw confirmado
+        — Estrategia B (6_31): Patrón W en últimas 3 posiciones con pos > ema4/8/20
 
     C3: Patrón W cuotas reales — ALTA CONFIANZA (herencia 6_27):
         — dos cuotas consecutivas >=2x
@@ -458,19 +457,22 @@ def check_signal_2x(vals: List[float]) -> bool:
         return False
     positions, _, ema8_s, ema20_s, cur_pos, cur_e4, cur_e8, cur_e20, prev_e4, prev_e8, prev_e20 = r
 
-    # ── Filtro base compartido: cruce EMA4/EMA20 sobre valores crudos (6_27) ──
     cruce_raw = _ema4_ema20_cross(vals)
 
-    # ── C1: EMA8 cruza EMA20 hacia arriba (posiciones) + cruce raw ───────────
-    cond1 = cruce_raw and (prev_e8 <= prev_e20) and (cur_e8 > cur_e20)
+    # ── C1: basta UNA de las dos estrategias ─────────────────────────────────
+    c1_estrategia_A = cruce_raw                                           # 6_27 raw
+    c1_estrategia_B = (prev_e8 <= prev_e20) and (cur_e8 > cur_e20)       # 6_31 posiciones
+    cond1 = c1_estrategia_A or c1_estrategia_B
 
-    # ── C2: Patrón W en posiciones con confirmación EMA + cruce raw ──────────
-    cond2 = False
-    if cruce_raw and len(positions) >= 3:
+    # ── C2: basta UNA de las dos estrategias ─────────────────────────────────
+    c2_estrategia_A = cruce_raw                                           # 6_27 raw
+    c2_estrategia_B = False
+    if len(positions) >= 3:
         a, b, c = positions[-3], positions[-2], positions[-1]
         if (abs(a - c) <= 1 and b > a
                 and cur_pos > cur_e4 and cur_pos > cur_e8 and cur_pos > cur_e20):
-            cond2 = True
+            c2_estrategia_B = True
+    cond2 = c2_estrategia_A or c2_estrategia_B
 
     # ── C3: Patrón W cuotas reales — ALTA CONFIANZA (herencia 6_27) ──────────
     cond3 = False
@@ -558,8 +560,8 @@ def build_signal_msg_2x(last_value: float, attempt: int) -> str:
         f"<b>💰 RETIRAR EN: {CASHOUT_TARGET_2X:.2f}x</b>\n\n"
         f"{footer}\n"
         f"{col_label}\n\n"
-        f"<i>🔞 +18 | Apueste con Responsabilidad</i>\n"
-        f'🎰 <a href="{GAME_LINK}">Acceder al Spaceman</a>'
+        f"<i>🔞 +18 | Apueste con Responsabilidad</i>\n\n"
+        f'🎰 <a href="{GAME_LINK}">Link de Spaceman</a>'
     )
 
 def build_win_msg_2x(result: float) -> str:
@@ -594,8 +596,8 @@ def build_signal_msg_150(last_value: float, attempt: int) -> str:
         f"<b>💰 RETIRAR EN: {CASHOUT_TARGET_150:.2f}x</b>\n\n"
         f"{footer}\n"
         f"{col_label}\n\n"
-        f"<i>🔞 +18 | Apueste con Responsabilidad</i>\n"
-        f'🎰 <a href="{GAME_LINK}">Acceder al Spaceman</a>'
+        f"<i>🔞 +18 | Apueste con Responsabilidad</i>\n\n"
+        f'🎰 <a href="{GAME_LINK}">Link de Spaceman</a>'
     )
 
 def build_win_msg_150(result: float) -> str:
