@@ -440,16 +440,29 @@ def check_signal_150(vals: List[float]) -> bool:
     return cond1 or cond2 or cond3
 
 # ─── MENSAJES — CANAL 2x ──────────────────────────────────────────────────────
+def _col_indicator(col: int) -> str:
+    """🔴=perdida  🔵=activa  ⚫=pendiente"""
+    icons = []
+    for i in range(1, MAX_COLS + 1):
+        if i < col:
+            icons.append("🔴")
+        elif i == col:
+            icons.append("🔵")
+        else:
+            icons.append("⚫")
+    return "".join(icons)
+
 def build_signal_msg_2x(last_value: float, attempt: int) -> str:
-    footer = f"🔁 <b>MÁXIMO {MAX_GALES} GALES</b>" if attempt == 1 else "🔁 <b>SEGUNDA OPORTUNIDAD</b>"
-    col_label = f"📊 <b>Columna C{s2x_col} de {MAX_COLS}</b>"
+    footer    = f"🔁 <b>MÁXIMO {MAX_GALES} GALE</b>" if attempt == 1 else "🔁 <b>SEGUNDA OPORTUNIDAD</b>"
+    col_label = f"💎 <b>NIVEL DE COLUMNA: {_col_indicator(s2x_col)}</b>"
     return (
+        f"<b>señal para columna c{s2x_col}</b>\n\n"
         "<b>✅ ENTRADA CONFIRMADA ✅</b>\n\n"
         f"<b>👉 INGRESAR DESPUÉS: {last_value:.2f}x</b>\n"
         f"<b>💰 RETIRAR EN: {CASHOUT_TARGET_2X:.2f}x</b>\n\n"
         f"{footer}\n"
         f"{col_label}\n\n"
-        f"<i>🔞 +18 | Apueste con Responsabilidad</i>\n"
+        f"<i>🔞 +18 | Apueste con Responsabilidad</i>"
     )
 
 def build_win_msg_2x(result: float) -> str:
@@ -476,15 +489,16 @@ def build_stats_msg_2x() -> str:
 
 # ─── MENSAJES — CANAL 1.5x ────────────────────────────────────────────────────
 def build_signal_msg_150(last_value: float, attempt: int) -> str:
-    footer = f"🔁 <b>MÁXIMO {MAX_GALES} GALES</b>" if attempt == 1 else "🔁 <b>SEGUNDA OPORTUNIDAD</b>"
-    col_label = f"📊 <b>Columna C{s150_col} de {MAX_COLS}</b>"
+    footer    = f"🔁 <b>MÁXIMO {MAX_GALES} GALE</b>" if attempt == 1 else "🔁 <b>SEGUNDA OPORTUNIDAD</b>"
+    col_label = f"💎 <b>NIVEL DE COLUMNA: {_col_indicator(s150_col)}</b>"
     return (
+        f"<b>señal para columna c{s150_col}</b>\n\n"
         "<b>✅ ENTRADA CONFIRMADA ✅</b>\n\n"
         f"<b>👉 INGRESAR DESPUÉS: {last_value:.2f}x</b>\n"
         f"<b>💰 RETIRAR EN: {CASHOUT_TARGET_150:.2f}x</b>\n\n"
         f"{footer}\n"
         f"{col_label}\n\n"
-        f"<i>🔞 +18 | Apueste con Responsabilidad</i>\n"
+        f"<i>🔞 +18 | Apueste con Responsabilidad</i>"
     )
 
 def build_win_msg_150(result: float) -> str:
