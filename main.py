@@ -304,7 +304,7 @@ def build_signal_message(last_value: float = None, attempt: int = 1) -> str:
         "<b>✅ ENTRADA CONFIRMADA ✅</b>\n\n"
         f"<b>👉 INGRESAR DESPUÉS: {last_value:.2f}x</b>\n"
         f"<b>💰 RETIRAR EN: {CASHOUT_TARGET:.2f}x</b>\n\n"
-        f"{footer}\n<i>🔞 +18 | Apueste con Responsabilidad<i>\n\n"
+        f"{footer}\n<i>🔞 +18 | Apueste con Responsabilidad</i>\n\n"
     )
 
 def build_win_message(result: float) -> str:
@@ -745,6 +745,7 @@ async def daily_reset_loop():
         logger.info("🔄 Estadísticas reiniciadas — 00:00 Colombia")
 
 
+async def main_async():
     global _main_loop
     _main_loop = asyncio.get_running_loop()
 
