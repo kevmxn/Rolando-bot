@@ -43,16 +43,20 @@ GAME_ID   = int(os.environ.get("GAME_ID", "1301"))
 
 DB_FILE = os.environ.get("DB_FILE", "spaceman.db")
 
-def argentina_time() -> str:
-    return (datetime.utcnow() - timedelta(hours=3)).strftime("%H:%M")
+def colombia_now() -> datetime:
+    return datetime.utcnow() - timedelta(hours=5)
+
+def colombia_time() -> str:
+    return colombia_now().strftime("%H:%M")
 
 # Umbrales de filtro (últimos 100 multiplicadores)
 UMBRAL_BELOW2  = 51.51
-UMBRAL_2TO5    = 27.99
+UMBRAL_2TO5    = 28.99
 HISTORY_MAX    = 150
 
 # Estrategia 2x
 CASHOUT_TARGET  = 2.00
+CASHOUT_TRIGGER = 2.00   # Ingresar después de esta cuota
 MAX_GALES       = 1
 MAX_COLS        = 3
 
@@ -256,7 +260,7 @@ def get_stats() -> dict:
     }
 
 def build_trend_message(stats: dict) -> str:
-    now    = argentina_time()
+    now    = colombia_time()
     last5  = list(history)[-5:][::-1] if history else []
     last5_str = ", ".join(f"{v:.2f}x" for v in last5) if last5 else "—"
 
@@ -300,7 +304,7 @@ def build_signal_message(last_value: float = None, attempt: int = 1) -> str:
         "<b>✅ ENTRADA CONFIRMADA ✅</b>\n\n"
         f"<b>👉 INGRESAR DESPUÉS: {last_value:.2f}x</b>\n"
         f"<b>💰 RETIRAR EN: {CASHOUT_TARGET:.2f}x</b>\n\n"
-        f"{footer}"
+        f"{footer}\n<i>🔞 +18 | Apueste con Responsabilidad<i>\n\n"
     )
 
 def build_win_message(result: float) -> str:
@@ -335,7 +339,7 @@ async def send_stats_update():
         await delete_message(stats_msg_id)
     stats_msg_id = await send_message(build_stats_message())
 
-# ─── LÓGICA DE SEÑALES — EMA cruce ───────────────────────────────────────────
+# ─── LÓGICA DE SEÑALES — Gráfico Moderado (3 condiciones) ────────────────────
 def calc_ema(values: List[float], period: int) -> List[float]:
     if not values:
         return []
@@ -345,19 +349,81 @@ def calc_ema(values: List[float], period: int) -> List[float]:
         ema.append(v * k + ema[-1] * (1 - k))
     return ema
 
+def build_positions(vals: List[float]) -> List[float]:
+    """
+    Convierte el historial de multiplicadores en posiciones acumuladas,
+    igual que el gráfico moderado del HTML:
+      +1 si valor >= 2.00, -1 si valor < 2.00
+    """
+    positions = [0]
+    current = 0
+    for v in vals[1:]:
+        current += 1 if v >= 2.00 else -1
+        positions.append(current)
+    return positions
+
 def check_signal_2x(vals: List[float]) -> bool:
-    if len(vals) < 20:
+    """
+    Reproduce las 3 condiciones de checkModerateAlerts (alerta 2.00) del HTML:
+
+    Condición 1 — EMA8 cruza EMA20 hacia arriba:
+        prevEma8 <= prevEma20  AND  currentEma8 > currentEma20
+
+    Condición 2 — Patrón W en últimas 3 posiciones con EMAs alineadas:
+        |pos[-3] - pos[-1]| <= 1  AND  pos[-2] > pos[-3]
+        AND currentPos > ema4 AND currentPos > ema8 AND currentPos > ema20
+
+    Condición 3 — Dos cuotas consecutivas >= 2x con EMA alineada:
+        vals[-1] >= 2.00 AND vals[-2] >= 2.00
+        AND (vals[-3] < 2.00 OR len < 3)
+        AND ema4 > ema8 AND ema8 > ema20
+
+    Solo dispara si la tendencia estadística es favorable.
+    """
+    if len(vals) < 8:
         return False
+
     stats = get_stats()
     if not stats["favorable"]:
         return False
-    ema4_series  = calc_ema(vals, 4)
-    ema20_series = calc_ema(vals, 20)
-    cur_ema4   = ema4_series[-1]
-    cur_ema20  = ema20_series[-1]
-    prev_ema4  = ema4_series[-2]  if len(ema4_series)  > 1 else cur_ema4
-    prev_ema20 = ema20_series[-2] if len(ema20_series) > 1 else cur_ema20
-    return (prev_ema4 <= prev_ema20) and (cur_ema4 > cur_ema20)
+
+    positions    = build_positions(vals)
+    ema4_series  = calc_ema(positions, 4)
+    ema8_series  = calc_ema(positions, 8)
+    ema20_series = calc_ema(positions, 20)
+
+    if len(ema8_series) < 2 or len(ema20_series) < 2:
+        return False
+
+    cur_pos   = positions[-1]
+    cur_ema4  = ema4_series[-1]
+    cur_ema8  = ema8_series[-1]
+    cur_ema20 = ema20_series[-1]
+
+    prev_ema4  = ema4_series[-2]
+    prev_ema8  = ema8_series[-2]
+    prev_ema20 = ema20_series[-2]
+
+    # ── Condición 1: EMA8 cruza EMA20 hacia arriba ────────────────────────────
+    cond1 = (prev_ema8 <= prev_ema20) and (cur_ema8 > cur_ema20)
+
+    # ── Condición 2: Patrón W en últimas 3 posiciones ─────────────────────────
+    cond2 = False
+    if len(positions) >= 3:
+        a, b, c = positions[-3], positions[-2], positions[-1]
+        if (abs(a - c) <= 1 and b > a and
+                cur_pos > cur_ema4 and cur_pos > cur_ema8 and cur_pos > cur_ema20):
+            cond2 = True
+
+    # ── Condición 3: Dos cuotas >= 2x consecutivas con EMA alineada ───────────
+    cond3 = False
+    if (len(vals) >= 2 and vals[-1] >= 2.00 and vals[-2] >= 2.00 and
+            cur_ema4 > cur_ema8 and cur_ema8 > cur_ema20):
+        before_prev_ok = (len(vals) < 3) or (vals[-3] < 2.00)
+        if before_prev_ok:
+            cond3 = True
+
+    return cond1 or cond2 or cond3
 
 # ─── PROCESAMIENTO DE CADA NUEVA CUOTA ───────────────────────────────────────
 async def process_new_value(value: float, silent: bool = False):
@@ -612,7 +678,7 @@ async def cmd_start(message):
 @bot.message_handler(commands=['stats'])
 async def cmd_stats(message):
     stats   = get_stats()
-    hora    = argentina_time()
+    hora    = colombia_time()
     sig_txt = (
         f"Intento {signal_attempt}/{MAX_GALES+1} Col {signal_col}/{MAX_COLS}"
         if signal_active else "Idle"
@@ -644,7 +710,41 @@ async def self_ping_loop():
         except Exception as e:
             logger.warning(f"Self-ping falló: {e}")
 
-async def main_async():
+async def daily_reset_loop():
+    """Reinicia las estadísticas de señales a las 00:00 hora Colombia."""
+    global daily_wins, daily_losses, daily_col_losses, consecutive_wins
+    while True:
+        now   = colombia_now()
+        # Segundos hasta la próxima medianoche Colombia
+        next_midnight = (now + timedelta(days=1)).replace(
+            hour=0, minute=0, second=0, microsecond=0
+        )
+        wait = (next_midnight - now).total_seconds()
+        await asyncio.sleep(wait)
+
+        # Resumen del día que termina (antes de reiniciar)
+        meses = ["Enero","Febrero","Marzo","Abril","Mayo","Junio",
+                 "Julio","Agosto","Septiembre","Octubre","Noviembre","Diciembre"]
+        dia_str = f"{now.day} de {meses[now.month - 1]} {now.year}"
+        total_ops  = daily_wins + daily_losses + daily_col_losses
+        losses_txt = daily_losses + daily_col_losses
+        win_pct    = (daily_wins / total_ops * 100) if total_ops > 0 else 0.0
+        resumen = (
+            f"🤑 <b>Resultados del {dia_str}</b>\n"
+            f"🚀 <b>Resultado del día ✅ {daily_wins} ⭕ {losses_txt}</b>\n"
+            f"💎 <b>Acertamos el {win_pct:.2f}% de las veces</b>\n"
+            f"📈 <b>¡Tenemos {consecutive_wins} victorias consecutivas!</b>"
+        )
+        await send_message(resumen)
+
+        daily_wins       = 0
+        daily_losses     = 0
+        daily_col_losses = 0
+        consecutive_wins = 0
+        save_state()
+        logger.info("🔄 Estadísticas reiniciadas — 00:00 Colombia")
+
+
     global _main_loop
     _main_loop = asyncio.get_running_loop()
 
@@ -665,6 +765,7 @@ async def main_async():
 
     asyncio.create_task(ws_loop())
     asyncio.create_task(self_ping_loop())
+    asyncio.create_task(daily_reset_loop())
 
     render_url = os.environ.get('RENDER_EXTERNAL_URL', '').rstrip('/')
     if render_url:
