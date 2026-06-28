@@ -483,7 +483,7 @@ def build_signal_msg_2x(last_value: float, attempt: int) -> str:
         f"<b>💰 RETIRAR EN: {CASHOUT_TARGET_2X:.2f}x</b>\n\n"
         f"{footer}\n"
         f"{col_label}\n\n"
-        f"<i>🔞 +18 | Apueste con Responsabilidad</i>"
+        f"<i>🔞 +18 | Apueste con Responsabilidad</i>\n \n"
     )
 
 def build_win_msg_2x(result: float) -> str:
@@ -518,7 +518,7 @@ def build_signal_msg_150(last_value: float, attempt: int) -> str:
         f"<b>💰 RETIRAR EN: {CASHOUT_TARGET_150:.2f}x</b>\n\n"
         f"{footer}\n"
         f"{col_label}\n\n"
-        f"<i>🔞 +18 | Apueste con Responsabilidad</i>"
+        f"<i>🔞 +18 | Apueste con Responsabilidad</i>\n \n"
     )
 
 def build_win_msg_150(result: float) -> str:
