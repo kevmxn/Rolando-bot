@@ -256,17 +256,23 @@ _main_loop: asyncio.AbstractEventLoop = None
 flask_app = Flask(__name__)
 
 # ─── TELEGRAM HELPERS — CANAL 2x ──────────────────────────────────────────────
-async def send_2x(text: str) -> Optional[int]:
+async def send_2x(text: str, no_preview: bool = False) -> Optional[int]:
     try:
-        msg = await bot.send_message(CHAT_ID, text, parse_mode="HTML")
+        msg = await bot.send_message(
+            CHAT_ID, text, parse_mode="HTML",
+            disable_web_page_preview=no_preview
+        )
         return msg.message_id
     except Exception as e:
         logger.warning(f"[2x] send error: {e}")
         return None
 
-async def edit_2x(msg_id: int, text: str) -> bool:
+async def edit_2x(msg_id: int, text: str, no_preview: bool = False) -> bool:
     try:
-        await bot.edit_message_text(text, CHAT_ID, msg_id, parse_mode="HTML")
+        await bot.edit_message_text(
+            text, CHAT_ID, msg_id, parse_mode="HTML",
+            disable_web_page_preview=no_preview
+        )
         return True
     except Exception as e:
         logger.debug(f"[2x] edit error {msg_id}: {e}")
@@ -281,17 +287,23 @@ async def delete_2x(msg_id: int) -> bool:
         return False
 
 # ─── TELEGRAM HELPERS — CANAL 1.5x ────────────────────────────────────────────
-async def send_150(text: str) -> Optional[int]:
+async def send_150(text: str, no_preview: bool = False) -> Optional[int]:
     try:
-        msg = await bot_150.send_message(CHAT_ID_150, text, parse_mode="HTML")
+        msg = await bot_150.send_message(
+            CHAT_ID_150, text, parse_mode="HTML",
+            disable_web_page_preview=no_preview
+        )
         return msg.message_id
     except Exception as e:
         logger.warning(f"[1.5x] send error: {e}")
         return None
 
-async def edit_150(msg_id: int, text: str) -> bool:
+async def edit_150(msg_id: int, text: str, no_preview: bool = False) -> bool:
     try:
-        await bot_150.edit_message_text(text, CHAT_ID_150, msg_id, parse_mode="HTML")
+        await bot_150.edit_message_text(
+            text, CHAT_ID_150, msg_id, parse_mode="HTML",
+            disable_web_page_preview=no_preview
+        )
         return True
     except Exception as e:
         logger.debug(f"[1.5x] edit error {msg_id}: {e}")
@@ -535,6 +547,8 @@ def _col_indicator(col: int) -> str:
             icons.append("⚫")
     return "".join(icons)
 
+GAME_LINK = "https://1win.lat/casino/play/v_pragmatic:spaceman"
+
 def build_signal_msg_2x(last_value: float, attempt: int) -> str:
     footer    = f"🔁 <b>MÁXIMO {MAX_GALES} GALE</b>" if attempt == 1 else "🔁 <b>SEGUNDA OPORTUNIDAD</b>"
     col_label = f"💎 <b>NIVEL DE COLUMNA: {_col_indicator(s2x_col)}</b>"
@@ -545,7 +559,7 @@ def build_signal_msg_2x(last_value: float, attempt: int) -> str:
         f"{footer}\n"
         f"{col_label}\n\n"
         f"<i>🔞 +18 | Apueste con Responsabilidad</i>\n"
-        f"   "
+        f'🎰 <a href="{GAME_LINK}">Acceder al Spaceman</a>'
     )
 
 def build_win_msg_2x(result: float) -> str:
@@ -581,7 +595,7 @@ def build_signal_msg_150(last_value: float, attempt: int) -> str:
         f"{footer}\n"
         f"{col_label}\n\n"
         f"<i>🔞 +18 | Apueste con Responsabilidad</i>\n"
-        f"    "
+        f'🎰 <a href="{GAME_LINK}">Acceder al Spaceman</a>'
     )
 
 def build_win_msg_150(result: float) -> str:
@@ -656,12 +670,12 @@ async def resolve_2x(value: float):
             save_state_2x()
             new_text = build_signal_msg_2x(last_value=value, attempt=s2x_attempt)
             if s2x_msg_id:
-                ok = await edit_2x(s2x_msg_id, new_text)
+                ok = await edit_2x(s2x_msg_id, new_text, no_preview=True)
                 if not ok:
-                    s2x_msg_id = await send_2x(new_text)
+                    s2x_msg_id = await send_2x(new_text, no_preview=True)
                     save_state_2x()
             else:
-                s2x_msg_id = await send_2x(new_text)
+                s2x_msg_id = await send_2x(new_text, no_preview=True)
                 save_state_2x()
 
         else:
@@ -721,12 +735,12 @@ async def resolve_150(value: float):
             save_state_150()
             new_text = build_signal_msg_150(last_value=value, attempt=s150_attempt)
             if s150_msg_id:
-                ok = await edit_150(s150_msg_id, new_text)
+                ok = await edit_150(s150_msg_id, new_text, no_preview=True)
                 if not ok:
-                    s150_msg_id = await send_150(new_text)
+                    s150_msg_id = await send_150(new_text, no_preview=True)
                     save_state_150()
             else:
-                s150_msg_id = await send_150(new_text)
+                s150_msg_id = await send_150(new_text, no_preview=True)
                 save_state_150()
 
         else:
@@ -787,7 +801,7 @@ async def process_new_value(value: float, silent: bool = False):
             s2x_attempt        = 1
             s2x_fired_this_round = True
             text               = build_signal_msg_2x(last_value=value, attempt=1)
-            s2x_msg_id         = await send_2x(text)
+            s2x_msg_id         = await send_2x(text, no_preview=True)
             save_state_2x()
             logger.info(f"[2x] Señal enviada | col={s2x_col}")
             if trend_msg_id:
@@ -809,7 +823,7 @@ async def process_new_value(value: float, silent: bool = False):
             s150_active  = True
             s150_attempt = 1
             text         = build_signal_msg_150(last_value=value, attempt=1)
-            s150_msg_id  = await send_150(text)
+            s150_msg_id  = await send_150(text, no_preview=True)
             save_state_150()
             logger.info(f"[1.5x] Señal enviada ({origen}) | col={s150_col}")
 
