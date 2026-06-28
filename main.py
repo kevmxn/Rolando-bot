@@ -52,9 +52,11 @@ def colombia_time() -> str:
     return colombia_now().strftime("%H:%M")
 
 # ─── UMBRALES COMPARTIDOS ─────────────────────────────────────────────────────
-UMBRAL_BELOW2  = 51.51
-UMBRAL_2TO5    = 28.99
-HISTORY_MAX    = 150
+UMBRAL_BELOW2      = 51.51   # canal 2x: <2x debe ser < este %
+UMBRAL_2TO5        = 28.99   # canal 2x: 2-5x debe ser > este %
+UMBRAL_BELOW2_150  = 54.01   # canal 1.5x: <2x debe ser < este %
+UMBRAL_2TO5_150    = 25.99  # canal 1.5x: 2-5x debe ser > este %
+HISTORY_MAX        = 150
 
 # ─── ESTRATEGIA 2x ────────────────────────────────────────────────────────────
 CASHOUT_TARGET_2X  = 2.00
@@ -313,6 +315,22 @@ def get_stats() -> dict:
         "pct_below2": pct_below2, "pct_2to5": pct_2to5, "favorable": favorable,
     }
 
+def get_stats_150() -> dict:
+    """Mismos datos pero 'favorable' usa umbrales propios del canal 1.5x."""
+    total = len(history)
+    if total == 0:
+        return {"total": 0, "below2": 0, "two_to_five": 0,
+                "pct_below2": 0.0, "pct_2to5": 0.0, "favorable": False}
+    below2      = sum(1 for v in history if v < 2.00)
+    two_to_five = sum(1 for v in history if 2.00 <= v < 5.00)
+    pct_below2  = (below2 / total) * 100
+    pct_2to5    = (two_to_five / total) * 100
+    favorable   = (pct_below2 < UMBRAL_BELOW2_150) and (pct_2to5 > UMBRAL_2TO5_150)
+    return {
+        "total": total, "below2": below2, "two_to_five": two_to_five,
+        "pct_below2": pct_below2, "pct_2to5": pct_2to5, "favorable": favorable,
+    }
+
 def build_trend_message(stats: dict) -> str:
     now       = colombia_time()
     last5     = list(history)[-5:][::-1] if history else []
@@ -412,7 +430,10 @@ def check_signal_150(vals: List[float]) -> bool:
     C2: EMA4 cruza EMA8 hacia arriba
     C3: Soporte: pos <= min(últimas 20 pos)*1.01
         Y pos > ema4 Y pos > ema8 Y pos > ema20
+    Solo dispara si tendencia 1.5x favorable (<2x<54%, 2-5x>26%).
     """
+    if not get_stats_150()["favorable"]:
+        return False
     r = _ema_components(vals)
     if r is None:
         return False
@@ -438,6 +459,7 @@ def check_signal_150(vals: List[float]) -> bool:
         cond3 = True
 
     return cond1 or cond2 or cond3
+
 
 # ─── MENSAJES — CANAL 2x ──────────────────────────────────────────────────────
 def _col_indicator(col: int) -> str:
@@ -693,14 +715,16 @@ async def process_new_value(value: float, silent: bool = False):
     vals = list(history)
 
     # ── CANAL 2x ──────────────────────────────────────────────────────────────
+    s2x_fired_this_round = False   # rastrea si 2x disparó señal en esta ronda
     if s2x_active:
         await resolve_2x(value)
     else:
         if check_signal_2x(vals):
-            s2x_active  = True
-            s2x_attempt = 1
-            text        = build_signal_msg_2x(last_value=value, attempt=1)
-            s2x_msg_id  = await send_2x(text)
+            s2x_active         = True
+            s2x_attempt        = 1
+            s2x_fired_this_round = True
+            text               = build_signal_msg_2x(last_value=value, attempt=1)
+            s2x_msg_id         = await send_2x(text)
             save_state_2x()
             logger.info(f"[2x] Señal enviada | col={s2x_col}")
             if trend_msg_id:
@@ -709,13 +733,15 @@ async def process_new_value(value: float, silent: bool = False):
                 save_state_2x()
 
     # ── CANAL 1.5x ────────────────────────────────────────────────────────────
-    # Dispara con señal propia (1.5x) O con señal del canal 2x — cashout siempre 1.50x
+    # Dispara con señal propia (1.5x) O como réplica del canal 2x SOLO si 2x
+    # envió señal en esta misma ronda (s2x_fired_this_round=True).
     if s150_active:
         await resolve_150(value)
     else:
         sig150 = check_signal_150(vals)
-        sig2x  = check_signal_2x(vals)
-        if sig150 or sig2x:
+        # Réplica 2x→1.5x solo si el canal 2x realmente disparó en esta ronda
+        sig2x_replica = s2x_fired_this_round
+        if sig150 or sig2x_replica:
             origen       = "1.5x" if sig150 else "2x→1.5x"
             s150_active  = True
             s150_attempt = 1
