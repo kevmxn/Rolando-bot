@@ -456,7 +456,6 @@ def build_signal_msg_2x(last_value: float, attempt: int) -> str:
     footer    = f"🔁 <b>MÁXIMO {MAX_GALES} GALE</b>" if attempt == 1 else "🔁 <b>SEGUNDA OPORTUNIDAD</b>"
     col_label = f"💎 <b>NIVEL DE COLUMNA: {_col_indicator(s2x_col)}</b>"
     return (
-        f"<b>señal para columna c{s2x_col}</b>\n\n"
         "<b>✅ ENTRADA CONFIRMADA ✅</b>\n\n"
         f"<b>👉 INGRESAR DESPUÉS: {last_value:.2f}x</b>\n"
         f"<b>💰 RETIRAR EN: {CASHOUT_TARGET_2X:.2f}x</b>\n\n"
@@ -492,7 +491,6 @@ def build_signal_msg_150(last_value: float, attempt: int) -> str:
     footer    = f"🔁 <b>MÁXIMO {MAX_GALES} GALE</b>" if attempt == 1 else "🔁 <b>SEGUNDA OPORTUNIDAD</b>"
     col_label = f"💎 <b>NIVEL DE COLUMNA: {_col_indicator(s150_col)}</b>"
     return (
-        f"<b>señal para columna c{s150_col}</b>\n\n"
         "<b>✅ ENTRADA CONFIRMADA ✅</b>\n\n"
         f"<b>👉 INGRESAR DESPUÉS: {last_value:.2f}x</b>\n"
         f"<b>💰 RETIRAR EN: {CASHOUT_TARGET_150:.2f}x</b>\n\n"
