@@ -1,17 +1,19 @@
 #!/usr/bin/env python3
 """
-SPACEMAN Dual Signal Bot — Telegram + Render  [v7 — 2025-06-30]
+SPACEMAN Dual Signal Bot — Telegram + Render  [v10 — 2025-07-01]
 ─────────────────────────────────────────────────────────────────
-Canal 2x  : señales 2.00x — gráfico moderado (3 condiciones EMA)
-  C1 : EMA4/EMA20 raw (6_27) OR EMA8/EMA20 posiciones (6_31) — basta una
-  C2 : EMA4/EMA20 raw (6_27) OR Patrón W posiciones (6_31) — basta una
-  C3 : Patrón W cuotas reales — ALTA CONFIANZA (herencia 6_27, 81% efectividad)
-       5 sub-condiciones AND: dos_altas + valle_previo + cruce_raw(EMA4/EMA20)
-       + alineacion_total(pos>e4>e8>e20) + pendiente_pos positiva
-Canal 1.5x: señales 1.50x — gráfico moderado (3 condiciones EMA, sin cambio)
+Canal 2x  : sistema identico a main_6_27
+  Señal   : EMA4 cruza EMA20 hacia arriba sobre valores crudos
+  Filtro  : <2x < 51.51% AND 2-5x > 27.99%
+Canal 1.5x: estrategias de posiciones acumuladas (6_31)
+  C1 : EMA8 cruza EMA20 hacia arriba (posiciones acumuladas)
+  C2 : Patron W en posiciones con pos > ema4/8/20
+  C3 : EMA4 cruza EMA8 hacia arriba (posiciones acumuladas)
+  Filtro  : <2x < 54.01% AND 2-5x > 25.99%
 Ambos canales comparten WebSocket e historial · token/chat independientes
-Gestión Martingale C1/C2/C3 · máx 1 gale por columna, por canal
-Persistencia SQLite · Reset estadísticas 00:00 Colombia
+Mensaje de tendencia con porcentajes en ambos canales
+Gestion Martingale: max 1 gale por columna, 3 columnas por canal
+Persistencia SQLite · Reset estadisticas 00:00 Colombia
 """
 
 import asyncio
@@ -142,6 +144,7 @@ def save_state_150():
         "150_signal_attempt":   str(s150_attempt),
         "150_signal_col":       str(s150_col),
         "150_signal_lost":      str(s150_lost),
+        "150_trend_msg_id":     str(trend_msg_id_150) if trend_msg_id_150 is not None else "",
         "150_stats_msg_id":     str(s150_stats_msg_id) if s150_stats_msg_id is not None else "",
         "150_signal_msg_id":    str(s150_msg_id)       if s150_msg_id       is not None else "",
         "150_daily_wins":       str(s150_daily_wins),
@@ -153,13 +156,15 @@ def save_state_150():
 
 def load_state_150():
     global s150_active, s150_attempt, s150_col, s150_lost
-    global s150_stats_msg_id, s150_msg_id
+    global s150_stats_msg_id, s150_msg_id, trend_msg_id_150
     global s150_daily_wins, s150_daily_losses, s150_daily_col_losses, s150_consecutive_wins
     d = _load_dict()
     s150_active           = bool(int(d.get("150_signal_active",    "0")))
     s150_attempt          = int(d.get("150_signal_attempt",  "1"))
     s150_col              = int(d.get("150_signal_col",      "1"))
     s150_lost             = float(d.get("150_signal_lost",   "0.0"))
+    _tid150               = d.get("150_trend_msg_id", "")
+    trend_msg_id_150      = int(_tid150) if _tid150 else None
     _sid                  = d.get("150_stats_msg_id", "")
     s150_stats_msg_id     = int(_sid) if _sid else None
     _smid                 = d.get("150_signal_msg_id", "")
@@ -223,7 +228,8 @@ def load_history() -> List[float]:
 # ─── ESTADO GLOBAL — COMPARTIDO ───────────────────────────────────────────────
 history: List[float] = []
 last_result: Optional[float] = None
-trend_msg_id: Optional[int]  = None   # compartido — un solo mensaje de tendencia (canal 2x)
+trend_msg_id: Optional[int]     = None   # mensaje de tendencia canal 2x
+trend_msg_id_150: Optional[int] = None   # mensaje de tendencia canal 1.5x
 
 # ─── ESTADO GLOBAL — CANAL 2x ─────────────────────────────────────────────────
 s2x_active:           bool         = False
@@ -371,6 +377,28 @@ def build_trend_message(stats: dict) -> str:
         f"<b>🆔 ({last5_str})</b>"
     )
 
+def build_trend_message_150(stats: dict) -> str:
+    now       = colombia_time()
+    last5     = list(history)[-5:][::-1] if history else []
+    last5_str = ", ".join(f"{v:.2f}x" for v in last5) if last5 else "—"
+    below2_ok = stats["pct_below2"] < UMBRAL_BELOW2_150
+    two5_ok   = stats["pct_2to5"]   > UMBRAL_2TO5_150
+    if stats["favorable"]:
+        header  = f"🟢 <b>TENDENCIA FAVORABLE — {now}</b>"
+        mark2   = "✅"
+    else:
+        header  = f"🔴 <b>TENDENCIA DESFAVORABLE — {now}</b>"
+        mark2   = "❌"
+    below2_mark = "✅" if below2_ok else "❌"
+    return (
+        f"{header}\n"
+        f"<b>━━━━━━━━━━━━━━━━━━━━━━━━━━</b>\n"
+        f"<b>📈 Análisis últimos {stats['total']} multiplicadores</b>\n"
+        f"<b>🔵 1.00-1.99x = {stats['below2']} — {stats['pct_below2']:.2f}%{below2_mark}</b>\n"
+        f"<b>🟡 2.00-4.99x = {stats['two_to_five']} — {stats['pct_2to5']:.2f}%{mark2}</b>\n"
+        f"<b>🆔 ({last5_str})</b>"
+    )
+
 # ─── EMA + POSICIONES (compartido) ────────────────────────────────────────────
 def calc_ema(values: List[float], period: int) -> List[float]:
     if not values:
@@ -433,78 +461,30 @@ def _ema4_ema20_cross(vals: List[float]) -> bool:
 
 def check_signal_2x(vals: List[float]) -> bool:
     """
-    3 condiciones gráfico moderado — alerta 2.00.
-
-    C1: basta UNA de las dos estrategias (OR):
-        — Estrategia A (6_27): EMA4 cruza EMA20 hacia arriba sobre valores crudos
-        — Estrategia B (6_31): EMA8 cruza EMA20 hacia arriba sobre posiciones acumuladas
-
-    C2: basta UNA de las dos estrategias (OR):
-        — Estrategia A (6_27): EMA4 cruza EMA20 raw confirmado
-        — Estrategia B (6_31): Patrón W en últimas 3 posiciones con pos > ema4/8/20
-
-    C3: Patrón W cuotas reales — ALTA CONFIANZA (herencia 6_27):
-        — dos cuotas consecutivas >=2x
-        — valle previo: al menos 1 de (vals[-3], vals[-4]) < 2x
-        — cruce EMA4/EMA20 raw confirmado
-        — cur_pos > e4 > e8 > e20 (alineación total)
-        — pendiente positiva en posiciones
+    Sistema 2x identico a main_6_27:
+    EMA4 cruza EMA20 hacia arriba sobre valores crudos.
+    Requiere tendencia favorable y minimo 20 valores.
     """
+    if len(vals) < 20:
+        return False
     if not get_stats()["favorable"]:
         return False
-    r = _ema_components(vals)
-    if r is None:
-        return False
-    positions, _, ema8_s, ema20_s, cur_pos, cur_e4, cur_e8, cur_e20, prev_e4, prev_e8, prev_e20 = r
-
-    cruce_raw = _ema4_ema20_cross(vals)
-
-    # ── C1: basta UNA de las dos estrategias ─────────────────────────────────
-    c1_estrategia_A = cruce_raw                                           # 6_27 raw
-    c1_estrategia_B = (prev_e8 <= prev_e20) and (cur_e8 > cur_e20)       # 6_31 posiciones
-    cond1 = c1_estrategia_A or c1_estrategia_B
-
-    # ── C2: basta UNA de las dos estrategias ─────────────────────────────────
-    c2_estrategia_A = cruce_raw                                           # 6_27 raw
-    c2_estrategia_B = False
-    if len(positions) >= 3:
-        a, b, c = positions[-3], positions[-2], positions[-1]
-        if (abs(a - c) <= 1 and b > a
-                and cur_pos > cur_e4 and cur_pos > cur_e8 and cur_pos > cur_e20):
-            c2_estrategia_B = True
-    cond2 = c2_estrategia_A or c2_estrategia_B
-
-    # ── C3: Patrón W cuotas reales — ALTA CONFIANZA (herencia 6_27) ──────────
-    cond3 = False
-    if len(vals) >= 4:
-        v1, v2, v3, v4 = vals[-4], vals[-3], vals[-2], vals[-1]
-
-        # Sub-1: Dos cuotas consecutivas >=2x (la W actual)
-        dos_altas = (v3 >= 2.00 and v4 >= 2.00)
-
-        # Sub-2: Valle previo confirmado — al menos 1 de las 2 anteriores <2x
-        valle_previo = (v1 < 2.00 or v2 < 2.00)
-
-        # Sub-3: EMA4 cruza EMA20 sobre valores crudos (lógica exacta del 6_27)
-        # Sub-4: Posición acumulada por encima de TODAS las EMAs
-        alineacion_total = (cur_pos > cur_e4 and cur_e4 > cur_e8 and cur_e8 > cur_e20)
-
-        # Sub-5: Pendiente de posiciones positiva — la W está escalando
-        pendiente_pos = (len(positions) >= 3 and positions[-1] > positions[-3])
-
-        if dos_altas and valle_previo and cruce_raw and alineacion_total and pendiente_pos:
-            cond3 = True
-
-    return cond1 or cond2 or cond3
+    ema4_series  = calc_ema(vals, 4)
+    ema20_series = calc_ema(vals, 20)
+    cur_ema4   = ema4_series[-1]
+    cur_ema20  = ema20_series[-1]
+    prev_ema4  = ema4_series[-2]  if len(ema4_series)  > 1 else cur_ema4
+    prev_ema20 = ema20_series[-2] if len(ema20_series) > 1 else cur_ema20
+    return (prev_ema4 <= prev_ema20) and (cur_ema4 > cur_ema20)
 
 def check_signal_150(vals: List[float]) -> bool:
     """
-    3 condiciones gráfico moderado — alerta 1.50:
-    C1: Patrón 3 bajos + 1 alto: últimas 4 rondas <2, <2, <2, >=2
-        Y pos <= ema4 Y pos <= ema8
-    C2: EMA4 cruza EMA8 hacia arriba
-    C3: Soporte: pos <= min(últimas 20 pos)*1.01
-        Y pos > ema4 Y pos > ema8 Y pos > ema20
+    3 condiciones gráfico moderado — alerta 1.50.
+    Usa las estrategias alternativas del 6_31 (posiciones acumuladas).
+
+    C1: EMA8 cruza EMA20 hacia arriba en posiciones acumuladas
+    C2: Patrón W en últimas 3 posiciones con pos > ema4/8/20
+    C3: EMA4 cruza EMA8 hacia arriba en posiciones acumuladas
     Solo dispara si tendencia 1.5x favorable (<2x<54%, 2-5x>26%).
     """
     if not get_stats_150()["favorable"]:
@@ -512,26 +492,21 @@ def check_signal_150(vals: List[float]) -> bool:
     r = _ema_components(vals)
     if r is None:
         return False
-    positions, ema4_s, ema8_s, _, cur_pos, cur_e4, cur_e8, cur_e20, prev_e4, prev_e8, _ = r
+    positions, ema4_s, ema8_s, _, cur_pos, cur_e4, cur_e8, cur_e20, prev_e4, prev_e8, prev_e20 = r
 
-    cond1 = False
-    if len(vals) >= 4:
-        cambios = [1 if v >= 2.00 else -1 for v in vals[-4:]]
-        c1, c2, c3, c4 = cambios
-        if c1 == -1 and c2 == -1 and c3 == -1 and c4 == 1:
-            if cur_pos <= cur_e4 and cur_pos <= cur_e8:
-                cond1 = True
+    # ── C1: EMA8 cruza EMA20 hacia arriba (posiciones) ───────────────────────
+    cond1 = (prev_e8 <= prev_e20) and (cur_e8 > cur_e20)
 
-    cond2 = (prev_e4 <= prev_e8) and (cur_e4 > cur_e8)
+    # ── C2: Patrón W en posiciones con pos > ema4/8/20 ───────────────────────
+    cond2 = False
+    if len(positions) >= 3:
+        a, b, c = positions[-3], positions[-2], positions[-1]
+        if (abs(a - c) <= 1 and b > a
+                and cur_pos > cur_e4 and cur_pos > cur_e8 and cur_pos > cur_e20):
+            cond2 = True
 
-    cond3 = False
-    if len(positions) >= 20:
-        soporte = min(positions[-20:])
-    else:
-        soporte = min(positions)
-    if (cur_pos <= soporte * 1.01 and
-            cur_pos > cur_e4 and cur_pos > cur_e8 and cur_pos > cur_e20):
-        cond3 = True
+    # ── C3: EMA4 cruza EMA8 hacia arriba (posiciones) ────────────────────────
+    cond3 = (prev_e4 <= prev_e8) and (cur_e4 > cur_e8)
 
     return cond1 or cond2 or cond3
 
@@ -560,8 +535,8 @@ def build_signal_msg_2x(last_value: float, attempt: int) -> str:
         f"<b>💰 RETIRAR EN: {CASHOUT_TARGET_2X:.2f}x</b>\n\n"
         f"{footer}\n"
         f"{col_label}\n\n"
-        f"<i>🔞 +18 | Apueste con Responsabilidad</i>\n\n"
-        f'🎰 <a href="{GAME_LINK}">Link de Spaceman</a>'
+        f"<i>🔞 +18 | Apueste con Responsabilidad</i>\n"
+        f'🎰 <a href="{GAME_LINK}">Acceder al Spaceman</a>'
     )
 
 def build_win_msg_2x(result: float) -> str:
@@ -596,8 +571,8 @@ def build_signal_msg_150(last_value: float, attempt: int) -> str:
         f"<b>💰 RETIRAR EN: {CASHOUT_TARGET_150:.2f}x</b>\n\n"
         f"{footer}\n"
         f"{col_label}\n\n"
-        f"<i>🔞 +18 | Apueste con Responsabilidad</i>\n\n"
-        f'🎰 <a href="{GAME_LINK}">Link de Spaceman</a>'
+        f"<i>🔞 +18 | Apueste con Responsabilidad</i>\n"
+        f'🎰 <a href="{GAME_LINK}">Acceder al Spaceman</a>'
     )
 
 def build_win_msg_150(result: float) -> str:
@@ -773,7 +748,7 @@ async def resolve_150(value: float):
 
 # ─── PROCESAMIENTO CENTRAL ────────────────────────────────────────────────────
 async def process_new_value(value: float, silent: bool = False):
-    global last_result, history, trend_msg_id
+    global last_result, history, trend_msg_id, trend_msg_id_150
     global s2x_active, s2x_attempt, s2x_col, s2x_msg_id
     global s150_active, s150_attempt, s150_col, s150_msg_id
 
@@ -818,7 +793,6 @@ async def process_new_value(value: float, silent: bool = False):
         await resolve_150(value)
     else:
         sig150 = check_signal_150(vals)
-        # Réplica 2x→1.5x solo si el canal 2x realmente disparó en esta ronda
         sig2x_replica = s2x_fired_this_round
         if sig150 or sig2x_replica:
             origen       = "1.5x" if sig150 else "2x→1.5x"
@@ -828,8 +802,12 @@ async def process_new_value(value: float, silent: bool = False):
             s150_msg_id  = await send_150(text, no_preview=True)
             save_state_150()
             logger.info(f"[1.5x] Señal enviada ({origen}) | col={s150_col}")
+            if trend_msg_id_150:
+                await delete_150(trend_msg_id_150)
+                trend_msg_id_150 = None
+                save_state_150()
 
-    # ── Tendencia (canal 2x, solo cuando ninguna señal 2x activa) ─────────────
+    # ── Tendencia canal 2x (solo cuando ninguna señal 2x activa) ──────────────
     if not s2x_active and len(history) >= 10:
         stats      = get_stats()
         trend_text = build_trend_message(stats)
@@ -841,6 +819,19 @@ async def process_new_value(value: float, silent: bool = False):
         else:
             trend_msg_id = await send_2x(trend_text)
             save_state_2x()
+
+    # ── Tendencia canal 1.5x (solo cuando ninguna señal 1.5x activa) ──────────
+    if not s150_active and len(history) >= 10:
+        stats150      = get_stats_150()
+        trend_text150 = build_trend_message_150(stats150)
+        if trend_msg_id_150:
+            ok = await edit_150(trend_msg_id_150, trend_text150)
+            if not ok:
+                trend_msg_id_150 = await send_150(trend_text150)
+                save_state_150()
+        else:
+            trend_msg_id_150 = await send_150(trend_text150)
+            save_state_150()
 
 # ─── WEBSOCKET ────────────────────────────────────────────────────────────────
 async def ws_loop():
