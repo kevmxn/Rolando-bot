@@ -66,6 +66,17 @@ UMBRAL_BELOW2_150  = 54.01   # canal 1.5x: <2x debe ser < este %
 UMBRAL_2TO5_150    = 25.99  # canal 1.5x: 2-5x debe ser > este %
 HISTORY_MAX        = 150
 
+# ─── EXIGENCIA PROGRESIVA POR COLUMNA (evitar 3 pérdidas seguidas) ────────────
+# Cada columna exige una tendencia más favorable que la anterior, tanto en el
+# canal 2x como en el 1.5x. Columna 1 = umbral normal. Columna 2 y 3 suman un
+# margen extra (acumulativo) por cada columna avanzada. Si la tendencia no
+# cumple el umbral de la columna actual, el bot NO dispara la señal.
+MARGEN_PASO = float(os.environ.get("MARGEN_PASO", "3.0"))  # puntos % extra por cada columna avanzada
+
+def _margen_col(col: int) -> float:
+    """Margen acumulado de exigencia para la columna dada (col 1 = 0)."""
+    return MARGEN_PASO * max(col - 1, 0)
+
 # ─── ESTRATEGIA 2x ────────────────────────────────────────────────────────────
 CASHOUT_TARGET_2X  = 2.00
 CASHOUT_TRIGGER_2X = 2.00
@@ -324,7 +335,8 @@ async def delete_150(msg_id: int) -> bool:
         return False
 
 # ─── ANÁLISIS DE TENDENCIA ────────────────────────────────────────────────────
-def get_stats() -> dict:
+def get_stats(col: int = 1) -> dict:
+    """col determina la exigencia: cada columna suma margen extra (ver MARGEN_PASO)."""
     total = len(history)
     if total == 0:
         return {"total": 0, "below2": 0, "two_to_five": 0,
@@ -333,14 +345,18 @@ def get_stats() -> dict:
     two_to_five = sum(1 for v in history if 2.00 <= v < 5.00)
     pct_below2  = (below2 / total) * 100
     pct_2to5    = (two_to_five / total) * 100
-    favorable   = (pct_below2 < UMBRAL_BELOW2) and (pct_2to5 > UMBRAL_2TO5)
+    margen      = _margen_col(col)
+    umbral_b2   = UMBRAL_BELOW2 - margen
+    umbral_25   = UMBRAL_2TO5   + margen
+    favorable   = (pct_below2 < umbral_b2) and (pct_2to5 > umbral_25)
     return {
         "total": total, "below2": below2, "two_to_five": two_to_five,
         "pct_below2": pct_below2, "pct_2to5": pct_2to5, "favorable": favorable,
     }
 
-def get_stats_150() -> dict:
-    """Mismos datos pero 'favorable' usa umbrales propios del canal 1.5x."""
+def get_stats_150(col: int = 1) -> dict:
+    """Mismos datos pero con umbrales propios del canal 1.5x.
+    col determina la exigencia: cada columna suma margen extra."""
     total = len(history)
     if total == 0:
         return {"total": 0, "below2": 0, "two_to_five": 0,
@@ -349,18 +365,24 @@ def get_stats_150() -> dict:
     two_to_five = sum(1 for v in history if 2.00 <= v < 5.00)
     pct_below2  = (below2 / total) * 100
     pct_2to5    = (two_to_five / total) * 100
-    favorable   = (pct_below2 < UMBRAL_BELOW2_150) and (pct_2to5 > UMBRAL_2TO5_150)
+    margen      = _margen_col(col)
+    umbral_b2   = UMBRAL_BELOW2_150 - margen
+    umbral_25   = UMBRAL_2TO5_150   + margen
+    favorable   = (pct_below2 < umbral_b2) and (pct_2to5 > umbral_25)
     return {
         "total": total, "below2": below2, "two_to_five": two_to_five,
         "pct_below2": pct_below2, "pct_2to5": pct_2to5, "favorable": favorable,
     }
 
-def build_trend_message(stats: dict) -> str:
-    now       = colombia_time()
-    last5     = list(history)[-5:][::-1] if history else []
-    last5_str = ", ".join(f"{v:.2f}x" for v in last5) if last5 else "—"
-    below2_ok = stats["pct_below2"] < UMBRAL_BELOW2
-    two5_ok   = stats["pct_2to5"]   > UMBRAL_2TO5
+def build_trend_message(stats: dict, col: int = 1) -> str:
+    now         = colombia_time()
+    last5       = list(history)[-5:][::-1] if history else []
+    last5_str   = ", ".join(f"{v:.2f}x" for v in last5) if last5 else "—"
+    margen      = _margen_col(col)
+    umbral_b2   = UMBRAL_BELOW2 - margen
+    umbral_25   = UMBRAL_2TO5   + margen
+    below2_ok   = stats["pct_below2"] < umbral_b2
+    two5_ok     = stats["pct_2to5"]   > umbral_25
     if stats["favorable"]:
         header    = f"🟢 <b>TENDENCIA FAVORABLE — {now}</b>"
         mark2     = "✅"
@@ -368,21 +390,25 @@ def build_trend_message(stats: dict) -> str:
         header    = f"🔴 <b>TENDENCIA DESFAVORABLE — {now}</b>"
         mark2     = "❌"
     below2_mark = "✅" if below2_ok else "❌"
+    candado     = f"\n<b>🔒 Exigencia Col {col}: +{margen:.1f}% margen</b>" if margen > 0 else ""
     return (
         f"{header}\n"
         f"<b>━━━━━━━━━━━━━━━━━━━━━━━━━━</b>\n"
         f"<b>📈 Análisis últimos {stats['total']} multiplicadores</b>\n"
         f"<b>🔵 1.00-1.99x = {stats['below2']} — {stats['pct_below2']:.2f}%{below2_mark}</b>\n"
         f"<b>🟡 2.00-4.99x = {stats['two_to_five']} — {stats['pct_2to5']:.2f}%{mark2}</b>\n"
-        f"<b>🆔 ({last5_str})</b>"
+        f"<b>🆔 ({last5_str})</b>{candado}"
     )
 
-def build_trend_message_150(stats: dict) -> str:
-    now       = colombia_time()
-    last5     = list(history)[-5:][::-1] if history else []
-    last5_str = ", ".join(f"{v:.2f}x" for v in last5) if last5 else "—"
-    below2_ok = stats["pct_below2"] < UMBRAL_BELOW2_150
-    two5_ok   = stats["pct_2to5"]   > UMBRAL_2TO5_150
+def build_trend_message_150(stats: dict, col: int = 1) -> str:
+    now         = colombia_time()
+    last5       = list(history)[-5:][::-1] if history else []
+    last5_str   = ", ".join(f"{v:.2f}x" for v in last5) if last5 else "—"
+    margen      = _margen_col(col)
+    umbral_b2   = UMBRAL_BELOW2_150 - margen
+    umbral_25   = UMBRAL_2TO5_150   + margen
+    below2_ok   = stats["pct_below2"] < umbral_b2
+    two5_ok     = stats["pct_2to5"]   > umbral_25
     if stats["favorable"]:
         header  = f"🟢 <b>TENDENCIA FAVORABLE — {now}</b>"
         mark2   = "✅"
@@ -390,13 +416,14 @@ def build_trend_message_150(stats: dict) -> str:
         header  = f"🔴 <b>TENDENCIA DESFAVORABLE — {now}</b>"
         mark2   = "❌"
     below2_mark = "✅" if below2_ok else "❌"
+    candado     = f"\n<b>🔒 Exigencia Col {col}: +{margen:.1f}% margen</b>" if margen > 0 else ""
     return (
         f"{header}\n"
         f"<b>━━━━━━━━━━━━━━━━━━━━━━━━━━</b>\n"
         f"<b>📈 Análisis últimos {stats['total']} multiplicadores</b>\n"
         f"<b>🔵 1.00-1.99x = {stats['below2']} — {stats['pct_below2']:.2f}%{below2_mark}</b>\n"
         f"<b>🟡 2.00-4.99x = {stats['two_to_five']} — {stats['pct_2to5']:.2f}%{mark2}</b>\n"
-        f"<b>🆔 ({last5_str})</b>"
+        f"<b>🆔 ({last5_str})</b>{candado}"
     )
 
 # ─── EMA + POSICIONES (compartido) ────────────────────────────────────────────
@@ -459,15 +486,19 @@ def _ema4_ema20_cross(vals: List[float]) -> bool:
     cur_e20  = ema20[-1]
     return (prev_e4 <= prev_e20) and (cur_e4 > cur_e20)
 
-def check_signal_2x(vals: List[float]) -> bool:
+def check_signal_2x(vals: List[float], col: int = 1) -> bool:
     """
     Sistema 2x identico a main_6_27:
     EMA4 cruza EMA20 hacia arriba sobre valores crudos.
     Requiere tendencia favorable y minimo 20 valores.
+
+    La exigencia de tendencia sube progresivamente con la columna (`col`):
+    columna 1 = umbral normal, columna 2 y 3 exigen más margen (MARGEN_PASO),
+    para no arriesgar pérdidas seguidas en columnas avanzadas.
     """
     if len(vals) < 20:
         return False
-    if not get_stats()["favorable"]:
+    if not get_stats(col=col)["favorable"]:
         return False
     ema4_series  = calc_ema(vals, 4)
     ema20_series = calc_ema(vals, 20)
@@ -477,7 +508,7 @@ def check_signal_2x(vals: List[float]) -> bool:
     prev_ema20 = ema20_series[-2] if len(ema20_series) > 1 else cur_ema20
     return (prev_ema4 <= prev_ema20) and (cur_ema4 > cur_ema20)
 
-def check_signal_150(vals: List[float]) -> bool:
+def check_signal_150(vals: List[float], col: int = 1) -> bool:
     """
     3 condiciones gráfico moderado — alerta 1.50.
     Usa las estrategias alternativas del 6_31 (posiciones acumuladas).
@@ -486,8 +517,11 @@ def check_signal_150(vals: List[float]) -> bool:
     C2: Patrón W en últimas 3 posiciones con pos > ema4/8/20
     C3: EMA4 cruza EMA8 hacia arriba en posiciones acumuladas
     Solo dispara si tendencia 1.5x favorable (<2x<54%, 2-5x>26%).
+
+    La exigencia de tendencia sube progresivamente con la columna (`col`):
+    columna 1 = umbral normal, columna 2 y 3 exigen más margen (MARGEN_PASO).
     """
-    if not get_stats_150()["favorable"]:
+    if not get_stats_150(col=col)["favorable"]:
         return False
     r = _ema_components(vals)
     if r is None:
@@ -773,7 +807,7 @@ async def process_new_value(value: float, silent: bool = False):
     if s2x_active:
         await resolve_2x(value)
     else:
-        if check_signal_2x(vals):
+        if check_signal_2x(vals, col=s2x_col):
             s2x_active         = True
             s2x_attempt        = 1
             s2x_fired_this_round = True
@@ -792,8 +826,10 @@ async def process_new_value(value: float, silent: bool = False):
     if s150_active:
         await resolve_150(value)
     else:
-        sig150 = check_signal_150(vals)
-        sig2x_replica = s2x_fired_this_round
+        sig150 = check_signal_150(vals, col=s150_col)
+        # La réplica del 2x también debe respetar la exigencia progresiva de
+        # la columna actual del canal 1.5x (si no, se cierra el hueco por otra vía).
+        sig2x_replica = s2x_fired_this_round and get_stats_150(col=s150_col)["favorable"]
         if sig150 or sig2x_replica:
             origen       = "1.5x" if sig150 else "2x→1.5x"
             s150_active  = True
@@ -809,8 +845,8 @@ async def process_new_value(value: float, silent: bool = False):
 
     # ── Tendencia canal 2x (solo cuando ninguna señal 2x activa) ──────────────
     if not s2x_active and len(history) >= 10:
-        stats      = get_stats()
-        trend_text = build_trend_message(stats)
+        stats      = get_stats(col=s2x_col)
+        trend_text = build_trend_message(stats, col=s2x_col)
         if trend_msg_id:
             ok = await edit_2x(trend_msg_id, trend_text)
             if not ok:
@@ -822,8 +858,8 @@ async def process_new_value(value: float, silent: bool = False):
 
     # ── Tendencia canal 1.5x (solo cuando ninguna señal 1.5x activa) ──────────
     if not s150_active and len(history) >= 10:
-        stats150      = get_stats_150()
-        trend_text150 = build_trend_message_150(stats150)
+        stats150      = get_stats_150(col=s150_col)
+        trend_text150 = build_trend_message_150(stats150, col=s150_col)
         if trend_msg_id_150:
             ok = await edit_150(trend_msg_id_150, trend_text150)
             if not ok:
